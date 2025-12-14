@@ -13,6 +13,7 @@ from ocr.ocr_engine import extract_text_from_pdf
 from ocr.invoice_parser import parse_invoice
 from ui.pdf_viewer import PdfViewer
 from PySide6.QtGui import QColor
+import json
 
 
 class MainWindow(QMainWindow):
@@ -79,6 +80,11 @@ class MainWindow(QMainWindow):
 
         self.btn_analyze_pdf = QPushButton("🔍 Analyser le PDF (OCR)")
         self.btn_analyze_pdf.clicked.connect(self.analyze_pdf)
+        self.btn_save_model = QPushButton("💾 Sauvegarder le modèle")
+        self.btn_save_model.clicked.connect(self.save_model)
+
+        right_panel.addWidget(self.btn_save_model)
+
 
         right_panel.addLayout(form_layout)
         right_panel.addStretch()
@@ -119,10 +125,11 @@ class MainWindow(QMainWindow):
     def set_active_field(self, field):
         self.active_field = field
 
-        # focus visuel PDF
-        self.pdf_viewer.focus_on_field(field)
+        self.pdf_viewer.active_field = field
+        self.pdf_viewer.field_colors = self.FIELD_COLORS
 
         field.setStyleSheet("background-color: #fff3cd;")
+
 
 
     def fill_active_field(self, text):
@@ -261,3 +268,48 @@ class MainWindow(QMainWindow):
         ]:
             field.clear()
             field.setStyleSheet("")
+
+
+
+    def save_model(self):
+        if not self.current_pdf_path:
+            QMessageBox.warning(self, "Erreur", "Aucun PDF sélectionné.")
+            return
+
+        model_data = {
+            "iban": self.iban_input.text().strip(),
+            "bic": self.bic_input.text().strip(),
+            "invoice_date": self.date_input.text().strip(),
+            "invoice_number": self.invoice_number_input.text().strip(),
+            "folder_number": self.folder_number_input.text().strip(),
+        }
+
+        # Vérification minimale
+        if not any(model_data.values()):
+            QMessageBox.warning(
+                self,
+                "Rien à sauvegarder",
+                "Aucune donnée n’a été renseignée."
+            )
+            return
+
+        # Dossier modèles
+        model_dir = r"C:\Users\hrouillard\Documents\clients\ED trans\OCR\modeles"
+        os.makedirs(model_dir, exist_ok=True)
+
+        pdf_name = os.path.splitext(os.path.basename(self.current_pdf_path))[0]
+        model_path = os.path.join(model_dir, f"{pdf_name}_model.json")
+
+        try:
+            with open(model_path, "w", encoding="utf-8") as f:
+                json.dump(model_data, f, indent=4, ensure_ascii=False)
+
+            QMessageBox.information(
+                self,
+                "Modèle sauvegardé",
+                f"Modèle enregistré :\n{model_path}"
+            )
+
+        except Exception as e:
+            QMessageBox.critical(self, "Erreur sauvegarde", str(e))
+
