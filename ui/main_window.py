@@ -8,13 +8,11 @@ from PySide6.QtGui import QImage, QPixmap
 
 import os
 import fitz  # PyMuPDF
+
 from ocr.ocr_engine import extract_text_from_pdf
 from ocr.invoice_parser import parse_invoice
-
-
-# (prévu pour plus tard)
-# from ocr.ocr_engine import extract_text_from_pdf
-# from ocr.invoice_parser import parse_invoice
+from ui.pdf_viewer import PdfViewer
+from PySide6.QtGui import QColor
 
 
 class MainWindow(QMainWindow):
@@ -25,22 +23,23 @@ class MainWindow(QMainWindow):
         self.resize(1200, 800)
 
         self.current_pdf_path = None
+        self.active_field = None  # champ sélectionné à droite
 
+        # =========================
         # Widget central
+        # =========================
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
-
         main_layout = QHBoxLayout(central_widget)
 
         # =========================
-        # Panneau gauche : PDF list
+        # Panneau gauche : liste PDF
         # =========================
         left_panel = QVBoxLayout()
 
         self.btn_scan_folder = QPushButton("📂 Analyser un dossier")
         self.btn_scan_folder.clicked.connect(self.select_folder)
 
-        # Liste des PDF (on pourra passer à un tableau QTableWidget ensuite)
         self.pdf_list = QListWidget()
         self.pdf_list.itemClicked.connect(self.on_pdf_selected)
 
@@ -48,23 +47,22 @@ class MainWindow(QMainWindow):
         left_panel.addWidget(self.pdf_list)
 
         # =========================
-        # Panneau central : PDF view
+        # Panneau central : PDF
         # =========================
         center_panel = QVBoxLayout()
 
-        self.pdf_label = QLabel()
-        self.pdf_label.setAlignment(Qt.AlignCenter)
-        self.pdf_label.setMinimumSize(400, 400)
-        self.pdf_label.setStyleSheet("border: 1px solid #999; background: #fff;")
-        self.pdf_label.setText("Aucun PDF sélectionné")
+        self.pdf_viewer = PdfViewer()
+        self.pdf_viewer.setMinimumSize(400, 400)
 
-        center_panel.addWidget(self.pdf_label)
+        # (sera utilisé plus tard pour OCR par sélection)
+        self.pdf_viewer.text_selected.connect(self.fill_active_field)
+
+        center_panel.addWidget(self.pdf_viewer)
 
         # =========================
-        # Panneau droit : Infos OCR
+        # Panneau droit : infos OCR
         # =========================
         right_panel = QVBoxLayout()
-
         form_layout = QFormLayout()
 
         self.iban_input = QLineEdit()
@@ -73,23 +71,11 @@ class MainWindow(QMainWindow):
         self.invoice_number_input = QLineEdit()
         self.folder_number_input = QLineEdit()
 
-        # Champs éditables (même si OCR trouvé)
         form_layout.addRow("IBAN :", self.iban_input)
         form_layout.addRow("BIC :", self.bic_input)
         form_layout.addRow("Date facture :", self.date_input)
         form_layout.addRow("N° facture :", self.invoice_number_input)
         form_layout.addRow("N° dossier :", self.folder_number_input)
-        for field in [
-            self.iban_input,
-            self.bic_input,
-            self.date_input,
-            self.invoice_number_input,
-            self.folder_number_input
-        ]:
-            field.textChanged.connect(
-                lambda _, f=field: f.setStyleSheet("")
-    )
-
 
         self.btn_analyze_pdf = QPushButton("🔍 Analyser le PDF (OCR)")
         self.btn_analyze_pdf.clicked.connect(self.analyze_pdf)
@@ -99,53 +85,108 @@ class MainWindow(QMainWindow):
         right_panel.addWidget(self.btn_analyze_pdf)
 
         # =========================
-        # Ajout des panneaux
+        # Layout global
         # =========================
         main_layout.addLayout(left_panel, 2)
         main_layout.addLayout(center_panel, 5)
         main_layout.addLayout(right_panel, 3)
 
+        # =========================
+        # Gestion champ actif
+        # =========================
+        for field in [
+            self.iban_input,
+            self.bic_input,
+            self.date_input,
+            self.invoice_number_input,
+            self.folder_number_input
+        ]:
+            field.mousePressEvent = lambda e, f=field: self.set_active_field(f)
+            field.textChanged.connect(lambda _, f=field: f.setStyleSheet(""))
+
+        self.FIELD_COLORS = {
+            self.iban_input: QColor(100, 149, 237, 80),     # bleu
+            self.bic_input: QColor(186, 85, 211, 80),       # violet
+            self.date_input: QColor(60, 179, 113, 80),      # vert
+            self.invoice_number_input: QColor(255, 215, 0, 80),  # jaune
+            self.folder_number_input: QColor(255, 165, 0, 80),   # orange
+        }
+
     # =========================
-    # Actions
+    # Actions UI
     # =========================
 
+    def set_active_field(self, field):
+        self.active_field = field
+
+        # focus visuel PDF
+        self.pdf_viewer.focus_on_field(field)
+
+        field.setStyleSheet("background-color: #fff3cd;")
+
+
+    def fill_active_field(self, text):
+        if not self.active_field:
+            return
+
+        value = text.strip()
+
+        # Nettoyage spécifique par champ
+        if self.active_field == self.invoice_number_input:
+            # On garde uniquement les chiffres
+            value = "".join(c for c in value if c.isdigit())
+
+        elif self.active_field == self.folder_number_input:
+            value = "".join(c for c in value if c.isdigit())
+
+        elif self.active_field == self.iban_input:
+            value = value.replace(" ", "").upper()
+
+        elif self.active_field == self.bic_input:
+            value = value.replace(" ", "").upper()
+
+        self.active_field.setText(value)
+        self.active_field.setStyleSheet("background-color: #e6ffe6;")
+
+
+
     def select_folder(self):
-        folder = QFileDialog.getExistingDirectory(self, "Sélectionner un dossier")
+        DEFAULT_OCR_FOLDER = r"C:\Users\hrouillard\Documents\clients\ED trans\OCR\modeles"
+
+        folder = QFileDialog.getExistingDirectory(
+            self,
+            "Sélectionner un dossier",
+            DEFAULT_OCR_FOLDER
+)
         if not folder:
             return
 
         self.pdf_list.clear()
         self.current_pdf_path = None
-        self.pdf_label.setText("Aucun PDF sélectionné")
         self.clear_fields()
 
-        # Ajoute tous les PDF du dossier
         for file in sorted(os.listdir(folder)):
             if file.lower().endswith(".pdf"):
                 self.pdf_list.addItem(os.path.join(folder, file))
 
     def on_pdf_selected(self, item):
         self.current_pdf_path = item.text()
+
+        # 🔴 nettoyage surlignages
+        self.pdf_viewer.clear_highlights()
+
         self.display_pdf()
         self.clear_fields()
 
     def display_pdf(self):
-        """Affiche la première page du PDF sélectionné dans le panneau central."""
         if not self.current_pdf_path or not os.path.exists(self.current_pdf_path):
-            self.pdf_label.setText("Aucun PDF sélectionné")
             return
 
         try:
             doc = fitz.open(self.current_pdf_path)
-            if doc.page_count == 0:
-                self.pdf_label.setText("PDF vide")
-                doc.close()
-                return
+            page = doc.load_page(0)
 
-            page = doc.load_page(0)  # première page
-            pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))  # zoom x2
-
-            # NOTE : get_pixmap renvoie généralement du RGB
+            pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
             img = QImage(
                 pix.samples,
                 pix.width,
@@ -155,26 +196,13 @@ class MainWindow(QMainWindow):
             )
 
             pixmap = QPixmap.fromImage(img)
+            self.pdf_viewer.setPixmap(pixmap)
 
-            self.pdf_label.setPixmap(
-                pixmap.scaled(
-                    self.pdf_label.size(),
-                    Qt.KeepAspectRatio,
-                    Qt.SmoothTransformation
-                )
-            )
 
             doc.close()
 
         except Exception as e:
-            self.pdf_label.setText(f"Erreur affichage PDF\n{e}")
-
-    def clear_fields(self):
-        self.iban_input.clear()
-        self.bic_input.clear()
-        self.date_input.clear()
-        self.invoice_number_input.clear()
-        self.folder_number_input.clear()
+            QMessageBox.critical(self, "Erreur PDF", str(e))
 
     def analyze_pdf(self):
         if not self.current_pdf_path:
@@ -182,51 +210,33 @@ class MainWindow(QMainWindow):
             return
 
         try:
-            # 1️⃣ OCR
             text = extract_text_from_pdf(self.current_pdf_path)
-
-            # 2️⃣ Parsing
             data = parse_invoice(text)
 
-            # 3️⃣ Remplissage UI
             self.fill_fields(data)
-
-            # 4️⃣ Mise en évidence champs manquants
             self.highlight_missing_fields()
 
             QMessageBox.information(
                 self,
                 "OCR terminé",
-                "Analyse OCR terminée.\nVeuillez vérifier les champs."
+                "Analyse OCR terminée.\nVous pouvez corriger les champs."
             )
 
         except Exception as e:
-            QMessageBox.critical(
-                self,
-                "Erreur OCR",
-                f"Une erreur est survenue pendant l'OCR :\n{e}"
-            )   
+            QMessageBox.critical(self, "Erreur OCR", str(e))
 
+    # =========================
+    # Helpers UI
+    # =========================
 
     def fill_fields(self, data):
-        """Remplit les champs à droite (data = InvoiceData)."""
-        self.iban_input.setText(getattr(data, "iban", "") or "")
-        self.bic_input.setText(getattr(data, "bic", "") or "")
-        self.date_input.setText(getattr(data, "invoice_date", "") or "")
-        self.invoice_number_input.setText(getattr(data, "invoice_number", "") or "")
-        self.folder_number_input.setText(getattr(data, "folder_number", "") or "")
-
-    # Optionnel : si tu redimensionnes la fenêtre, on ré-adapte l’image
-    def resizeEvent(self, event):
-        super().resizeEvent(event)
-        # re-scale l'image à la taille du label si un pdf est chargé
-        if self.current_pdf_path and self.pdf_label.pixmap() is not None:
-            self.display_pdf()
+        self.iban_input.setText(data.iban or "")
+        self.bic_input.setText(data.bic or "")
+        self.date_input.setText(data.invoice_date or "")
+        self.invoice_number_input.setText(data.invoice_number or "")
+        self.folder_number_input.setText(data.folder_number or "")
 
     def highlight_missing_fields(self):
-        """
-        Met en rouge clair les champs non trouvés par l'OCR
-        """
         fields = [
             self.iban_input,
             self.bic_input,
@@ -241,14 +251,13 @@ class MainWindow(QMainWindow):
             else:
                 field.setStyleSheet("background-color: #e6ffe6;")
 
-
-    def fill_fields(self, data):
-        """
-        Remplit les champs avec les données OCR
-        """
-        self.iban_input.setText(data.iban or "")
-        self.bic_input.setText(data.bic or "")
-        self.date_input.setText(data.invoice_date or "")
-        self.invoice_number_input.setText(data.invoice_number or "")
-        self.folder_number_input.setText(data.folder_number or "")  
-
+    def clear_fields(self):
+        for field in [
+            self.iban_input,
+            self.bic_input,
+            self.date_input,
+            self.invoice_number_input,
+            self.folder_number_input
+        ]:
+            field.clear()
+            field.setStyleSheet("")
