@@ -8,6 +8,9 @@ from PySide6.QtGui import QImage, QPixmap
 
 import os
 import fitz  # PyMuPDF
+from ocr.ocr_engine import extract_text_from_pdf
+from ocr.invoice_parser import parse_invoice
+
 
 # (prévu pour plus tard)
 # from ocr.ocr_engine import extract_text_from_pdf
@@ -76,6 +79,17 @@ class MainWindow(QMainWindow):
         form_layout.addRow("Date facture :", self.date_input)
         form_layout.addRow("N° facture :", self.invoice_number_input)
         form_layout.addRow("N° dossier :", self.folder_number_input)
+        for field in [
+            self.iban_input,
+            self.bic_input,
+            self.date_input,
+            self.invoice_number_input,
+            self.folder_number_input
+        ]:
+            field.textChanged.connect(
+                lambda _, f=field: f.setStyleSheet("")
+    )
+
 
         self.btn_analyze_pdf = QPushButton("🔍 Analyser le PDF (OCR)")
         self.btn_analyze_pdf.clicked.connect(self.analyze_pdf)
@@ -163,22 +177,36 @@ class MainWindow(QMainWindow):
         self.folder_number_input.clear()
 
     def analyze_pdf(self):
-        """Bouton OCR: à brancher sur pytesseract + parsing."""
         if not self.current_pdf_path:
             QMessageBox.warning(self, "Erreur", "Aucun PDF sélectionné.")
             return
 
-        # Placeholder : on branchera pytesseract + extraction ensuite
-        QMessageBox.information(
-            self,
-            "OCR",
-            "OCR à implémenter :\n- IBAN\n- BIC\n- Date facture\n- N° facture\n- N° dossier"
-        )
+        try:
+            # 1️⃣ OCR
+            text = extract_text_from_pdf(self.current_pdf_path)
 
-        # Exemple futur :
-        # text = extract_text_from_pdf(self.current_pdf_path)
-        # data = parse_invoice(text)
-        # self.fill_fields(data)
+            # 2️⃣ Parsing
+            data = parse_invoice(text)
+
+            # 3️⃣ Remplissage UI
+            self.fill_fields(data)
+
+            # 4️⃣ Mise en évidence champs manquants
+            self.highlight_missing_fields()
+
+            QMessageBox.information(
+                self,
+                "OCR terminé",
+                "Analyse OCR terminée.\nVeuillez vérifier les champs."
+            )
+
+        except Exception as e:
+            QMessageBox.critical(
+                self,
+                "Erreur OCR",
+                f"Une erreur est survenue pendant l'OCR :\n{e}"
+            )   
+
 
     def fill_fields(self, data):
         """Remplit les champs à droite (data = InvoiceData)."""
@@ -194,3 +222,33 @@ class MainWindow(QMainWindow):
         # re-scale l'image à la taille du label si un pdf est chargé
         if self.current_pdf_path and self.pdf_label.pixmap() is not None:
             self.display_pdf()
+
+    def highlight_missing_fields(self):
+        """
+        Met en rouge clair les champs non trouvés par l'OCR
+        """
+        fields = [
+            self.iban_input,
+            self.bic_input,
+            self.date_input,
+            self.invoice_number_input,
+            self.folder_number_input
+        ]
+
+        for field in fields:
+            if not field.text().strip():
+                field.setStyleSheet("background-color: #ffe6e6;")
+            else:
+                field.setStyleSheet("background-color: #e6ffe6;")
+
+
+    def fill_fields(self, data):
+        """
+        Remplit les champs avec les données OCR
+        """
+        self.iban_input.setText(data.iban or "")
+        self.bic_input.setText(data.bic or "")
+        self.date_input.setText(data.invoice_date or "")
+        self.invoice_number_input.setText(data.invoice_number or "")
+        self.folder_number_input.setText(data.folder_number or "")  
+

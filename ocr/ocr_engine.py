@@ -28,7 +28,7 @@ def extract_text_from_pdf(pdf_path: str) -> str:
         for idx, image in enumerate(images):
             text = pytesseract.image_to_string(
                 image,
-                lang="fra",
+                lang="fra+eng+deu+spa+ita+nld",
                 config="--psm 6"
             )
             full_text += f"\n\n===== PAGE {idx + 1} =====\n{text}"
