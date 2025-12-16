@@ -11,6 +11,9 @@ from PySide6.QtWidgets import QTextEdit
 from PySide6.QtWidgets import QPushButton, QLabel, QHBoxLayout
 from PySide6.QtGui import QTextCharFormat, QColor, QTextCursor, QTextDocument
 from PySide6.QtWidgets import QTextEdit
+from PySide6.QtWidgets import QTableWidget, QTableWidgetItem
+import re
+
 
 
 
@@ -50,11 +53,21 @@ class MainWindow(QMainWindow):
         self.btn_scan_folder = QPushButton("📂 Analyser un dossier")
         self.btn_scan_folder.clicked.connect(self.select_folder)
 
-        self.pdf_list = QListWidget()
-        self.pdf_list.itemClicked.connect(self.on_pdf_selected)
 
         left_panel.addWidget(self.btn_scan_folder)
-        left_panel.addWidget(self.pdf_list)
+
+        self.pdf_table = QTableWidget()
+        self.pdf_table.setColumnCount(1)
+        self.pdf_table.setHorizontalHeaderLabels(["Nom du fichier"])
+        self.pdf_table.horizontalHeader().setStretchLastSection(True)
+        self.pdf_table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.pdf_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.pdf_table.setAlternatingRowColors(True)
+        self.pdf_table.cellClicked.connect(self.on_pdf_selected)
+
+        left_panel.addWidget(self.pdf_table)
+        
+
 
         # =========================
         # Panneau central : PDF
@@ -225,31 +238,36 @@ class MainWindow(QMainWindow):
 )
         if not folder:
             return
+        self.pdf_table.setRowCount(0)
 
-        self.pdf_list.clear()
-        self.current_pdf_path = None
-        self.clear_fields()
+        pdf_files = [
+            f for f in sorted(os.listdir(folder))
+            if f.lower().endswith(".pdf")
+        ]
 
-        for file in sorted(os.listdir(folder)):
-            if file.lower().endswith(".pdf"):
-                self.pdf_list.addItem(os.path.join(folder, file))
+        for row, file in enumerate(pdf_files):
+            self.pdf_table.insertRow(row)
 
-    def on_pdf_selected(self, item):
-        self.current_pdf_path = item.text()
+            item = QTableWidgetItem(file)
+            item.setData(Qt.UserRole, os.path.join(folder, file))
 
-        # 🔴 nettoyage surlignages
+            self.pdf_table.setItem(row, 0, item)
+            self.current_pdf_path = None
+            self.clear_fields()
+
+
+    def on_pdf_selected(self, row, column):
+        item = self.pdf_table.item(row, 0)
+        if not item:
+            return
+
+        self.current_pdf_path = item.data(Qt.UserRole)
+
         self.pdf_viewer.clear_highlights()
-
         self.display_pdf()
         self.clear_fields()
         self.ocr_text_view.clear()
-        self.ocr_search_input.clear()
-        self.ocr_text_view.setExtraSelections([])
-        self.ocr_search_input.clear()
-        self.ocr_text_view.setExtraSelections([])
-        self.search_counter_label.setText("0 / 0")
-        self.search_selections = []
-        self.current_match_index = -1
+
 
 
 
@@ -415,12 +433,13 @@ class MainWindow(QMainWindow):
         if not field:
             return
 
-        # Nettoyage léger selon le champ
-        if field_key in ("invoice_number", "folder_number"):
-            text = "".join(c for c in text if c.isdigit())
 
-        if field_key in ("iban", "bic"):
-            text = text.replace(" ", "").upper()
+        if field_key == "invoice_number":
+            text = re.sub(r"[^A-Z0-9\-_/\. ]", "", text.upper()).strip()
+
+        elif field_key == "folder_number":
+            text = re.sub(r"[^0-9]", "", text)
+
 
         field.setText(text)
         field.setStyleSheet("background-color: #e6ffe6;")
