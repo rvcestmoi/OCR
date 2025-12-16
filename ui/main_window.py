@@ -16,6 +16,7 @@ import re
 import json
 from PySide6.QtWidgets import QProgressDialog
 from PySide6.QtWidgets import QApplication
+from ocr.supplier_model import build_supplier_key, load_supplier_model
 
 
 
@@ -329,13 +330,22 @@ class MainWindow(QMainWindow):
 
             self.fill_fields(data)
 
-            model = self.load_supplier_model(
-                self.iban_input.text(),
-                self.bic_input.text()
-            )
+            from ocr.supplier_model import build_supplier_key, load_supplier_model
+
+            iban = self.iban_input.text().strip()
+            bic = self.bic_input.text().strip()
+
+            supplier_key = build_supplier_key(iban, bic)
+            print("SUPPLIER KEY:", supplier_key)
+
+            model = load_supplier_model(supplier_key)
 
             if model:
+                print("✅ Modèle fournisseur trouvé")
                 self.apply_supplier_model(model)
+            else:
+                print("❌ Aucun modèle fournisseur")
+
 
             
             self.highlight_missing_fields()
@@ -708,21 +718,12 @@ class MainWindow(QMainWindow):
         json_path = os.path.join(model_dir, f"{base_name}.json")
         return os.path.exists(json_path)
 
-    def _get_supplier_key(self, iban: str, bic: str) -> str | None:
-        if not iban or not bic:
-            return None
-        return f"{iban}_{bic}"
-
-    def _get_supplier_model_path(self, supplier_key: str) -> str:
-        supplier_dir = r"C:\git\OCR\OCR\suppliers"
-        os.makedirs(supplier_dir, exist_ok=True)
-        return os.path.join(supplier_dir, f"{supplier_key}.json")
-
+   
     def save_supplier_model(self):
         iban = self.iban_input.text().strip()
         bic = self.bic_input.text().strip()
 
-        supplier_key = self._get_supplier_key(iban, bic)
+        supplier_key = build_supplier_key(iban, bic)
         if not supplier_key:
             QMessageBox.warning(
                 self,
@@ -731,7 +732,10 @@ class MainWindow(QMainWindow):
             )
             return
 
-        model_path = self._get_supplier_model_path(supplier_key)
+        supplier_dir = r"C:\git\OCR\OCR\models\suppliers"
+        os.makedirs(supplier_dir, exist_ok=True)
+
+        model_path = os.path.join(supplier_dir, f"{supplier_key}.json")
 
         data = {
             "supplier_key": supplier_key,
@@ -755,20 +759,6 @@ class MainWindow(QMainWindow):
         except Exception as e:
             QMessageBox.critical(self, "Erreur", str(e))
 
-    def load_supplier_model(self, iban: str, bic: str) -> dict | None:
-        supplier_key = self._get_supplier_key(iban, bic)
-        if not supplier_key:
-            return None
-
-        model_path = self._get_supplier_model_path(supplier_key)
-        if not os.path.exists(model_path):
-            return None
-
-        try:
-            with open(model_path, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
-            return None
 
     def apply_supplier_model(self, model: dict):
         if not model:
