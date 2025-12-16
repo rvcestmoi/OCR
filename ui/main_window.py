@@ -1,7 +1,7 @@
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QListWidget, QPushButton,
     QVBoxLayout, QHBoxLayout, QFileDialog, QLabel,
-    QLineEdit, QFormLayout, QMessageBox
+    QLineEdit, QFormLayout, QMessageBox, QPlainTextEdit
 )
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QImage, QPixmap
@@ -57,6 +57,8 @@ class MainWindow(QMainWindow):
 
         # (sera utilisé plus tard pour OCR par sélection)
         self.pdf_viewer.text_selected.connect(self.fill_active_field)
+        self.pdf_viewer.text_selected.connect(self.append_ocr_text)
+
 
         center_panel.addWidget(self.pdf_viewer)
 
@@ -117,6 +119,18 @@ class MainWindow(QMainWindow):
             self.invoice_number_input: QColor(255, 215, 0, 80),  # jaune
             self.folder_number_input: QColor(255, 165, 0, 80),   # orange
         }
+
+        # =========================
+        # Zone texte OCR brut
+        # =========================
+        self.ocr_text_view = QPlainTextEdit()
+        self.ocr_text_view.setReadOnly(True)
+        self.ocr_text_view.setPlaceholderText("Texte brut OCR (Tesseract / PDF)…")
+        self.ocr_text_view.setMinimumHeight(200)
+
+        right_panel.addWidget(QLabel("🧾 Texte OCR brut :"))
+        right_panel.addWidget(self.ocr_text_view)
+
 
     # =========================
     # Actions UI
@@ -184,6 +198,8 @@ class MainWindow(QMainWindow):
 
         self.display_pdf()
         self.clear_fields()
+        self.ocr_text_view.clear()
+
 
     def display_pdf(self):
         if not self.current_pdf_path or not os.path.exists(self.current_pdf_path):
@@ -218,7 +234,12 @@ class MainWindow(QMainWindow):
 
         try:
             text = extract_text_from_pdf(self.current_pdf_path)
+
+            # 🆕 affichage texte brut OCR
+            self.ocr_text_view.setPlainText(text)
+
             data = parse_invoice(text)
+
 
             self.fill_fields(data)
             self.highlight_missing_fields()
@@ -231,6 +252,8 @@ class MainWindow(QMainWindow):
 
         except Exception as e:
             QMessageBox.critical(self, "Erreur OCR", str(e))
+
+        
 
     # =========================
     # Helpers UI
@@ -312,4 +335,15 @@ class MainWindow(QMainWindow):
 
         except Exception as e:
             QMessageBox.critical(self, "Erreur sauvegarde", str(e))
+
+
+    def append_ocr_text(self, text):
+        if not text.strip():
+            return
+
+        current = self.ocr_text_view.toPlainText()
+        self.ocr_text_view.setPlainText(
+            current + "\n\n--- OCR sélection ---\n" + text
+        )
+
 
