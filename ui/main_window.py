@@ -6,6 +6,13 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QImage, QPixmap
 from ui.ocr_text_view import OcrTextView
+from PySide6.QtGui import QTextCharFormat, QColor, QTextCursor, QTextDocument
+from PySide6.QtWidgets import QTextEdit
+from PySide6.QtWidgets import QPushButton, QLabel, QHBoxLayout
+from PySide6.QtGui import QTextCharFormat, QColor, QTextCursor, QTextDocument
+from PySide6.QtWidgets import QTextEdit
+
+
 
 
 import os
@@ -123,6 +130,16 @@ class MainWindow(QMainWindow):
         }
 
         # =========================
+        # Recherche dans texte OCR
+        # =========================
+        self.ocr_search_input = QLineEdit()
+        self.ocr_search_input.setPlaceholderText("🔍 Rechercher dans le texte OCR…")
+        self.ocr_search_input.textChanged.connect(self.search_in_ocr_text)
+
+        right_panel.addWidget(self.ocr_search_input)
+
+
+        # =========================
         # Zone texte OCR brut
         # =========================
         self.ocr_text_view = OcrTextView()
@@ -137,6 +154,26 @@ class MainWindow(QMainWindow):
         right_panel.addWidget(self.ocr_text_view)
 
         self.ocr_text_view.assign_to_field.connect(self.assign_text_to_field)
+
+        # =========================
+        # Navigation recherche OCR
+        # =========================
+        nav_layout = QHBoxLayout()
+
+        self.btn_prev_match = QPushButton("⬅️")
+        self.btn_next_match = QPushButton("➡️")
+        self.search_counter_label = QLabel("0 / 0")
+
+        self.btn_prev_match.clicked.connect(self.goto_previous_match)
+        self.btn_next_match.clicked.connect(self.goto_next_match)
+
+        nav_layout.addWidget(self.btn_prev_match)
+        nav_layout.addWidget(self.btn_next_match)
+        nav_layout.addWidget(self.search_counter_label)
+        nav_layout.addStretch()
+
+        right_panel.addLayout(nav_layout)
+
 
 
     # =========================
@@ -206,6 +243,15 @@ class MainWindow(QMainWindow):
         self.display_pdf()
         self.clear_fields()
         self.ocr_text_view.clear()
+        self.ocr_search_input.clear()
+        self.ocr_text_view.setExtraSelections([])
+        self.ocr_search_input.clear()
+        self.ocr_text_view.setExtraSelections([])
+        self.search_counter_label.setText("0 / 0")
+        self.search_selections = []
+        self.current_match_index = -1
+
+
 
 
     def display_pdf(self):
@@ -378,6 +424,96 @@ class MainWindow(QMainWindow):
 
         field.setText(text)
         field.setStyleSheet("background-color: #e6ffe6;")
+
+
+    def search_in_ocr_text(self, query: str):
+        editor = self.ocr_text_view
+
+        self.search_selections = []
+        self.current_match_index = -1
+        editor.setExtraSelections([])
+
+        if not query.strip():
+            self.search_counter_label.setText("0 / 0")
+            return
+
+        cursor = editor.textCursor()
+        cursor.movePosition(QTextCursor.Start)
+
+        while True:
+            cursor = editor.document().find(query, cursor)
+            if cursor.isNull():
+                break
+
+            sel = QTextEdit.ExtraSelection()
+            sel.cursor = cursor
+
+            fmt = QTextCharFormat()
+            fmt.setBackground(QColor("#fff59d"))  # jaune clair
+            sel.format = fmt
+
+            self.search_selections.append(sel)
+
+        if not self.search_selections:
+            self.search_counter_label.setText("0 / 0")
+            return
+
+        # Sélection active = première
+        self.current_match_index = 0
+        self._update_active_match()
+
+        self.search_counter_label.setText(
+            f"1 / {len(self.search_selections)}"
+        )
+
+    def goto_next_match(self):
+        if not self.search_selections:
+            return
+
+        self.current_match_index = (
+            self.current_match_index + 1
+        ) % len(self.search_selections)
+
+        self._update_active_match()
+
+
+    def goto_previous_match(self):
+        if not self.search_selections:
+            return
+
+        self.current_match_index = (
+            self.current_match_index - 1
+        ) % len(self.search_selections)
+
+        self._update_active_match()
+
+    def _update_active_match(self):
+        editor = self.ocr_text_view
+
+        updated = []
+
+        for i, sel in enumerate(self.search_selections):
+            fmt = QTextCharFormat()
+
+            if i == self.current_match_index:
+                fmt.setBackground(QColor("#ffcc80"))  # orange (actif)
+                editor.setTextCursor(sel.cursor)
+            else:
+                fmt.setBackground(QColor("#fff59d"))  # jaune
+
+            sel.format = fmt
+            updated.append(sel)
+
+        editor.setExtraSelections(updated)
+
+        self.search_counter_label.setText(
+            f"{self.current_match_index + 1} / {len(self.search_selections)}"
+    )
+
+
+
+
+
 
 
 
