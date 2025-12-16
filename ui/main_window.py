@@ -13,6 +13,11 @@ from PySide6.QtGui import QTextCharFormat, QColor, QTextCursor, QTextDocument
 from PySide6.QtWidgets import QTextEdit
 from PySide6.QtWidgets import QTableWidget, QTableWidgetItem
 import re
+import json
+from PySide6.QtWidgets import QProgressDialog
+from PySide6.QtWidgets import QApplication
+
+
 
 
 
@@ -52,6 +57,12 @@ class MainWindow(QMainWindow):
 
         self.btn_scan_folder = QPushButton("📂 Analyser un dossier")
         self.btn_scan_folder.clicked.connect(self.select_folder)
+
+        self.btn_ocr_all = QPushButton("⚙️ OCRiser")
+        self.btn_ocr_all.clicked.connect(self.ocr_all_pdfs)
+
+        left_panel.addWidget(self.btn_ocr_all)
+
 
 
         left_panel.addWidget(self.btn_scan_folder)
@@ -104,10 +115,16 @@ class MainWindow(QMainWindow):
 
         self.btn_analyze_pdf = QPushButton("🔍 Analyser le PDF (OCR)")
         self.btn_analyze_pdf.clicked.connect(self.analyze_pdf)
-        self.btn_save_model = QPushButton("💾 Sauvegarder le modèle")
-        self.btn_save_model.clicked.connect(self.save_model)
 
-        right_panel.addWidget(self.btn_save_model)
+        self.btn_save_data = QPushButton("💾 Sauvegarder")
+        self.btn_save_data.clicked.connect(self.save_current_data)
+
+        right_panel.addWidget(self.btn_save_data)
+
+
+        self.btn_save_supplier = QPushButton("⭐ Mettre à jour modèle fournisseur")
+        self.btn_save_supplier.clicked.connect(self.save_supplier_model)
+        right_panel.addWidget(self.btn_save_supplier)
 
 
         right_panel.addLayout(form_layout)
@@ -265,12 +282,10 @@ class MainWindow(QMainWindow):
 
         self.pdf_viewer.clear_highlights()
         self.display_pdf()
+        
         self.clear_fields()
         self.ocr_text_view.clear()
-
-
-
-
+        self.load_saved_data()
 
     def display_pdf(self):
         if not self.current_pdf_path or not os.path.exists(self.current_pdf_path):
@@ -313,6 +328,16 @@ class MainWindow(QMainWindow):
 
 
             self.fill_fields(data)
+
+            model = self.load_supplier_model(
+                self.iban_input.text(),
+                self.bic_input.text()
+            )
+
+            if model:
+                self.apply_supplier_model(model)
+
+            
             self.highlight_missing_fields()
 
             QMessageBox.information(
@@ -438,7 +463,7 @@ class MainWindow(QMainWindow):
             text = re.sub(r"[^A-Z0-9\-_/\. ]", "", text.upper()).strip()
 
         elif field_key == "folder_number":
-            text = re.sub(r"[^0-9]", "", text)
+            text = re.sub(r"[^A-Z0-9\-_/\. ]", "", text.upper()).strip()
 
 
         field.setText(text)
@@ -531,8 +556,236 @@ class MainWindow(QMainWindow):
 
 
 
+    def save_current_data(self):
+        if not self.current_pdf_path:
+            QMessageBox.warning(self, "Erreur", "Aucun PDF sélectionné.")
+            return
+
+        data = {
+            "iban": self.iban_input.text().strip(),
+            "bic": self.bic_input.text().strip(),
+            "invoice_date": self.date_input.text().strip(),
+            "invoice_number": self.invoice_number_input.text().strip(),
+            "folder_number": self.folder_number_input.text().strip(),
+        }
+
+        base_name = os.path.splitext(os.path.basename(self.current_pdf_path))[0]
+        model_dir = r"C:\git\OCR\OCR\models"
+        os.makedirs(model_dir, exist_ok=True)
+
+        json_path = os.path.join(model_dir, f"{base_name}.json")
+
+        try:
+            with open(json_path, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+
+            QMessageBox.information(self, "Sauvegarde", "Données sauvegardées avec succès.")
+
+        except Exception as e:
+            QMessageBox.critical(self, "Erreur sauvegarde", str(e))
 
 
 
+    def load_saved_data(self):
+        if not self.current_pdf_path:
+            return
+
+        base_name = os.path.splitext(os.path.basename(self.current_pdf_path))[0]
+        model_dir = r"C:\git\OCR\OCR\models"
+        json_path = os.path.join(model_dir, f"{base_name}.json")
+
+        if not os.path.exists(json_path):
+            return  # rien à charger
+
+        try:
+            with open(json_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            self.iban_input.setText(data.get("iban", ""))
+            self.bic_input.setText(data.get("bic", ""))
+            self.date_input.setText(data.get("invoice_date", ""))
+            self.invoice_number_input.setText(data.get("invoice_number", ""))
+            self.folder_number_input.setText(data.get("folder_number", ""))
+
+        except Exception as e:
+            QMessageBox.warning(self, "Erreur chargement", str(e))
 
 
+    def ocr_all_pdfs(self):
+        total = self.pdf_table.rowCount()
+        if total == 0:
+            QMessageBox.warning(self, "OCR", "Aucun PDF à traiter.")
+            return
+
+        progress = QProgressDialog(
+            "OCR en cours…",
+            "Annuler",
+            0,
+            total,
+            self
+        )
+        progress.setWindowTitle("OCR batch")
+        progress.setWindowModality(Qt.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.setValue(0)
+
+        processed = 0
+        skipped = 0
+        errors = 0
+
+        for row in range(total):
+            if progress.wasCanceled():
+                break
+
+            item = self.pdf_table.item(row, 0)
+            if not item:
+                continue
+
+            pdf_path = item.data(Qt.UserRole)
+            if not pdf_path or not os.path.exists(pdf_path):
+                errors += 1
+                continue
+
+            # ✅ SKIP si déjà OCRisé
+            if self._model_exists_for_pdf(pdf_path):
+                skipped += 1
+                progress.setValue(row + 1)
+                QApplication.processEvents()
+                continue
+
+            try:
+                progress.setLabelText(
+                    f"OCR en cours : {os.path.basename(pdf_path)}"
+                )
+
+                text = extract_text_from_pdf(pdf_path)
+                data = parse_invoice(text)
+
+                self._save_data_for_pdf(pdf_path, data)
+                processed += 1
+
+            except Exception as e:
+                print(f"OCR erreur sur {pdf_path} :", e)
+                errors += 1
+
+            progress.setValue(row + 1)
+            QApplication.processEvents()
+
+        progress.close()
+
+        QMessageBox.information(
+            self,
+            "OCR terminé",
+            f"OCR terminé.\n"
+            f"Nouveaux OCR : {processed}\n"
+            f"Déjà traités : {skipped}\n"
+            f"Erreurs : {errors}"
+        )
+
+
+
+    def _save_data_for_pdf(self, pdf_path, data):
+        base_name = os.path.splitext(os.path.basename(pdf_path))[0]
+        model_dir = r"C:\git\OCR\OCR\models"
+        os.makedirs(model_dir, exist_ok=True)
+
+        json_path = os.path.join(model_dir, f"{base_name}.json")
+
+        payload = {
+            "iban": data.iban or "",
+            "bic": data.bic or "",
+            "invoice_date": data.invoice_date or "",
+            "invoice_number": data.invoice_number or "",
+            "folder_number": data.folder_number or "",
+        }
+
+        with open(json_path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+
+
+    def _model_exists_for_pdf(self, pdf_path):
+        base_name = os.path.splitext(os.path.basename(pdf_path))[0]
+        model_dir = r"C:\git\OCR\OCR\models"
+        json_path = os.path.join(model_dir, f"{base_name}.json")
+        return os.path.exists(json_path)
+
+    def _get_supplier_key(self, iban: str, bic: str) -> str | None:
+        if not iban or not bic:
+            return None
+        return f"{iban}_{bic}"
+
+    def _get_supplier_model_path(self, supplier_key: str) -> str:
+        supplier_dir = r"C:\git\OCR\OCR\suppliers"
+        os.makedirs(supplier_dir, exist_ok=True)
+        return os.path.join(supplier_dir, f"{supplier_key}.json")
+
+    def save_supplier_model(self):
+        iban = self.iban_input.text().strip()
+        bic = self.bic_input.text().strip()
+
+        supplier_key = self._get_supplier_key(iban, bic)
+        if not supplier_key:
+            QMessageBox.warning(
+                self,
+                "Modèle fournisseur",
+                "IBAN et BIC requis pour créer un modèle fournisseur."
+            )
+            return
+
+        model_path = self._get_supplier_model_path(supplier_key)
+
+        data = {
+            "supplier_key": supplier_key,
+            "iban": iban,
+            "bic": bic,
+            "invoice_number_example": self.invoice_number_input.text().strip(),
+            "date_example": self.date_input.text().strip(),
+            "folder_number_example": self.folder_number_input.text().strip()
+        }
+
+        try:
+            with open(model_path, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+
+            QMessageBox.information(
+                self,
+                "Modèle fournisseur",
+                "Modèle fournisseur sauvegardé / mis à jour."
+            )
+
+        except Exception as e:
+            QMessageBox.critical(self, "Erreur", str(e))
+
+    def load_supplier_model(self, iban: str, bic: str) -> dict | None:
+        supplier_key = self._get_supplier_key(iban, bic)
+        if not supplier_key:
+            return None
+
+        model_path = self._get_supplier_model_path(supplier_key)
+        if not os.path.exists(model_path):
+            return None
+
+        try:
+            with open(model_path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return None
+
+    def apply_supplier_model(self, model: dict):
+        if not model:
+            return
+
+        # ⚠️ On ne remplace QUE les champs vides
+        if not self.invoice_number_input.text().strip():
+            self.invoice_number_input.setText(
+                model.get("invoice_number_example", "")
+            )
+
+        if not self.date_input.text().strip():
+            self.date_input.setText(
+                model.get("date_example", "")
+            )
+
+        if not self.folder_number_input.text().strip():
+            self.folder_number_input.setText(
+                model.get("folder_number_example", "")
+        )
