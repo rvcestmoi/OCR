@@ -1,5 +1,9 @@
 from PySide6.QtWidgets import QPlainTextEdit, QMenu
 from PySide6.QtCore import Signal
+from ocr.field_detector import guess_field
+
+
+
 
 
 class OcrTextView(QPlainTextEdit):
@@ -14,10 +18,8 @@ class OcrTextView(QPlainTextEdit):
         cursor = self.textCursor()
         selected_text = cursor.selectedText().strip()
 
-        # Menu standard si rien sélectionné
         if not selected_text:
-            super().contextMenuEvent(event)
-            return
+            return  # ❌ on n'appelle PAS le menu standard
 
         menu = QMenu(self)
 
@@ -29,11 +31,16 @@ class OcrTextView(QPlainTextEdit):
             "N° dossier": "folder_number",
         }
 
+        from ocr.field_detector import guess_field
+        suggested = guess_field(selected_text)
+
         for label, field_key in actions.items():
-            action = menu.addAction(f"➡ Remplir : {label}")
+            prefix = "⭐ " if field_key == suggested else ""
+            action = menu.addAction(f"{prefix}Remplir : {label}")
             action.triggered.connect(
                 lambda _, t=selected_text, k=field_key:
                 self.assign_to_field.emit(t, k)
             )
 
         menu.exec(event.globalPos())
+
