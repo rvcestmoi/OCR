@@ -5,6 +5,8 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QImage, QPixmap
+from ui.ocr_text_view import OcrTextView
+
 
 import os
 import fitz  # PyMuPDF
@@ -123,13 +125,18 @@ class MainWindow(QMainWindow):
         # =========================
         # Zone texte OCR brut
         # =========================
-        self.ocr_text_view = QPlainTextEdit()
+        self.ocr_text_view = OcrTextView()
+        self.ocr_text_view.setPlaceholderText("Texte brut OCR (Tesseract / PDF)…")
+        self.ocr_text_view.setMinimumHeight(200)
+
         self.ocr_text_view.setReadOnly(True)
         self.ocr_text_view.setPlaceholderText("Texte brut OCR (Tesseract / PDF)…")
         self.ocr_text_view.setMinimumHeight(200)
 
         right_panel.addWidget(QLabel("🧾 Texte OCR brut :"))
         right_panel.addWidget(self.ocr_text_view)
+
+        self.ocr_text_view.assign_to_field.connect(self.assign_text_to_field)
 
 
     # =========================
@@ -345,5 +352,32 @@ class MainWindow(QMainWindow):
         self.ocr_text_view.setPlainText(
             current + "\n\n--- OCR sélection ---\n" + text
         )
+
+
+    def assign_text_to_field(self, text: str, field_key: str):
+        text = text.strip()
+
+        mapping = {
+            "iban": self.iban_input,
+            "bic": self.bic_input,
+            "date": self.date_input,
+            "invoice_number": self.invoice_number_input,
+            "folder_number": self.folder_number_input,
+        }
+
+        field = mapping.get(field_key)
+        if not field:
+            return
+
+        # Nettoyage léger selon le champ
+        if field_key in ("invoice_number", "folder_number"):
+            text = "".join(c for c in text if c.isdigit())
+
+        if field_key in ("iban", "bic"):
+            text = text.replace(" ", "").upper()
+
+        field.setText(text)
+        field.setStyleSheet("background-color: #e6ffe6;")
+
 
 
