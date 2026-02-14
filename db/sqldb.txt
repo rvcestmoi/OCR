@@ -1,0 +1,21 @@
+CREATE TABLE dbo.XXA_LOGMAIL_228794 (
+    id_log            INT IDENTITY(1,1) PRIMARY KEY,
+    
+    date_creation     DATETIME2 NOT NULL DEFAULT SYSDATETIME(),
+    
+    message_id        NVARCHAR(255) NOT NULL,
+    entry_id          NVARCHAR(255) NOT NULL,
+    
+    nom_pdf           NVARCHAR(255) NOT NULL,
+    
+    sujet             NVARCHAR(500) NULL,
+    expediteur        NVARCHAR(255) NULL
+
+	ALTER TABLE dbo.XXA_LOGMAIL_228794
+ADD CONSTRAINT UQ_LOGMAIL_ENTRY_PDF
+UNIQUE (entry_id, nom_pdf);
+
+);
+
+ALTER TABLE dbo.XXA_LOGMAIL_228794
+ALTER COLUMN message_id NVARCHAR(255) NULL;

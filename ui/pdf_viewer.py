@@ -1,132 +1,150 @@
-from PySide6.QtWidgets import QLabel
-from PySide6.QtCore import Qt, QRect, Signal
-from PySide6.QtGui import QPainter, QPen, QImage, QColor
-import pytesseract
-from PIL import Image
+# ui/pdf_viewer.py
+
+from PySide6.QtWidgets import (
+    QWidget,
+    QVBoxLayout,
+    QLabel,
+    QScrollArea
+)
+from PySide6.QtGui import QPixmap
+from PySide6.QtCore import Qt, Signal
 
 
-class PdfViewer(QLabel):
+class PdfViewer(QWidget):
+    """
+    Viewer PDF avec navigation par page.
+
+    - PDF multipages
+    - Une page affichée à la fois
+    - Navigation page précédente / suivante
+    - Auto-zoom fit largeur
+    - Zoom manuel
+    - Compatible API legacy
+    """
+
+    # Compatibilité legacy
     text_selected = Signal(str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
 
-        self.setAlignment(Qt.AlignCenter)
-        self.setScaledContents(True)
+        self._pixmaps: list[QPixmap] = []
+        self._current_page: int = 0
 
-        self.start_pos = None
-        self.end_pos = None
-        self.selecting = False
+        self._zoom_factor: float = 1.0
+        self._auto_fit_width: bool = True
 
-        self.original_image = None  # QImage du PDF
-        self.highlights = []        # [{rect, color}]
+        self._init_ui()
 
-        # Injecté depuis MainWindow
-        self.active_field = None
-        self.field_colors = {}
+    # ------------------------------------------------------------------
+    # UI
+    # ------------------------------------------------------------------
+    def _init_ui(self) -> None:
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
 
-    # =========================
-    # Image handling
-    # =========================
-    def setPixmap(self, pixmap):
-        super().setPixmap(pixmap)
-        self.original_image = pixmap.toImage()
+        self.scroll_area = QScrollArea(self)
+        self.scroll_area.setWidgetResizable(True)
 
-    # =========================
-    # Mouse events
-    # =========================
-    def mousePressEvent(self, event):
-        if event.button() == Qt.LeftButton:
-            self.start_pos = event.position().toPoint()
-            self.end_pos = self.start_pos
-            self.selecting = True
-            self.update()
+        self.label = QLabel(self)
+        self.label.setAlignment(Qt.AlignCenter)
 
-    def mouseMoveEvent(self, event):
-        if self.selecting:
-            self.end_pos = event.position().toPoint()
-            self.update()
+        self.scroll_area.setWidget(self.label)
+        layout.addWidget(self.scroll_area)
 
-    def mouseReleaseEvent(self, event):
-        if self.selecting:
-            self.selecting = False
-            rect = QRect(self.start_pos, self.end_pos).normalized()
-            self.process_selection(rect)
-            self.update()
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+    def set_pages(self, pixmaps: list[QPixmap]) -> None:
+        self._pixmaps = pixmaps or []
+        self._current_page = 0
 
-    # =========================
-    # OCR sur zone sélectionnée
-    # =========================
-    def process_selection(self, rect: QRect):
-        if self.original_image is None:
+        if self._pixmaps:
+            self.fit_to_width()
+        else:
+            self.label.clear()
+
+    # Ancienne API mono-page
+    def setPixmap(self, pixmap: QPixmap | None) -> None:
+        if pixmap is None:
+            self.set_pages([])
+        else:
+            self.set_pages([pixmap])
+
+    # ---------------- Navigation ----------------
+    def next_page(self) -> None:
+        if self._current_page < len(self._pixmaps) - 1:
+            self._current_page += 1
+            self._refresh()
+
+    def previous_page(self) -> None:
+        if self._current_page > 0:
+            self._current_page -= 1
+            self._refresh()
+
+    def go_to_page(self, index: int) -> None:
+        if 0 <= index < len(self._pixmaps):
+            self._current_page = index
+            self._refresh()
+
+    def page_count(self) -> int:
+        return len(self._pixmaps)
+
+    def current_page_index(self) -> int:
+        return self._current_page
+
+    # ---------------- Zoom ----------------
+    def zoom_in(self) -> None:
+        self._auto_fit_width = False
+        self._zoom_factor *= 1.2
+        self._refresh()
+
+    def zoom_out(self) -> None:
+        self._auto_fit_width = False
+        self._zoom_factor /= 1.2
+        self._refresh()
+
+    def reset_zoom(self) -> None:
+        self.fit_to_width()
+
+    def fit_to_width(self) -> None:
+        if not self._pixmaps:
             return
 
-        label_w, label_h = self.width(), self.height()
-        img_w, img_h = self.original_image.width(), self.original_image.height()
+        viewport_width = self.scroll_area.viewport().width()
+        page_width = self._pixmaps[self._current_page].width()
 
-        scale_x = img_w / label_w
-        scale_y = img_h / label_h
+        if page_width > 0:
+            self._zoom_factor = viewport_width / page_width
+            self._auto_fit_width = True
+            self._refresh()
 
-        img_rect = QRect(
-            int(rect.x() * scale_x),
-            int(rect.y() * scale_y),
-            int(rect.width() * scale_x),
-            int(rect.height() * scale_y),
-        )
-
-        cropped = self.original_image.copy(img_rect)
-        if cropped.isNull():
+    # ------------------------------------------------------------------
+    # Internal
+    # ------------------------------------------------------------------
+    def _refresh(self) -> None:
+        if not self._pixmaps:
+            self.label.clear()
             return
 
-        cropped = cropped.convertToFormat(QImage.Format_RGB888)
-        buffer = cropped.bits().tobytes()
+        pixmap = self._pixmaps[self._current_page]
 
-        pil_image = Image.frombytes(
-            "RGB",
-            (cropped.width(), cropped.height()),
-            buffer
+        scaled = pixmap.scaled(
+            pixmap.size() * self._zoom_factor,
+            Qt.KeepAspectRatio,
+            Qt.SmoothTransformation
         )
 
-        text = pytesseract.image_to_string(
-            pil_image,
-            lang="fra+eng+deu+spa+ita+nld",
-            config="--psm 7"
-        ).strip()
+        self.label.setPixmap(scaled)
 
-        # Highlight
-        color = self.field_colors.get(
-            self.active_field,
-            QColor(255, 255, 0, 80)
-        )
+    # ------------------------------------------------------------------
+    # Legacy no-op (zones / highlights supprimés)
+    # ------------------------------------------------------------------
+    def clear_highlights(self) -> None:
+        pass
 
-        self.highlights.append({
-            "rect": rect,
-            "color": color
-        })
+    def set_highlights(self, *args, **kwargs) -> None:
+        pass
 
-        if text:
-            self.text_selected.emit(text)
-
-        self.update()
-
-    # =========================
-    # Drawing
-    # =========================
-    def paintEvent(self, event):
-        super().paintEvent(event)
-
-        painter = QPainter(self)
-
-        for h in self.highlights:
-            painter.setBrush(h["color"])
-            painter.setPen(Qt.NoPen)
-            painter.drawRect(h["rect"])
-
-        if self.selecting and self.start_pos and self.end_pos:
-            painter.setPen(QPen(Qt.red, 2, Qt.DashLine))
-            painter.setBrush(Qt.NoBrush)
-            painter.drawRect(QRect(self.start_pos, self.end_pos))
-
-    def clear_highlights(self):
-        self.highlights.clear()
-        self.update()
+    def highlight_field(self, *args, **kwargs) -> None:
+        pass

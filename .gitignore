@@ -1,0 +1,7 @@
+db/config.py
+db/__pycache__
+models/
+ui/__pycache__
+ocr/__pycache__
+PJ/
+
