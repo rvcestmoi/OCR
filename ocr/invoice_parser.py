@@ -115,13 +115,14 @@ def extract_invoice_number(text: str) -> str:
     return match.group(2) if match else ""
 
 
-def extract_folder_number(text: str) -> str:
-    match = re.search(
-        r'(N°|No\.?|LS:|Dossier)[^\d]{0,5}(\d{6,})',
-        text,
-        re.IGNORECASE
-    )
-    return match.group(2) if match else ""
+def extract_folder_number(text: str) -> str | None:
+    pattern = r"\b(?:1\d{8}|(?:84|25|35|44|64|67|69|72|78)\d{7})\b"
+
+    match = re.search(pattern, text)
+    if match:
+        return match.group(0)
+
+    return None
 
 
 # =========================

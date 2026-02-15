@@ -1,7 +1,13 @@
-db/config.py
-db/__pycache__
-models/
-ui/__pycache__
-ocr/__pycache__
-PJ/
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
 
+# Si tu veux ignorer spécifiquement tes dossiers
+db/config.py
+db/__pycache__/
+ui/__pycache__/
+ocr/__pycache__/
+PJ/
+models/
