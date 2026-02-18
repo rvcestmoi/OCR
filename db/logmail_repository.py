@@ -25,3 +25,11 @@ class LogmailRepository(BaseRepository):
             ORDER BY nom_pdf
         """
         return self.fetch_all(query, (entry_id,))
+
+def update_entry_for_file(self, nom_pdf: str, entry_id: str) -> None:
+    query = """
+        UPDATE XXA_LOGMAIL_PDF
+        SET entry_id = ?
+        WHERE nom_pdf = ?
+    """
+    self.execute(query, (entry_id, nom_pdf))
