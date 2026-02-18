@@ -58,6 +58,8 @@ class MainWindow(QMainWindow):
         self.bank_valid: bool | None = None
         self.selected_invoice_entry_id = None
         self.selected_invoice_filename = None
+        self.transporter_selected_mode = False   # True = on est sur un transporteur choisi (kundennr)
+
 
 
         # --- Window ---
@@ -262,6 +264,9 @@ class MainWindow(QMainWindow):
         for field in [self.iban_input, self.bic_input, self.date_input, self.invoice_number_input]:
             field.mousePressEvent = lambda e, f=field: self.set_active_field(f)
             field.textChanged.connect(lambda _, f=field: f.setStyleSheet(""))
+            self.transporter_input.mousePressEvent = lambda e, f=self.transporter_input: self.set_active_field(f)
+            self.transporter_input.textChanged.connect(lambda _: self.transporter_input.setStyleSheet(""))
+
 
         # =========================
         # Recherche dans texte OCR
@@ -317,19 +322,24 @@ class MainWindow(QMainWindow):
         field.setStyleSheet("background-color: #fff3cd;")
 
         # ✅ Volet info selon champ actif
-        if field in (self.iban_input, self.bic_input, self.transporter_input):
-            self.load_transporter_information()
+        # ✅ Volet info selon champ actif
+        if field in (self.iban_input, self.bic_input):
+            # IBAN/BIC -> toujours par banque
+            self.transporter_selected_mode = False
+            self.load_transporter_information(force_by_kundennr=False)
+            return
+
+        if field == self.transporter_input:
+            # Transporteur -> si on a sélectionné un transporteur avant, on recharge par kundennr
+            self.load_transporter_information(force_by_kundennr=self.transporter_selected_mode)
             return
 
         # Champs dossier (dynamiques)
         for _, folder_le, amount_le in getattr(self, "folder_inputs", []):
-            if field == folder_le:
+            if field == folder_le or field == amount_le:
                 self.load_tour_information(folder_le.text())
                 return
-            if field == amount_le:
-                # optionnel : si tu veux aussi charger la tour quand on clique sur le montant
-                self.load_tour_information(folder_le.text())
-                return
+
 
 
 
@@ -393,6 +403,9 @@ class MainWindow(QMainWindow):
         amount_edit = QLineEdit()
         amount_edit.setPlaceholderText("Montant HT (OCR)")
         amount_edit.setText(amount_ht)
+        folder_edit.mousePressEvent = lambda e, f=folder_edit: self.set_active_field(f)
+        amount_edit.mousePressEvent = lambda e, f=amount_edit: self.set_active_field(f)
+
 
         btn_remove = QPushButton("❌")
         btn_remove.setFixedWidth(30)
@@ -424,6 +437,12 @@ class MainWindow(QMainWindow):
         # Events => comparaison
         folder_edit.textChanged.connect(lambda _: self.update_folder_row_status(container_widget))
         amount_edit.textChanged.connect(lambda _: self.update_folder_row_status(container_widget))
+
+        folder_edit.textChanged.connect(lambda _: self.on_folder_changed(folder_edit))
+
+        folder_edit.mousePressEvent = lambda e, f=folder_edit: self.set_active_field(f)
+        amount_edit.mousePressEvent = lambda e, f=amount_edit: self.set_active_field(f)
+
 
         # premier calcul
         self.update_folder_row_status(container_widget)
@@ -1027,16 +1046,27 @@ class MainWindow(QMainWindow):
             self.iban_input.setStyleSheet("background-color: #fff3cd;")
             self.bic_input.setStyleSheet("background-color: #fff3cd;")
 
-    def load_transporter_information(self):
+    def load_transporter_information(self, force_by_kundennr: bool = False):
+        self.transporter_info.clear()
+
         iban = self.iban_input.text().strip()
         bic = self.bic_input.text().strip()
+        # si on est en mode transporteur sélectionné, on privilégie KundenNr
+        if self.transporter_selected_mode and self.selected_kundennr:
+            force_by_kundennr = True
 
-        self.transporter_info.clear()
-        if not iban or not bic:
-            return
 
         try:
-            record = self.transporter_repo.find_transporter_by_bank(iban, bic)
+            record = None
+
+            # 1) si on force KundenNr (sélection transporteur) OU si IBAN/BIC absents mais KundenNr connu
+            if force_by_kundennr or ((not iban or not bic) and self.selected_kundennr):
+                record = self.transporter_repo.find_transporter_by_kundennr(self.selected_kundennr)
+
+            # 2) sinon comportement existant : chercher par banque
+            elif iban and bic:
+                record = self.transporter_repo.find_transporter_by_bank(iban, bic)
+
             if not record:
                 self.transporter_info.setPlainText("❌ Transporteur non trouvé en base.")
                 return
@@ -1045,7 +1075,11 @@ class MainWindow(QMainWindow):
             name = record.get("name1", "")
 
             self.selected_kundennr = str(kundennr) if kundennr is not None else None
+
+            # ⚠️ Important : ne pas déclencher search_transporters quand on set le texte
+            self.transporter_input.blockSignals(True)
             self.transporter_input.setText(f"{name} ({kundennr})")
+            self.transporter_input.blockSignals(False)
 
             self.current_db_iban = record.get("IBAN", "") or ""
             self.current_db_bic = record.get("SWIFT", "") or ""
@@ -1061,11 +1095,11 @@ class MainWindow(QMainWindow):
             )
             self.transporter_info.setPlainText(text)
 
-            # laisse enable_transporter_update décider si flèche active (modif réelle)
             self.enable_transporter_update()
 
         except Exception as e:
             self.transporter_info.setPlainText(f"Erreur chargement transporteur :\n{e}")
+
 
     def on_bank_fields_changed(self):
         self.check_bank_information()
@@ -1085,12 +1119,23 @@ class MainWindow(QMainWindow):
             self.transporter_model.setStringList(suggestions)
         except Exception as e:
             print("Erreur recherche transporteur:", e)
-
+            
     def on_transporter_selected(self, text: str):
         self.transporter_input.setText(text)
+
         if "(" in text and ")" in text:
             self.selected_kundennr = text.split("(")[-1].replace(")", "").strip()
+        else:
+            self.selected_kundennr = None
+
+        # ✅ On passe en mode "transporteur choisi"
+        self.transporter_selected_mode = bool(self.selected_kundennr)
+
+        # ✅ Charger le transporteur par KundenNr (pas par IBAN/BIC)
+        self.load_transporter_information(force_by_kundennr=True)
+
         self.enable_transporter_update()
+
 
     def on_transporter_action(self):
         if not self.selected_kundennr:

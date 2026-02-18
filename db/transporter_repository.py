@@ -77,5 +77,23 @@ class TransporterRepository(BaseRepository):
 
 
 
+    def find_transporter_by_kundennr(self, kundennr: str):
+        query = """
+            SELECT TOP 1
+                bank.IBAN,
+                bank.SWIFT,
+                bank.BankName,
+                kun.name1,
+                kun.Strasse,
+                kun.Ort,
+                kun.LKZ,
+                kun.KundenNr
+            FROM xxakun kun
+            LEFT JOIN xxakunbank bank
+                ON bank.KundenNr = kun.KundenNr
+            WHERE kun.KundenNr = ?
+            ORDER BY bank.LfdNr
+        """
+        return self.fetch_one(query, (kundennr,))
 
 
