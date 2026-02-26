@@ -15,15 +15,29 @@ from PySide6.QtWidgets import (
     QVBoxLayout, QHBoxLayout, QFileDialog, QLabel,
     QLineEdit, QFormLayout, QMessageBox, QPlainTextEdit,
     QTextEdit, QTableWidget, QTableWidgetItem, QProgressDialog,
-    QApplication, QSplitter, QCompleter
+    QApplication, QSplitter, QCompleter, QHeaderView
 )
+##from matplotlib import text
 
-from ui.ocr_text_view import OcrTextView
+
 from ui.pdf_viewer import PdfViewer
 from ocr.ocr_engine import extract_text_from_pdf
 from ocr.invoice_parser import parse_invoice
-from ocr.supplier_model import build_supplier_key, load_supplier_model
+from ocr.supplier_model import (
+    build_supplier_key,
+    load_supplier_model,
+    save_supplier_model,
+    learn_supplier_patterns,
+    merge_patterns,
+    extract_fields_with_model,
+)
 from PySide6.QtWidgets import QMenu
+from ui.pallet_details_dialog import PalletDetailsDialog
+from PySide6.QtWidgets import QDialog
+from ui.block_options_dialog import BlockOptionsDialog
+
+from datetime import datetime
+from ocr.supplier_model import extract_best_bank_ids
 
 
 class MainWindow(QMainWindow):
@@ -37,6 +51,7 @@ class MainWindow(QMainWindow):
         from db.transporter_repository import TransporterRepository
         from db.bank_repository import BankRepository
         from db.tour_repository import TourRepository
+        from ui.ocr_text_view import OcrTextView
 
         self.db_conn = SqlServerConnection(**DB_CONFIG)
 
@@ -44,7 +59,6 @@ class MainWindow(QMainWindow):
         self.transporter_repo = TransporterRepository(self.db_conn)
         self.bank_repo = BankRepository(self.db_conn)
         self.tour_repo = TourRepository(self.db_conn)
-
 
         # --- State ---
         self.current_pdf_path: str | None = None
@@ -58,9 +72,14 @@ class MainWindow(QMainWindow):
         self.bank_valid: bool | None = None
         self.selected_invoice_entry_id = None
         self.selected_invoice_filename = None
-        self.transporter_selected_mode = False   # True = on est sur un transporteur choisi (kundennr)
+        self.transporter_selected_mode = False  # True = on est sur un transporteur choisi (kundennr)
 
+        # PDF "affiché" (peut être la facture ou une PJ)
+        self.view_pdf_path: str | None = None
 
+        # Groupe de PDFs (même entry_id)
+        self.entry_pdf_paths: list[str] = []
+        self.current_doc_index: int = 0
 
         # --- Window ---
         self.setWindowTitle("OCR Factures Fournisseurs")
@@ -128,7 +147,21 @@ class MainWindow(QMainWindow):
         # =========================
         center_panel = QVBoxLayout()
 
+        # --- Barre navigation PDF (docs + pages) ---
         pdf_nav = QHBoxLayout()
+
+        # ✅ navigation documents (même entry_id)
+        self.btn_prev_doc = QPushButton("⏪")
+        self.btn_next_doc = QPushButton("⏩")
+        self.lbl_doc_info = QLabel("0 / 0")
+
+        self.btn_prev_doc.setToolTip("Document précédent")
+        self.btn_next_doc.setToolTip("Document suivant")
+
+        self.btn_prev_doc.clicked.connect(self.on_prev_doc)
+        self.btn_next_doc.clicked.connect(self.on_next_doc)
+
+        # ✅ navigation pages (dans le PDF)
         self.btn_prev_page = QPushButton("⏮")
         self.btn_next_page = QPushButton("⏭")
         self.lbl_page_info = QLabel("0 / 0")
@@ -137,18 +170,38 @@ class MainWindow(QMainWindow):
         self.btn_next_page.clicked.connect(self.on_next_page)
 
         pdf_nav.addStretch()
+        pdf_nav.addWidget(self.btn_prev_doc)
+        pdf_nav.addWidget(self.lbl_doc_info)
+        pdf_nav.addWidget(self.btn_next_doc)
+
+        pdf_nav.addSpacing(16)
+
         pdf_nav.addWidget(self.btn_prev_page)
         pdf_nav.addWidget(self.lbl_page_info)
         pdf_nav.addWidget(self.btn_next_page)
         pdf_nav.addStretch()
+
         center_panel.addLayout(pdf_nav)
 
+        # --- Viewer ---
         self.pdf_viewer = PdfViewer()
         self.pdf_viewer.setMinimumSize(400, 400)
         self.pdf_viewer.text_selected.connect(self.fill_active_field)
         self.pdf_viewer.text_selected.connect(self.append_ocr_text)
         center_panel.addWidget(self.pdf_viewer)
 
+        # --- Clic droit sur la zone PDF ---
+        target = getattr(self.pdf_viewer, "label", self.pdf_viewer)
+        target.setContextMenuPolicy(Qt.CustomContextMenu)
+        target.customContextMenuRequested.connect(self.on_pdf_context_menu)
+
+        # Stockage en mémoire des détails palettes (chargé depuis le JSON)
+        self.pallet_details = {}
+
+        self.block_options = {}   # { "nom_fichier.pdf": {"blocked": bool, "comment": str} }
+
+
+        # --- Volet info (transporteur/tour) ---
         self.transporter_info = QPlainTextEdit()
         self.transporter_info.setReadOnly(True)
         self.transporter_info.setMaximumHeight(120)
@@ -191,8 +244,6 @@ class MainWindow(QMainWindow):
         self.btn_transporter_action = QPushButton("➡")
         self.btn_transporter_action.setFixedWidth(30)
         self.btn_transporter_action.clicked.connect(self.on_transporter_action)
-        # (tu peux remettre False si tu veux un vrai contrôle d'état)
-        # self.btn_transporter_action.setEnabled(False)
 
         transporter_layout = QHBoxLayout()
         transporter_layout.addWidget(self.transporter_input)
@@ -204,29 +255,58 @@ class MainWindow(QMainWindow):
         form_layout.addRow("N° facture :", self.invoice_number_input)
 
         # =========================
-        # Gestion multi-dossiers
+        # Table dossiers (N° dossier / Montant HT)
         # =========================
-        self.folder_inputs: list[tuple[QWidget, QLineEdit, QLineEdit]] = []
+        self.folder_table = QTableWidget(0, 2)
+        self.folder_table.setHorizontalHeaderLabels(["N° dossier", "Montant HT (OCR)"])
+        self.folder_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+        self.folder_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        self.folder_table.setAlternatingRowColors(True)
+        self.folder_table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.folder_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.folder_table.setMinimumHeight(140)
 
-
-        self.folder_container = QVBoxLayout()
-        self.folder_container.setSpacing(5)
+        # Totaux dossiers
         self.lbl_folder_totals = QLabel("")
         self.lbl_folder_totals.setStyleSheet("padding:4px;")
-        self.folder_container.addWidget(self.lbl_folder_totals)
 
+        # =========================
+        # TVA (table sous les dossiers)
+        # =========================
+        self.vat_table = QTableWidget(0, 3)
+        self.vat_table.setHorizontalHeaderLabels(["Taux TVA (%)", "Base HT", "Montant TVA"])
+        self.vat_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        self.vat_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
+        self.vat_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        self.vat_table.setAlternatingRowColors(True)
+        self.vat_table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.vat_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.vat_table.setMinimumHeight(110)
 
-        self.btn_add_folder = QPushButton("➕")
-        self.btn_add_folder.setFixedWidth(30)
-        self.btn_add_folder.clicked.connect(self.add_folder_field)
+        self.lbl_vat_total = QLabel("")
+        self.lbl_vat_total.setStyleSheet("padding:4px;")
 
-        folder_main_layout = QHBoxLayout()
-        folder_main_layout.addLayout(self.folder_container)
-        folder_main_layout.addWidget(self.btn_add_folder)
-        folder_main_layout.addStretch()
+        # =========================
+        # Conteneur vertical (dossiers + totaux + TVA)
+        # =========================
+        folders_box = QWidget()
+        self.folders_layout = QVBoxLayout(folders_box)
+        self.folders_layout.setContentsMargins(0, 0, 0, 0)
 
-        form_layout.addRow("N° dossier :", folder_main_layout)
-                # =========================
+        self.folders_layout.addWidget(self.folder_table)
+        self.folders_layout.addWidget(self.lbl_folder_totals)
+
+        self.folders_layout.addWidget(QLabel("TVA :"))
+        self.folders_layout.addWidget(self.vat_table)
+        self.folders_layout.addWidget(self.lbl_vat_total)
+
+        form_layout.addRow("Dossiers :", folders_box)
+
+        # Lignes vides permanentes
+        self._ensure_empty_folder_row()
+        self._ensure_empty_vat_row()
+
+        # =========================
         # Gestion champ actif (PDF -> champ)
         # =========================
         self.FIELD_COLORS = {
@@ -234,12 +314,7 @@ class MainWindow(QMainWindow):
             self.bic_input: QColor(186, 85, 211, 80),             # violet
             self.date_input: QColor(60, 179, 113, 80),            # vert
             self.invoice_number_input: QColor(255, 215, 0, 80),   # jaune
-            # ⚠️ les champs dossier sont dynamiques : gérés à la création
         }
-
-
-        # premier champ par défaut
-        self.add_folder_field()
 
         # Boutons principaux
         self.btn_analyze_pdf = QPushButton("🔍 Analyser le PDF (OCR)")
@@ -257,16 +332,16 @@ class MainWindow(QMainWindow):
         right_panel.addStretch()
         right_panel.addWidget(self.btn_analyze_pdf)
 
+        # Layout global
         main_layout.addLayout(center_panel, 5)
         main_layout.addLayout(right_panel, 3)
 
-
+        # Champs cliquables
         for field in [self.iban_input, self.bic_input, self.date_input, self.invoice_number_input]:
             field.mousePressEvent = lambda e, f=field: self.set_active_field(f)
             field.textChanged.connect(lambda _, f=field: f.setStyleSheet(""))
             self.transporter_input.mousePressEvent = lambda e, f=self.transporter_input: self.set_active_field(f)
             self.transporter_input.textChanged.connect(lambda _: self.transporter_input.setStyleSheet(""))
-
 
         # =========================
         # Recherche dans texte OCR
@@ -310,6 +385,10 @@ class MainWindow(QMainWindow):
         self.bic_input.textChanged.connect(self.enable_transporter_update)
         self.transporter_input.textChanged.connect(self.enable_transporter_update)
 
+        # Optionnel (mais utile) : état initial boutons doc
+        self.btn_prev_doc.setEnabled(False)
+        self.btn_next_doc.setEnabled(False)
+
     # =========================
     # Active field / PDF selection
     # =========================
@@ -334,10 +413,10 @@ class MainWindow(QMainWindow):
             self.load_transporter_information(force_by_kundennr=self.transporter_selected_mode)
             return
 
-        # Champs dossier (dynamiques)
-        for _, folder_le, amount_le in getattr(self, "folder_inputs", []):
-            if field == folder_le or field == amount_le:
-                self.load_tour_information(folder_le.text())
+        for r in range(self.folder_table.rowCount()):
+            dossier_le, amount_le = self._get_row_widgets(r)
+            if field == dossier_le or field == amount_le:
+                self.load_tour_information(dossier_le.text())
                 return
 
 
@@ -368,102 +447,24 @@ class MainWindow(QMainWindow):
     # Folder fields helpers
     # =========================
     def get_folder_line_edits(self) -> list[QLineEdit]:
-        return [folder_le for _, folder_le, _ in self.folder_inputs]
-
-
-    def clear_folder_fields(self, keep_one: bool = True):
-        for container, _, _ in self.folder_inputs:
-            self.folder_container.removeWidget(container)
-            container.deleteLater()
-        self.folder_inputs.clear()
-
-        if keep_one:
-            self.add_folder_field("", "")
-
-
-
-    def get_folder_numbers(self) -> list[str]:
-        out: list[str] = []
-        for _, folder_le, _ in self.folder_inputs:
-            val = folder_le.text().strip()
-            if val:
-                out.append(val)
+        out = []
+        for r in range(self.folder_table.rowCount()):
+            dossier_le, _ = self._get_row_widgets(r)
+            if dossier_le:
+                out.append(dossier_le)
         return out
 
 
-    def add_folder_field(self, value="", amount_ht=""):
-        # value peut parfois arriver en bool si tu appelles add_folder_field(False) => on sécurise
-        value = "" if value is None else str(value)
-        amount_ht = "" if amount_ht is None else str(amount_ht)
-
-        folder_edit = QLineEdit()
-        folder_edit.setPlaceholderText("Numéro de dossier")
-        folder_edit.setText(value)
-
-        amount_edit = QLineEdit()
-        amount_edit.setPlaceholderText("Montant HT (OCR)")
-        amount_edit.setText(amount_ht)
-        folder_edit.mousePressEvent = lambda e, f=folder_edit: self.set_active_field(f)
-        amount_edit.mousePressEvent = lambda e, f=amount_edit: self.set_active_field(f)
-
-
-        btn_remove = QPushButton("❌")
-        btn_remove.setFixedWidth(30)
-
-        row_layout = QHBoxLayout()
-        row_layout.addWidget(folder_edit)
-        row_layout.addWidget(amount_edit)
-        row_layout.addWidget(btn_remove)
-
-        container_widget = QWidget()
-        container_widget.setLayout(row_layout)
-
-        # Insert avant le label totals si présent, sinon fin
-        # (on garantit que le label totals reste en bas)
-        if hasattr(self, "lbl_folder_totals") and self.lbl_folder_totals is not None:
-            idx = self.folder_container.indexOf(self.lbl_folder_totals)
-            if idx >= 0:
-                self.folder_container.insertWidget(idx, container_widget)
-            else:
-                self.folder_container.addWidget(container_widget)
-        else:
-            self.folder_container.addWidget(container_widget)
-
-        # IMPORTANT: maintenant folder_inputs stocke (container, folder_edit, amount_edit)
-        self.folder_inputs.append((container_widget, folder_edit, amount_edit))
-
-        btn_remove.clicked.connect(lambda: self.remove_folder_field(container_widget))
-
-        # Events => comparaison
-        folder_edit.textChanged.connect(lambda _: self.update_folder_row_status(container_widget))
-        amount_edit.textChanged.connect(lambda _: self.update_folder_row_status(container_widget))
-
-        folder_edit.textChanged.connect(lambda _: self.on_folder_changed(folder_edit))
-
-        folder_edit.mousePressEvent = lambda e, f=folder_edit: self.set_active_field(f)
-        amount_edit.mousePressEvent = lambda e, f=amount_edit: self.set_active_field(f)
-
-
-        # premier calcul
-        self.update_folder_row_status(container_widget)
-
+    def clear_folder_fields(self, *args, **kwargs):
+        self.folder_table.setRowCount(0)
+        self._ensure_empty_folder_row()
+        self.update_folder_totals()
 
     def on_folder_changed(self, line_edit: QLineEdit):
         # Si on est en train d’éditer ce champ dossier, on refresh le volet info tour
         if self.active_field == line_edit:
             self.load_tour_information(line_edit.text())
 
-
-    def remove_folder_field(self, widget):
-        for i, (container, folder_edit, amount_edit) in enumerate(self.folder_inputs):
-            if container == widget:
-                self.folder_container.removeWidget(container)
-                container.deleteLater()
-                self.folder_inputs.pop(i)
-                break
-
-        # Recalcule les totaux
-        self.update_folder_totals()
 
     # =========================
     # PDF list / display
@@ -496,29 +497,32 @@ class MainWindow(QMainWindow):
         self.selected_invoice_filename = invoice_filename
         self.selected_invoice_entry_id = self.logmail_repo.get_entry_id_for_file(invoice_filename)
 
+        # facture = PDF cible
+        self.view_pdf_path = self.current_pdf_path
 
-        self.pdf_viewer.clear_highlights()
-        self.display_pdf()
+        # construit la liste des PDFs du même entry_id
+        self.build_entry_pdf_group()
+        self.show_doc_by_index(0)
 
-        self.clear_fields()
-        self.ocr_text_view.clear()
-        self.load_saved_data()
-        self.update_page_indicator()
-        self.load_related_pdfs()
+
+        ##self.clear_fields()
+        ##self.ocr_text_view.clear()
+        ##self.load_saved_data()
+        ##self.load_related_pdfs()
 
     def display_pdf(self):
-        if not self.current_pdf_path or not os.path.exists(self.current_pdf_path):
+        pdf_path = self.view_pdf_path or self.current_pdf_path
+        if not pdf_path or not os.path.exists(pdf_path):
             return
 
         try:
-            doc = fitz.open(self.current_pdf_path)
+            doc = fitz.open(pdf_path)
             pixmaps = []
             for page in doc:
                 pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
                 img = QImage(pix.samples, pix.width, pix.height, pix.stride, QImage.Format_RGB888)
                 pixmaps.append(QPixmap.fromImage(img))
             self.pdf_viewer.set_pages(pixmaps)
-            self.update_page_indicator()
             doc.close()
         except Exception as e:
             QMessageBox.critical(self, "Erreur PDF", str(e))
@@ -527,6 +531,7 @@ class MainWindow(QMainWindow):
     # OCR
     # =========================
     def analyze_pdf(self):
+
         if not self.current_pdf_path:
             QMessageBox.warning(self, "Erreur", "Aucun PDF sélectionné.")
             return
@@ -550,6 +555,27 @@ class MainWindow(QMainWindow):
                 self.apply_supplier_model(model)
 
             self.highlight_missing_fields()
+            ocr_text = self.ocr_text_view.toPlainText() or ""
+            best = extract_best_bank_ids(
+                ocr_text,
+                prefer_iban=self.iban_input.text().strip(),
+                prefer_bic=self.bic_input.text().strip(),
+            )
+
+            if best["iban"] and not self.iban_input.text().strip():
+                self.iban_input.setText(best["iban"])
+            if best["bic"] and not self.bic_input.text().strip():
+                self.bic_input.setText(best["bic"])
+
+            supplier_key = build_supplier_key(
+                self.iban_input.text().strip(),
+                self.bic_input.text().strip(),
+            )
+            if supplier_key:
+                model = load_supplier_model(supplier_key)
+                if model:
+                    self.apply_supplier_model(model)
+
 
             QMessageBox.information(self, "OCR terminé", "Analyse OCR terminée.\nVous pouvez corriger les champs.")
         except Exception as e:
@@ -562,26 +588,29 @@ class MainWindow(QMainWindow):
         self.date_input.setText(data.invoice_date or "")
         self.invoice_number_input.setText(data.invoice_number or "")
 
-        # Multi-dossiers
-        # (supprime toutes les lignes existantes + remet le label totaux)
-        self.clear_folder_fields(keep_one=False)
+        # dossiers
+        self.folder_table.setRowCount(0)
 
-        # 1) Cas où parse_invoice renvoie déjà une liste (folder_numbers)
         folder_numbers = getattr(data, "folder_numbers", None)
         if folder_numbers:
             for n in folder_numbers:
                 if n:
-                    self.add_folder_field(str(n), "")  # (tour_nr, amount_ht_ocr)
-            # si la liste est vide après filtrage
-            if not self.folder_inputs:
-                self.add_folder_field("", "")
-
-        # 2) Compat : un seul folder_number
+                    self._add_folder_row(str(n), "")
         else:
             if getattr(data, "folder_number", None):
-                self.add_folder_field(str(data.folder_number), "")
-            else:
-                self.add_folder_field("", "")
+                self._add_folder_row(str(data.folder_number), "")
+        # ligne vide permanente
+        self._ensure_empty_folder_row()
+        self.update_folder_totals()
+        # --- TVA ---
+        self.vat_table.setRowCount(0)
+
+        vat_lines = getattr(data, "vat_lines", None) or []
+        for r in vat_lines:
+            self._add_vat_row(r.get("rate", ""), r.get("base", ""), r.get("vat", ""))
+
+        self._ensure_empty_vat_row()
+        self.update_vat_total()
 
         # Totaux / couleurs (si tu as ces fonctions)
         if hasattr(self, "update_folder_totals"):
@@ -595,20 +624,26 @@ class MainWindow(QMainWindow):
                 continue
             field.setStyleSheet("background-color: #ffe6e6;" if not field.text().strip() else "background-color: #e6ffe6;")
 
-        # dossiers : au moins 1 rempli
-        folders = self.get_folder_numbers()
-        for _, folder_le, _ in self.folder_inputs:
-            if folders:
-                folder_le.setStyleSheet("background-color: #e6ffe6;" if folder_le.text().strip() else "")
+        rows = self.get_folder_rows()
+        has_any = any(r.get("tour_nr") for r in rows)
+
+        for r in range(self.folder_table.rowCount()):
+            dossier_le, _ = self._get_row_widgets(r)
+            if not dossier_le:
+                continue
+            if has_any:
+                # vert seulement si rempli
+                dossier_le.setStyleSheet("background-color: #e6ffe6;" if dossier_le.text().strip() else "")
             else:
-                folder_le.setStyleSheet("background-color: #ffe6e6;")
+                # si aucun dossier saisi, on met la première ligne en rouge
+                dossier_le.setStyleSheet("background-color: #ffe6e6;" if r == 0 else "")
 
 
     def clear_fields(self):
         for field in [self.iban_input, self.bic_input, self.date_input, self.invoice_number_input]:
             field.clear()
             field.setStyleSheet("")
-        self.clear_folder_fields(keep_one=True)
+        self.clear_folder_fields()
 
     # =========================
     # OCR text view helpers
@@ -631,17 +666,19 @@ class MainWindow(QMainWindow):
         if field_key == "folder_number":
             m = re.search(self.DOSSIER_PATTERN, text)
             dossier = m.group(0) if m else ""
-            # on remplit le 1er champ vide sinon on en crée un nouveau
-            for _, folder_le, _ in self.folder_inputs:
-                if not folder_le.text().strip():
-                    folder_le.setText(dossier)
-                    folder_le.setStyleSheet("background-color: #e6ffe6;")
+
+            # remplir la première ligne dont la colonne dossier est vide (en évitant la ligne vide du bas si elle existe)
+            for r in range(self.folder_table.rowCount()):
+                dossier_le, _ = self._get_row_widgets(r)
+                if dossier_le and not dossier_le.text().strip():
+                    dossier_le.setText(dossier)
+                    dossier_le.setStyleSheet("background-color: #e6ffe6;")
+                    self._ensure_empty_folder_row()
                     return
 
-            self.add_folder_field(dossier)
-            _, folder_le, _ = self.folder_inputs[-1]
-            folder_le.setStyleSheet("background-color: #e6ffe6;")
-
+            # sinon on force une nouvelle ligne (avant/avec la ligne vide)
+            self._add_folder_row(dossier, "")
+            self._ensure_empty_folder_row()
             return
 
         if field_key == "iban":
@@ -734,12 +771,7 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Erreur", "Aucun PDF sélectionné.")
             return
 
-        folders = []
-        for _, folder_edit, amount_edit in self.folder_inputs:
-            num = folder_edit.text().strip()
-            amt = amount_edit.text().strip()
-            if num or amt:
-                folders.append({"tour_nr": num, "amount_ht_ocr": amt})
+        folders = self.get_folder_rows()
 
         data = {
             "iban": self.iban_input.text().strip(),
@@ -747,8 +779,8 @@ class MainWindow(QMainWindow):
             "invoice_date": self.date_input.text().strip(),
             "invoice_number": self.invoice_number_input.text().strip(),
             "folders": folders,
-            # compat ancienne version (optionnel)
-            "folder_number": folders[0]["tour_nr"] if folders else ""
+            "folder_number": folders[0]["tour_nr"] if folders else "",
+            "vat_lines": self.get_vat_rows(),
         }
 
         base_name = os.path.splitext(os.path.basename(self.current_pdf_path))[0]
@@ -757,9 +789,22 @@ class MainWindow(QMainWindow):
         json_path = os.path.join(model_dir, f"{base_name}.json")
 
         try:
+            existing = {}
+            if os.path.exists(json_path):
+                try:
+                    with open(json_path, "r", encoding="utf-8") as f:
+                        existing = json.load(f) or {}
+                except Exception:
+                    existing = {}
+
+            existing.update(data)  # garde pallet_details / block_options si déjà présents
+
             with open(json_path, "w", encoding="utf-8") as f:
-                json.dump(data, f, ensure_ascii=False, indent=2)
+                json.dump(existing, f, ensure_ascii=False, indent=2)
+
             QMessageBox.information(self, "Sauvegarde", "Données sauvegardées avec succès.")
+        except Exception as e:
+            QMessageBox.critical(self, "Erreur sauvegarde", str(e))
         except Exception as e:
             QMessageBox.critical(self, "Erreur sauvegarde", str(e))
 
@@ -776,53 +821,54 @@ class MainWindow(QMainWindow):
         try:
             with open(json_path, "r", encoding="utf-8") as f:
                 data = json.load(f)
-            # --- rebuild folder fields ---
-            self.rebuild_folder_fields_from_json(data)
+            self.pallet_details = data.get("pallet_details", {}) or {}
+            self.block_options = data.get("block_options", {}) or {}
             self.iban_input.setText(data.get("iban", ""))
             self.bic_input.setText(data.get("bic", ""))
             self.date_input.setText(data.get("invoice_date", ""))
             self.invoice_number_input.setText(data.get("invoice_number", ""))
+            self.vat_table.setRowCount(0)
+            vat_lines = data.get("vat_lines", [])
+            if isinstance(vat_lines, list):
+                for r in vat_lines:
+                    self._add_vat_row(r.get("rate", ""), r.get("base", ""), r.get("vat", ""))
 
-            # compat : ancien format "folder_number"
-            folders = data.get("folder_numbers", None)
-            if folders is None:
-                one = data.get("folder_number", "")
-                folders = [one] if one else []
+            self._ensure_empty_vat_row()
+            self.update_vat_total()
 
-            self.clear_folder_fields(keep_one=False)
-            if folders:
-                for n in folders:
-                    self.add_folder_field(n)
-            else:
-                self.add_folder_field()
+            # ✅ dossiers -> table
+            self.rebuild_folder_fields_from_json(data)
 
         except Exception as e:
             QMessageBox.warning(self, "Erreur chargement", str(e))
     
 
     def rebuild_folder_fields_from_json(self, data: dict):
-        # supprimer anciens champs
-        for container, folder_edit, amount_edit in self.folder_inputs:
-            container.deleteLater()
-        self.folder_inputs.clear()
+        # reset table
+        self.vat_table.setRowCount(0)
+        vat_lines = data.get("vat_lines", [])
+        if isinstance(vat_lines, list):
+            for r in vat_lines:
+                self._add_vat_row(r.get("rate", ""), r.get("base", ""), r.get("vat", ""))
 
-        # label totals en bas (1 seul)
-        if not hasattr(self, "lbl_folder_totals") or self.lbl_folder_totals is None:
-            self.lbl_folder_totals = QLabel("")
-            self.lbl_folder_totals.setStyleSheet("padding:4px;")
-            self.folder_container.addWidget(self.lbl_folder_totals)
+        self._ensure_empty_vat_row()
+        self.update_vat_total()
 
         folders = data.get("folders")
+
         if isinstance(folders, list) and folders:
             for row in folders:
                 tour_nr = "" if row is None else str(row.get("tour_nr", "") or "")
                 amt = "" if row is None else str(row.get("amount_ht_ocr", "") or "")
-                self.add_folder_field(tour_nr, amt)
+                if tour_nr or amt:
+                    self._add_folder_row(tour_nr, amt)
         else:
             # compat ancienne version
             one = str(data.get("folder_number", "") or "")
-            self.add_folder_field(one, "")
+            if one:
+                self._add_folder_row(one, "")
 
+        self._ensure_empty_folder_row()
         self.update_folder_totals()
 
     # =========================
@@ -915,31 +961,65 @@ class MainWindow(QMainWindow):
     # Supplier model
     # =========================
     def save_supplier_model(self):
-        iban = self.iban_input.text().strip()
-        bic = self.bic_input.text().strip()
+        ocr_text = self.ocr_text_view.toPlainText() or ""
+
+        # 1) récupérer IBAN/BIC robustes depuis l’OCR (validation + scoring)
+        best = extract_best_bank_ids(
+            ocr_text,
+            prefer_iban=self.iban_input.text().strip(),
+            prefer_bic=self.bic_input.text().strip(),
+        )
+
+        iban = best.get("iban") or self.iban_input.text().strip()
+        bic  = best.get("bic")  or self.bic_input.text().strip()
+
+        if iban:
+            self.iban_input.setText(iban)
+        if bic:
+            self.bic_input.setText(bic)
 
         supplier_key = build_supplier_key(iban, bic)
         if not supplier_key:
-            QMessageBox.warning(self, "Modèle fournisseur", "IBAN et BIC requis pour créer un modèle fournisseur.")
+            QMessageBox.warning(
+                self,
+                "Modèle fournisseur",
+                "Impossible de sauvegarder : IBAN/BIC non fiables.\n"
+                "Corrige IBAN/BIC puis réessaie."
+            )
             return
 
-        supplier_dir = r"C:\git\OCR\OCR\models\suppliers"
-        os.makedirs(supplier_dir, exist_ok=True)
-        model_path = os.path.join(supplier_dir, f"{supplier_key}.json")
+        # 2) charger l’existant
+        existing = load_supplier_model(supplier_key) or {}
 
-        data = {
+        # 3) apprendre / merger les patterns
+        new_patterns = learn_supplier_patterns(
+            ocr_text,
+            iban=iban,
+            bic=bic,
+            invoice_number=self.invoice_number_input.text().strip(),
+            invoice_date=self.date_input.text().strip(),
+        )
+        merged = merge_patterns(existing.get("patterns") or {}, new_patterns)
+
+        folders = self.get_folder_numbers()
+
+        # 4) construire data (TOUJOURS défini)
+        data = dict(existing)
+        data.update({
             "supplier_key": supplier_key,
             "iban": iban,
             "bic": bic,
             "invoice_number_example": self.invoice_number_input.text().strip(),
             "date_example": self.date_input.text().strip(),
-            # on garde aussi un exemple de dossier (1er non vide)
-            "folder_number_example": (self.get_folder_numbers()[0] if self.get_folder_numbers() else "")
-        }
+            "folder_number_example": (folders[0] if folders else ""),
+            "updated_at": datetime.now().isoformat(timespec="seconds"),
+            "patterns": merged,
+            "model_version": 2,
+        })
 
+        # 5) sauver le fichier
         try:
-            with open(model_path, "w", encoding="utf-8") as f:
-                json.dump(data, f, ensure_ascii=False, indent=2)
+            save_supplier_model(supplier_key, data)
             QMessageBox.information(self, "Modèle fournisseur", "Modèle fournisseur sauvegardé / mis à jour.")
         except Exception as e:
             QMessageBox.critical(self, "Erreur", str(e))
@@ -948,17 +1028,34 @@ class MainWindow(QMainWindow):
         if not model:
             return
 
+        ocr_text = self.ocr_text_view.toPlainText() or ""
+        found = extract_fields_with_model(ocr_text, model)
+
+        # IBAN/BIC : valeur trouvée via patterns, sinon valeur stockée modèle
+        if not self.iban_input.text().strip():
+            self.iban_input.setText(found.get("iban") or model.get("iban", ""))
+
+        if not self.bic_input.text().strip():
+            self.bic_input.setText(found.get("bic") or model.get("bic", ""))
+
         if not self.invoice_number_input.text().strip():
-            self.invoice_number_input.setText(model.get("invoice_number_example", ""))
+            self.invoice_number_input.setText(
+                found.get("invoice_number") or model.get("invoice_number_example", "")
+            )
 
         if not self.date_input.text().strip():
-            self.date_input.setText(model.get("date_example", ""))
+            self.date_input.setText(
+                found.get("invoice_date") or model.get("date_example", "")
+            )
 
-        # Remplir un dossier par défaut uniquement si aucun saisi
+        # dossier : on garde le comportement actuel (exemple)
         if not self.get_folder_numbers():
             example = model.get("folder_number_example", "")
             if example:
-                self.folder_inputs[0][1].setText(example)
+                dossier_le, _ = self._get_row_widgets(0)
+                if dossier_le:
+                    dossier_le.setText(example)
+                    self._ensure_empty_folder_row()
 
     # =========================
     # PDF navigation
@@ -1019,10 +1116,16 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "PDF", "Fichier introuvable.")
             return
 
-        # On affiche juste le PDF, sans changer la facture "cible"
-        self.current_pdf_path = path
+        # on affiche ce PDF, sans changer la facture cible
+        self.view_pdf_path = path
+
+        # si ce PDF est dans le groupe, on met à jour l’index
+        if path in self.entry_pdf_paths:
+            self.current_doc_index = self.entry_pdf_paths.index(path)
+
         self.display_pdf()
         self.update_page_indicator()
+        self.update_doc_indicator()
 
 
     # =========================
@@ -1193,24 +1296,26 @@ class MainWindow(QMainWindow):
 
     def load_tour_information(self, tour_nr: str):
         self.transporter_info.clear()
-
         tour_nr = (tour_nr or "").strip()
+
         if not tour_nr:
             self.transporter_info.setPlainText("ℹ️ Aucun numéro de dossier.")
             return
 
+        if not re.fullmatch(self.DOSSIER_PATTERN, tour_nr):
+            self.transporter_info.setPlainText(f"❌ Numéro de dossier invalide : {tour_nr}")
+            return
+
         try:
             record = self.tour_repo.find_by_tournr(tour_nr)
-
             if not record:
                 self.transporter_info.setPlainText(f"❌ Tour non trouvée : {tour_nr}")
                 return
 
             self.transporter_info.setPlainText(
-                f"🧾 Tour trouvée\n"
+                "🧾 Tour trouvée\n"
                 f"TourNr : {record.get('TourNr', '')}"
             )
-
         except Exception as e:
             self.transporter_info.setPlainText(f"Erreur chargement tour :\n{e}")
 
@@ -1262,113 +1367,451 @@ class MainWindow(QMainWindow):
             return float(s)
         except ValueError:
             return None
-
-    def update_folder_row_status(self, container_widget):
-        """
-        Compare 1 ligne dossier avec le coût BDD (xxatour.kosten)
-        et colorie le champ montant.
-        """
-        row = None
-        for c, folder_edit, amount_edit in self.folder_inputs:
-            if c == container_widget:
-                row = (folder_edit, amount_edit)
-                break
-        if not row:
-            return
-
-        folder_edit, amount_edit = row
-
-        tour_nr = folder_edit.text().strip()
-        amount_ocr = self._parse_amount(amount_edit.text())
-
-        # reset style léger
-        folder_edit.setStyleSheet("")
-        amount_edit.setStyleSheet("")
-
-        if not tour_nr:
-            self.update_folder_totals()
-            return
-
-        # Requête BDD
-        try:
-            db_kosten = self.tour_repo.get_kosten_by_tournr(tour_nr)
-        except Exception as e:
-            # si souci SQL : on met en rouge
-            amount_edit.setStyleSheet("background-color: #ffe6e6;")
-            amount_edit.setToolTip(f"Erreur BDD: {e}")
-            self.update_folder_totals()
-            return
-
-        if db_kosten is None:
-            # dossier non trouvé
-            folder_edit.setStyleSheet("background-color: #ffe6e6;")
-            amount_edit.setStyleSheet("background-color: #ffe6e6;")
-            amount_edit.setToolTip("Tour non trouvée en base (xxatour).")
-            self.update_folder_totals()
-            return
-
-        # db_kosten peut être Decimal selon pyodbc
-        try:
-            db_kosten_val = float(db_kosten)
-        except Exception:
-            db_kosten_val = None
-
-        amount_edit.setToolTip(f"Montant BDD (kosten) = {db_kosten_val}")
-
-        # Si pas encore de montant OCR => neutre / info
-        if amount_ocr is None or db_kosten_val is None:
-            amount_edit.setStyleSheet("background-color: #fff3cd;")  # orange clair
-            self.update_folder_totals()
-            return
-
-        # Comparaison
-        if abs(amount_ocr - db_kosten_val) <= 0.01:
-            amount_edit.setStyleSheet("background-color: #e6ffe6;")  # vert
-        else:
-            amount_edit.setStyleSheet("background-color: #fff3cd;")  # orange
-
-        self.update_folder_totals()
-
+   
     def update_folder_totals(self):
-        """
-        Calcule total OCR et total BDD (sur les dossiers trouvés)
-        et affiche un résumé dans lbl_folder_totals.
-        """
-        total_ocr = 0.0
+        rows = self.get_folder_rows()
+
+        tour_nrs = [r["tour_nr"] for r in rows if r.get("tour_nr")]
+        kosten_map = self.tour_repo.get_kosten_by_tournrs(tour_nrs) if tour_nrs else {}
+
         total_db = 0.0
-        has_ocr = False
         has_db = False
+        for t in tour_nrs:
+            v = kosten_map.get(t)
+            if v is not None:
+                total_db += float(v)
+                has_db = True
 
-        for _, folder_edit, amount_edit in self.folder_inputs:
-            tour_nr = folder_edit.text().strip()
-            if tour_nr:
-                db_kosten = self.tour_repo.get_kosten_by_tournr(tour_nr)
-                if db_kosten is not None:
-                    try:
-                        total_db += float(db_kosten)
-                        has_db = True
-                    except Exception:
-                        pass
-
-            a = self._parse_amount(amount_edit.text())
+        total_ocr = 0.0
+        has_ocr = False
+        for r in rows:
+            a = self._parse_amount(r.get("amount_ht_ocr", ""))
             if a is not None:
                 total_ocr += a
                 has_ocr = True
 
-        if not hasattr(self, "lbl_folder_totals") or self.lbl_folder_totals is None:
-            return
-
-        if not has_ocr and not has_db:
+        # Affichage : si au moins un dossier existe, on montre le total BDD même si introuvable
+        if not rows:
             self.lbl_folder_totals.setText("")
             self.lbl_folder_totals.setStyleSheet("padding:4px;")
             return
 
-        txt = f"Total OCR = {total_ocr:.2f} | Total BDD = {total_db:.2f}"
-        self.lbl_folder_totals.setText(txt)
+        bdd_txt = f"{total_db:.2f}" if has_db else "N/A"
+        ocr_txt = f"{total_ocr:.2f}" if has_ocr else "N/A"
+        self.lbl_folder_totals.setText(f"Total OCR = {ocr_txt} | Total BDD = {bdd_txt}")
 
-        # coloration globale
         if has_ocr and has_db and abs(total_ocr - total_db) <= 0.01:
             self.lbl_folder_totals.setStyleSheet("padding:4px; background-color:#e6ffe6;")
         else:
             self.lbl_folder_totals.setStyleSheet("padding:4px; background-color:#fff3cd;")
 
+    def _make_folder_cell(self, placeholder: str):
+        le = QLineEdit()
+        le.setPlaceholderText(placeholder)
+        le.setClearButtonEnabled(True)
+        return le
+
+    def _get_row_widgets(self, row: int):
+        dossier_le = self.folder_table.cellWidget(row, 0)
+        amount_le = self.folder_table.cellWidget(row, 1)
+        return dossier_le, amount_le    
+    
+    def _add_folder_row(self, dossier: str = "", amount: str = ""):
+        row = self.folder_table.rowCount()
+        self.folder_table.insertRow(row)
+
+        dossier_le = self._make_folder_cell("Numéro de dossier")
+        amount_le = self._make_folder_cell("Montant HT (OCR)")
+
+        dossier_le.setText("" if dossier is None else str(dossier))
+        amount_le.setText("" if amount is None else str(amount))
+
+        # Focus => champ actif (pour PDF -> champ)
+        dossier_le.mousePressEvent = lambda e, f=dossier_le: self.set_active_field(f)
+        amount_le.mousePressEvent = lambda e, f=amount_le: self.set_active_field(f)
+
+        # Change => calcul + ligne vide + volet info
+        dossier_le.textChanged.connect(lambda _=None, r=row: self._on_folder_row_changed(r))
+        amount_le.textChanged.connect(lambda _=None, r=row: self._on_folder_row_changed(r))
+
+        self.folder_table.setCellWidget(row, 0, dossier_le)
+        self.folder_table.setCellWidget(row, 1, amount_le)
+
+        # 1er calcul
+        self._update_folder_row_status(row)
+
+
+    def _ensure_empty_folder_row(self):
+        # si aucune ligne -> en créer une vide
+        if self.folder_table.rowCount() == 0:
+            self._add_folder_row("", "")
+            return
+
+        last = self.folder_table.rowCount() - 1
+        dossier_le, amount_le = self._get_row_widgets(last)
+        dossier_txt = (dossier_le.text() if dossier_le else "").strip()
+        amount_txt = (amount_le.text() if amount_le else "").strip()
+
+        # si la dernière ligne n'est plus vide -> ajouter une nouvelle ligne vide
+        if dossier_txt or amount_txt:
+            self._add_folder_row("", "")
+
+    def _on_folder_row_changed(self, row: int):
+        self._update_folder_row_status(row)
+        self.update_folder_totals()
+        self._ensure_empty_folder_row()
+
+        # si le champ actif est le dossier de cette ligne, refresh le volet tour
+        dossier_le, _ = self._get_row_widgets(row)
+        if self.active_field == dossier_le:
+            self.load_tour_information(dossier_le.text())
+
+    def get_folder_rows(self):
+        rows = []
+        for r in range(self.folder_table.rowCount()):
+            dossier_le, amount_le = self._get_row_widgets(r)
+            dossier = (dossier_le.text() if dossier_le else "").strip()
+            amount = (amount_le.text() if amount_le else "").strip()
+            # ignorer la ligne totalement vide (celle du bas)
+            if dossier or amount:
+                rows.append({"tour_nr": dossier, "amount_ht_ocr": amount})
+        return rows
+    
+    def _update_folder_row_status(self, row: int):
+        dossier_le, amount_le = self._get_row_widgets(row)
+        if not dossier_le or not amount_le:
+            return
+
+        tour_nr = dossier_le.text().strip()
+        amount_ocr = self._parse_amount(amount_le.text())
+
+        dossier_le.setStyleSheet("")
+        amount_le.setStyleSheet("")
+        amount_le.setToolTip("")
+
+        # ligne vide => neutre
+        if not tour_nr:
+            return
+
+        try:
+            db_kosten = self.tour_repo.get_kosten_by_tournr(tour_nr)
+        except Exception as e:
+            amount_le.setStyleSheet("background-color: #ffe6e6;")
+            amount_le.setToolTip(f"Erreur BDD: {e}")
+            return
+
+        if db_kosten is None:
+            dossier_le.setStyleSheet("background-color: #ffe6e6;")
+            amount_le.setStyleSheet("background-color: #ffe6e6;")
+            amount_le.setToolTip("Tour non trouvée en base (xxatour).")
+            return
+
+        try:
+            db_val = float(db_kosten)
+        except Exception:
+            db_val = None
+
+        amount_le.setToolTip(f"Montant BDD (kosten) = {db_val}")
+
+        if amount_ocr is None or db_val is None:
+            amount_le.setStyleSheet("background-color: #fff3cd;")
+            return
+
+        if abs(amount_ocr - db_val) <= 0.01:
+            amount_le.setStyleSheet("background-color: #e6ffe6;")
+        else:
+            amount_le.setStyleSheet("background-color: #fff3cd;")
+
+    def get_folder_numbers(self) -> list[str]:
+        return [r["tour_nr"] for r in self.get_folder_rows() if r.get("tour_nr")]
+    
+
+    def _make_vat_cell(self, placeholder: str):
+        le = QLineEdit()
+        le.setPlaceholderText(placeholder)
+        le.setClearButtonEnabled(True)
+        return le
+
+    def _get_vat_row_widgets(self, row: int):
+        rate_le = self.vat_table.cellWidget(row, 0)
+        base_le = self.vat_table.cellWidget(row, 1)
+        vat_le  = self.vat_table.cellWidget(row, 2)
+        return rate_le, base_le, vat_le
+
+    def _add_vat_row(self, rate: str = "", base: str = "", vat: str = ""):
+        row = self.vat_table.rowCount()
+        self.vat_table.insertRow(row)
+
+        rate_le = self._make_vat_cell("ex: 20")
+        base_le = self._make_vat_cell("Base HT")
+        vat_le  = self._make_vat_cell("Montant TVA")
+
+        rate_le.setText("" if rate is None else str(rate))
+        base_le.setText("" if base is None else str(base))
+        vat_le.setText("" if vat is None else str(vat))
+
+        # champ actif
+        rate_le.mousePressEvent = lambda e, f=rate_le: self.set_active_field(f)
+        base_le.mousePressEvent = lambda e, f=base_le: self.set_active_field(f)
+        vat_le.mousePressEvent  = lambda e, f=vat_le: self.set_active_field(f)
+
+        # changements => total + ligne vide
+        rate_le.textChanged.connect(lambda _=None, r=row: self._on_vat_row_changed(r))
+        base_le.textChanged.connect(lambda _=None, r=row: self._on_vat_row_changed(r))
+        vat_le.textChanged.connect(lambda _=None, r=row: self._on_vat_row_changed(r))
+
+        self.vat_table.setCellWidget(row, 0, rate_le)
+        self.vat_table.setCellWidget(row, 1, base_le)
+        self.vat_table.setCellWidget(row, 2, vat_le)
+
+    def _ensure_empty_vat_row(self):
+        if self.vat_table.rowCount() == 0:
+            self._add_vat_row("", "", "")
+            return
+
+        last = self.vat_table.rowCount() - 1
+        rate_le, base_le, vat_le = self._get_vat_row_widgets(last)
+        rate_txt = (rate_le.text() if rate_le else "").strip()
+        base_txt = (base_le.text() if base_le else "").strip()
+        vat_txt  = (vat_le.text() if vat_le else "").strip()
+
+        if rate_txt or base_txt or vat_txt:
+            self._add_vat_row("", "", "")
+
+    def _on_vat_row_changed(self, row: int):
+        self.update_vat_total()
+        self._ensure_empty_vat_row()
+
+    def get_vat_rows(self):
+        rows = []
+        for r in range(self.vat_table.rowCount()):
+            rate_le, base_le, vat_le = self._get_vat_row_widgets(r)
+            rate = (rate_le.text() if rate_le else "").strip()
+            base = (base_le.text() if base_le else "").strip()
+            vat  = (vat_le.text() if vat_le else "").strip()
+            if rate or base or vat:
+                rows.append({"rate": rate, "base": base, "vat": vat})
+        return rows
+
+    def update_vat_total(self):
+        total = 0.0
+        has_any = False
+        for r in range(self.vat_table.rowCount()):
+            _, _, vat_le = self._get_vat_row_widgets(r)
+            vat_txt = (vat_le.text() if vat_le else "").strip()
+            v = self._parse_amount(vat_txt)
+            if v is not None:
+                total += v
+                has_any = True
+
+        if not has_any:
+            self.lbl_vat_total.setText("")
+            self.lbl_vat_total.setStyleSheet("padding:4px;")
+            return
+
+        self.lbl_vat_total.setText(f"Total TVA = {total:.2f}")
+        self.lbl_vat_total.setStyleSheet("padding:4px; background-color:#e6ffe6;")
+
+
+    def build_entry_pdf_group(self):
+        """
+        Construit self.entry_pdf_paths à partir du entry_id de la facture sélectionnée.
+        La facture (current_pdf_path) est mise en premier.
+        """
+
+        self.entry_pdf_paths = []
+        self.current_doc_index = 0
+
+        if not self.selected_invoice_entry_id or not self.current_pdf_path:
+            # groupe minimal = juste la facture
+            if self.current_pdf_path:
+                self.entry_pdf_paths = [self.current_pdf_path]
+            self.update_doc_indicator()
+            return
+
+        current_dir = os.path.dirname(self.current_pdf_path)
+        invoice_path = self.current_pdf_path
+
+        try:
+            rows = self.logmail_repo.get_files_for_entry(self.selected_invoice_entry_id) or []
+        except Exception:
+            rows = []
+
+        paths = []
+        for r in rows:
+            name = r.get("nom_pdf") or r.get("Nom_PDF") or r.get("filename") or ""
+            name = str(name).strip()
+            if not name:
+                continue
+            if not os.name.lower().endswith(".pdf"):
+                return
+            full_path = os.path.join(current_dir, name)
+            if os.path.exists(full_path) and full_path not in paths:
+                paths.append(full_path)
+
+        # s’assurer que la facture est dans la liste + en premier
+        if invoice_path in paths:
+            paths.remove(invoice_path)
+        paths.insert(0, invoice_path)
+
+        self.entry_pdf_paths = paths
+        self.update_doc_indicator()
+
+
+    def show_doc_by_index(self, index: int):
+        if not self.entry_pdf_paths:
+            self.update_doc_indicator()
+            return
+
+        index = max(0, min(index, len(self.entry_pdf_paths) - 1))
+        self.current_doc_index = index
+
+        self.view_pdf_path = self.entry_pdf_paths[self.current_doc_index]
+        self.display_pdf()
+        self.update_page_indicator()
+        self.update_doc_indicator()
+
+
+    def update_doc_indicator(self):
+        total = len(self.entry_pdf_paths)
+        if total <= 0:
+            self.lbl_doc_info.setText("0 / 0")
+            self.btn_prev_doc.setEnabled(False)
+            self.btn_next_doc.setEnabled(False)
+            return
+
+        self.lbl_doc_info.setText(f"{self.current_doc_index + 1} / {total}")
+        self.btn_prev_doc.setEnabled(self.current_doc_index > 0)
+        self.btn_next_doc.setEnabled(self.current_doc_index < total - 1)
+
+
+    def on_prev_doc(self):
+        if not self.entry_pdf_paths:
+            return
+        self.show_doc_by_index(self.current_doc_index - 1)
+
+
+    def on_next_doc(self):
+        if not self.entry_pdf_paths:
+            return
+        self.show_doc_by_index(self.current_doc_index + 1)
+
+    def on_pdf_context_menu(self, pos):
+        menu = QMenu(self)
+
+        act_pal = menu.addAction("Details palettes")
+        tour_nrs = self.get_folder_numbers()
+        act_pal.setEnabled(bool(tour_nrs))
+
+        menu.addSeparator()
+
+        act_block = menu.addAction("Options de blocage")
+        act_block.setEnabled(bool(self.view_pdf_path or self.current_pdf_path))
+
+        chosen = menu.exec(getattr(self.pdf_viewer, "label", self.pdf_viewer).mapToGlobal(pos))
+        if chosen == act_pal:
+            self.open_pallet_details_dialog()
+        elif chosen == act_block:
+            self.open_block_options_dialog()
+
+    def open_pallet_details_dialog(self):
+        tour_nrs = self.get_folder_numbers()
+        if not tour_nrs:
+            QMessageBox.information(self, "Palettes", "Aucun numéro de dossier renseigné.")
+            return
+
+        dlg = PalletDetailsDialog(
+            self,
+            tour_numbers=tour_nrs,
+            tour_repo=self.tour_repo,
+            existing_saved=getattr(self, "pallet_details", {}) or {},
+        )
+
+        if dlg.exec() != QDialog.Accepted:
+            return
+
+        result = dlg.get_result()
+        self.pallet_details = result
+        self._save_pallet_details_to_json(result)
+
+        QMessageBox.information(self, "Palettes", "Détails palettes sauvegardés.")
+
+
+    def _current_model_json_path(self) -> str | None:
+        if not self.current_pdf_path:
+            return None
+        base_name = os.path.splitext(os.path.basename(self.current_pdf_path))[0]
+        model_dir = r"C:\git\OCR\OCR\models"
+        os.makedirs(model_dir, exist_ok=True)
+        return os.path.join(model_dir, f"{base_name}.json")
+
+
+    def _save_pallet_details_to_json(self, pallet_details: dict):
+        json_path = self._current_model_json_path()
+        if not json_path:
+            return
+
+        data = {}
+        if os.path.exists(json_path):
+            try:
+                with open(json_path, "r", encoding="utf-8") as f:
+                    data = json.load(f) or {}
+            except Exception:
+                data = {}
+
+        data["pallet_details"] = pallet_details
+
+        with open(json_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+
+
+    def _read_model_json(self) -> tuple[str | None, dict]:
+        json_path = self._current_model_json_path()
+        if not json_path:
+            return None, {}
+
+        data = {}
+        if os.path.exists(json_path):
+            try:
+                with open(json_path, "r", encoding="utf-8") as f:
+                    data = json.load(f) or {}
+            except Exception:
+                data = {}
+
+        return json_path, data
+
+    def _write_model_json(self, json_path: str, data: dict) -> None:
+        with open(json_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+
+    def open_block_options_dialog(self):
+        # doc affiché (facture ou PJ)
+        doc_path = self.view_pdf_path or self.current_pdf_path
+        if not doc_path:
+            return
+
+        doc_name = os.path.basename(doc_path)
+
+        json_path, data = self._read_model_json()
+        if not json_path:
+            return
+
+        block_options = data.get("block_options", {}) or {}
+        current = block_options.get(doc_name, {}) or {}
+
+        dlg = BlockOptionsDialog(
+            self,
+            document_name=doc_name,
+            blocked=bool(current.get("blocked", False)),
+            comment=str(current.get("comment", "") or ""),
+        )
+
+        if dlg.exec() != QDialog.Accepted:
+            return
+
+        block_options[doc_name] = dlg.get_result()
+        data["block_options"] = block_options
+        self._write_model_json(json_path, data)
+
+        # en mémoire aussi (utile si tu veux t’en servir ailleurs)
+        self.block_options = block_options
