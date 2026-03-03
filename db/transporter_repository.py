@@ -85,6 +85,7 @@ class TransporterRepository(BaseRepository):
                 bank.BankName,
                 kun.name1,
                 kun.Strasse,
+                KUN.PLZ,
                 kun.Ort,
                 kun.LKZ,
                 kun.KundenNr
@@ -93,6 +94,14 @@ class TransporterRepository(BaseRepository):
                 ON bank.KundenNr = kun.KundenNr
             WHERE kun.KundenNr = ?
             ORDER BY bank.LfdNr
+        """
+        return self.fetch_one(query, (kundennr,))
+
+    def get_ustid_by_kundennr(self, kundennr: str):
+        query = """
+            SELECT UstId
+            FROM XXAKun
+            WHERE KundenNr = ?
         """
         return self.fetch_one(query, (kundennr,))
 

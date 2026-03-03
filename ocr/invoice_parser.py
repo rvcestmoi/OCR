@@ -1,6 +1,8 @@
 import re
 from dataclasses import dataclass, field
 from typing import List, Dict, Optional
+from collections import Counter
+from .supplier_model import validate_iban
 
 
 @dataclass
@@ -20,6 +22,10 @@ class InvoiceData:
 # =========================
 
 IBAN_REGEX = re.compile(r"\b[A-Z]{2}[0-9]{2}[A-Z0-9]{11,30}\b")
+IBAN_CANDIDATE_REGEX = re.compile(
+    r"\b[A-Z]{2}[ \u00A0-]*\d{2}(?:[ \u00A0-]*[A-Z0-9]){11,30}\b",
+    re.IGNORECASE,
+)
 
 BIC_REGEX = re.compile(r"\b[A-Z]{4}[A-Z]{2}[A-Z0-9]{2}([A-Z0-9]{3})?\b")
 
@@ -34,13 +40,19 @@ BIC_BLACKLIST = {
 # Règles:
 # - 1 + 8 chiffres => 9
 # - ou préfixes 84/25/35/44/64/67/69/72/78 + 6..8 chiffres => 8..10
+# Strict : numéro compact sans séparateurs
 DOSSIER_PATTERN = re.compile(
-    r"(?<!\d)(?:1\d{8}|(?:84|25|35|44|64|67|69|72|78)\d{6,8})(?!\d)"
+    r"(?<!\d)(?:"
+    r"1\d{8}"                    # 9 chiffres commençant par 1
+    r"|150\d{5,8}"               # 150 + 5..8 chiffres  (ex: 15000003)
+    r"|(?:845|255|355|445|645|675|695|725|785)\d{6,8}"  # autres : 3 + 6..8 chiffres
+    r")(?!\d)"
 )
 
-# Candidats potentiellement séparés par espace/NBSP/tiret (mais PAS \n)
+# Large : accepte espaces/NBSP/tirets (et je te conseille d'accepter \n aussi, OCR coupe souvent)
 DOSSIER_CANDIDATE = re.compile(
-    r"(?<!\d)(?:1|84|25|35|44|64|67|69|72|78)[0-9 \u00A0-]{6,20}\d(?!\d)"
+    r"(?<!\d)(?:1|150|845|255|355|445|645|675|695|725|785)"
+    r"[0-9 \u00A0\-\n]{4,25}\d(?!\d)"
 )
 
 
@@ -93,32 +105,79 @@ def _normalize_for_folder_search(text: str) -> str:
 # =========================
 # EXTRACTIONS
 # =========================
+OCR_DIGIT_FIX = {
+    "O": "0",
+    "Q": "0",
+    "D": "0",
+    "I": "1",
+    "L": "1",
+    "S": "5",
+    "B": "8",
+    "Z": "2",
+    "G": "6",
+    "T": "7",
+}
 
-def extract_iban(text: str) -> str:
-    t = _normalize_ocr(text)
-
-    # 1️⃣ priorité : IBAN proche du label "IBAN"
-    for m in re.finditer(r"\bIBAN\b", t, flags=re.IGNORECASE):
-        start = m.end()
-        chunk = t[start:start + 200]
-        chunk = chunk.replace(":", " ").replace("-", " ")
-
-        candidates = IBAN_REGEX.findall(chunk)
-        for iban in candidates:
-            iban = iban.replace(" ", "")
-            if 15 <= len(iban) <= 34:
-                return iban
-
-    # 2️⃣ fallback global (OCR-safe)
-    cleaned = t.replace(" ", "").replace("-", "")
-    matches = IBAN_REGEX.findall(cleaned)
-
-    matches = [x for x in matches if 15 <= len(x) <= 34]
-    if not matches:
+def _fix_iban_ocr(iban: str) -> str:
+    """
+    Corrige les confusions OCR courantes, surtout sur les IBAN FR
+    (après FRkk, le reste doit être des chiffres).
+    Retourne "" si impossible.
+    """
+    s = (iban or "").replace(" ", "").replace("\u00A0", "").replace("-", "").upper().strip()
+    if len(s) < 6:
         return ""
 
-    matches.sort(key=len, reverse=True)
-    return matches[0]
+    country = s[:2]
+    # ✅ Cas France : après FRkk => uniquement chiffres
+    if country == "FR":
+        head = s[:4]          # FRkk
+        rest = s[4:]
+        rest2 = "".join(OCR_DIGIT_FIX.get(ch, ch) for ch in rest)
+        if not rest2.isdigit():
+            return ""
+        return head + rest2
+
+    # (Optionnel) autres pays : tu peux laisser vide pour ne rien faire
+    return ""
+
+def extract_iban(text: str) -> str:
+
+
+    # ⚠️ Ne PAS remplacer les \n par des espaces ici, sinon "...038\nBIC" => "...038BIC"
+    src = (text or "").upper().replace("\u00A0", " ")
+
+    def _norm_iban(s: str) -> str:
+        return re.sub(r"[ \u00A0-]", "", s or "").upper().strip()
+
+    # 1) priorité : IBAN proche du label "IBAN"
+    for m in re.finditer(r"\bIBAN\b", src, flags=re.IGNORECASE):
+        chunk = src[m.end(): m.end() + 260].replace(":", " ").replace("=", " ")
+        for mm in IBAN_CANDIDATE_REGEX.finditer(chunk):
+            iban = _norm_iban(mm.group(0))
+            if 15 <= len(iban) <= 34:
+                if validate_iban(iban):
+                    return iban
+                fixed = _fix_iban_ocr(iban)
+                if fixed and validate_iban(fixed):
+                    return fixed
+
+    # 2) fallback global (sans recoller entre lignes)
+    candidates = []
+    for mm in IBAN_CANDIDATE_REGEX.finditer(src):
+        iban = _norm_iban(mm.group(0))
+        if 15 <= len(iban) <= 34:
+            if validate_iban(iban):
+                return iban
+            fixed = _fix_iban_ocr(iban)
+            if fixed and validate_iban(fixed):
+                return fixed
+
+            if not candidates:
+                return ""
+
+    counts = Counter(candidates)
+    return sorted(counts.items(), key=lambda kv: (kv[1], len(kv[0])), reverse=True)[0][0]
 
 
 def extract_bic(text: str) -> str:
@@ -173,6 +232,13 @@ def extract_invoice_number(text: str) -> str:
 VAT_RATE_RE = re.compile(r"(?P<rate>\d{1,2}(?:[.,]\d{1,2})?)\s*%")
 MONEY_RE = re.compile(r"\b\d{1,3}(?:[ \u00A0]\d{3})*(?:[.,]\d{2})\b")
 
+ONLY_AMOUNT_RE = re.compile(
+    r"^\s*\d{1,3}(?:[ \u00A0]\d{3})*(?:[.,]\d{2})\s*(?:€|EUR)?\s*$",
+    re.IGNORECASE
+)
+
+VAT_BLOCK_HINT_RE = re.compile(r"(MONTANT\s*TVA|TOTAL\s*TVA|TAUX|BASE\s*HT|TVA)", re.IGNORECASE)
+
 
 def _norm_amount_str(s: str) -> str:
     return (s or "").replace("\u00A0", "").replace(" ", "").strip()
@@ -190,6 +256,7 @@ def parse_vat_lines(text: str):
     lines_out = []
     seen = set()
 
+    # --- 1) format "TVA 20% ...": on garde ton comportement actuel ---
     for raw in (text or "").splitlines():
         line = raw.strip()
         if not line:
@@ -223,6 +290,43 @@ def parse_vat_lines(text: str):
         seen.add(key)
 
         lines_out.append({"rate": rate, "base": base, "vat": vat})
+
+    # --- 2) format "table TVA" (comme ton exemple) ---
+    lines = [ln.strip() for ln in (text or "").splitlines() if ln.strip()]
+
+    centers = [i for i, ln in enumerate(lines) if VAT_BLOCK_HINT_RE.search(ln)]
+    # si rien trouvé, on tente quand même autour de "Total TVA"
+    if not centers:
+        centers = [i for i, ln in enumerate(lines) if "TVA" in ln.upper()]
+
+    best_table = None
+    best_score = -1
+
+    # on teste plusieurs centres et on garde le meilleur
+    for c in centers[:40]:  # limite pour perf
+        res = _infer_vat_line_from_block(lines, c, window=25)
+        if not res:
+            continue
+
+        # petit score proxy: préfère les cas où on a bien 3 champs
+        score = 0
+        score += 10 if res.get("rate") else 0
+        score += 10 if res.get("base") else 0
+        score += 10 if res.get("vat") else 0
+
+        if score > best_score:
+            best_score = score
+            best_table = res
+
+    if best_table:
+        rate = best_table["rate"]
+        base = best_table["base"]
+        vat = best_table["vat"]
+
+        # évite doublons avec la méthode 1)
+        key = (rate.replace(",", "."), base, vat)
+        if key not in seen:
+            lines_out.append({"rate": rate, "base": base, "vat": vat})
 
     return lines_out
 
@@ -298,3 +402,84 @@ def _find_best_match_near_label(
                 return mm.group(0)
 
     return ""
+
+def _infer_vat_line_from_block(lines: list[str], center: int, window: int = 25):
+    """
+    Essaie d'inférer (taux, base, tva) dans un bloc autour d'un indice,
+    en utilisant la cohérence: TVA ≈ Base * Taux / 100.
+    """
+    start = max(0, center - window)
+    end = min(len(lines), center + window + 1)
+
+    # indices des labels (si présents)
+    idx_taux = next((i for i in range(start, end) if "TAUX" in lines[i].upper()), None)
+    idx_base = next((i for i in range(start, end) if "BASE" in lines[i].upper()), None)
+    idx_mtv  = next((i for i in range(start, end) if "MONTANT TVA" in lines[i].upper() or "TOTAL TVA" in lines[i].upper()), None)
+
+    # collect montants (val, raw_str, line_idx, is_only_amount_line)
+    amounts = []
+    for i in range(start, end):
+        ln = (lines[i] or "").strip()
+        if not ln:
+            continue
+        for s in MONEY_RE.findall(ln):
+            v = _to_float(s)
+            if v is None:
+                continue
+            amounts.append((v, _norm_amount_str(s), i, bool(ONLY_AMOUNT_RE.match(ln))))
+
+    if not amounts:
+        return None
+
+    # candidats taux (0 < taux <= 30) — adapte si besoin
+    rate_cands = [a for a in amounts if 0.0 < a[0] <= 30.0]
+    if not rate_cands:
+        return None
+
+    best = None  # (score, rate_str, base_str, vat_str)
+    for rv, rstr, ri, r_only in rate_cands:
+        for bv, bstr, bi, b_only in amounts:
+            if bv <= 0:
+                continue
+            # base plutôt "grande" par rapport au taux
+            if bv < 10:
+                continue
+
+            expected = (bv * rv) / 100.0
+            for vv, vstr, vi, v_only in amounts:
+                if vv <= 0:
+                    continue
+
+                diff = abs(vv - expected)
+                tol = max(0.06, expected * 0.03)  # tolérance 3%
+                if diff > tol:
+                    continue
+
+                # scoring
+                score = 0
+
+                # bonus cohérence
+                score += max(0, 60 - diff * 200)
+
+                # bonus si valeurs sur lignes "montant seul"
+                score += 25 if r_only else 0
+                score += 25 if b_only else 0
+                score += 35 if v_only else 0
+
+                # bonus proximité labels
+                if idx_taux is not None:
+                    score += max(0, 20 - abs(ri - idx_taux) * 2)
+                if idx_base is not None:
+                    score += max(0, 20 - abs(bi - idx_base) * 2)
+                if idx_mtv is not None:
+                    score += max(0, 30 - abs(vi - idx_mtv) * 2)
+
+                cand = (score, rstr, bstr, vstr)
+                if best is None or cand[0] > best[0]:
+                    best = cand
+
+    if not best:
+        return None
+
+    _, rstr, bstr, vstr = best
+    return {"rate": rstr, "base": bstr, "vat": vstr}

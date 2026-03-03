@@ -8,7 +8,7 @@ import fitz  # PyMuPDF
 
 
 
-from PySide6.QtCore import Qt, QStringListModel
+from PySide6.QtCore import Qt, QStringListModel, QTimer
 from PySide6.QtGui import QImage, QPixmap, QColor, QTextCharFormat, QTextCursor
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QPushButton,
@@ -39,9 +39,44 @@ from ui.block_options_dialog import BlockOptionsDialog
 from datetime import datetime
 from ocr.supplier_model import extract_best_bank_ids
 
+try:
+    from shiboken6 import isValid
+except Exception:
+    def isValid(_obj):  # fallback
+        return _obj is not None
+
+from datetime import datetime
+from PySide6.QtGui import QKeySequence
+from PySide6.QtGui import QShortcut, QKeySequence
+from PySide6.QtWidgets import QApplication, QLineEdit, QTextEdit, QPlainTextEdit
+from PySide6.QtWidgets import QButtonGroup
+from PySide6.QtGui import QColor, QBrush
+
+from db.geb_repository import GebRepository
+from ui.geb_search_dialog import GebSearchDialog
+from ui.folder_select_dialog import FolderSelectDialog
+
+
+AMOUNT_CANDIDATE_RE = re.compile(r"\b\d{1,3}(?:[ \u00A0]\d{3})*(?:[.,]\d{2,3})\b")
+DOSSIER_8DIG_RE = re.compile(r"\b\d{8}\b")
+ONLY_AMOUNT_2DEC_RE = re.compile(
+    r"^\s*\d{1,3}(?:[ \u00A0]\d{3})*(?:[.,]\d{2})\s*(?:€|EUR)?\s*$",
+    re.IGNORECASE
+)
+HAS_LETTERS_RE = re.compile(r"[A-Za-z]")
+
 
 class MainWindow(QMainWindow):
-    DOSSIER_PATTERN = r"\b(?:1\d{8}|(?:84|25|35|44|64|67|69|72|78)\d{7})\b"
+
+    DOSSIER_PATTERN = re.compile(
+        r"(?<!\d)(?:"
+        r"1\d{8}"                    # 9 chiffres commençant par 1
+        r"|150\d{5,8}"               # 150 + 5..8 chiffres  (ex: 15000003)
+        r"|(?:845|255|355|445|645|675|695|725|785)\d{6,8}"  # autres : 3 + 6..8 chiffres
+        r")(?!\d)"
+    )
+     # Dossier affiché au démarrage (liste des PDF)
+    DEFAULT_PDF_FOLDER = r"C:\Users\hrouillard\Documents\clients\ED trans\OCR\modeles2"
 
     def __init__(self):
         super().__init__()
@@ -52,6 +87,10 @@ class MainWindow(QMainWindow):
         from db.bank_repository import BankRepository
         from db.tour_repository import TourRepository
         from ui.ocr_text_view import OcrTextView
+        from db.tour_repository import TourRepository
+        from db.geb_repository import GebRepository
+
+        
 
         self.db_conn = SqlServerConnection(**DB_CONFIG)
 
@@ -59,6 +98,7 @@ class MainWindow(QMainWindow):
         self.transporter_repo = TransporterRepository(self.db_conn)
         self.bank_repo = BankRepository(self.db_conn)
         self.tour_repo = TourRepository(self.db_conn)
+        self.geb_repo = GebRepository(self.db_conn)
 
         # --- State ---
         self.current_pdf_path: str | None = None
@@ -72,7 +112,15 @@ class MainWindow(QMainWindow):
         self.bank_valid: bool | None = None
         self.selected_invoice_entry_id = None
         self.selected_invoice_filename = None
-        self.transporter_selected_mode = False  # True = on est sur un transporteur choisi (kundennr)
+        self.transporter_selected_mode = False 
+        # anti double-trigger (cellClicked + currentCellChanged)
+        self._last_main_selected_path: str | None = None
+        self._did_autoload_default_folder = False
+
+        self._vat_theo_cache: dict[str, float | None] = {}
+        self._pending_tags_to_add: set[str] = set()
+
+        
 
         # PDF "affiché" (peut être la facture ou une PJ)
         self.view_pdf_path: str | None = None
@@ -95,7 +143,77 @@ class MainWindow(QMainWindow):
         # =========================
         # Panneau gauche (splitter)
         # =========================
-        left_splitter = QSplitter(Qt.Vertical)
+        # =========================
+        # Panneau gauche (sans partie basse)
+        # =========================
+        left_widget = QWidget()
+        left_layout = QVBoxLayout(left_widget)
+
+        self.btn_scan_folder = QPushButton("📂 Analyser un dossier")
+        self.btn_scan_folder.clicked.connect(self.select_folder)
+
+        self.btn_ocr_all = QPushButton("⚙️ OCRiser")
+        self.btn_ocr_all.clicked.connect(self.ocr_all_pdfs)
+
+        left_layout.addWidget(self.btn_ocr_all)
+        left_layout.addWidget(self.btn_scan_folder)
+
+        self.pdf_table = QTableWidget(left_widget)
+        self.pdf_table.setObjectName("pdf_table")
+        self.pdf_table.setColumnCount(3)
+        self.pdf_table.setHorizontalHeaderLabels(["Nom du fichier", "IBAN", "BIC"])
+
+        hdr = self.pdf_table.horizontalHeader()
+        hdr.setSectionResizeMode(0, QHeaderView.Stretch)
+        hdr.setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        hdr.setSectionResizeMode(2, QHeaderView.ResizeToContents)
+
+        self.pdf_table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.pdf_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.pdf_table.setAlternatingRowColors(True)
+        self.pdf_table.cellClicked.connect(self.on_pdf_selected)
+
+        self.pdf_table.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.pdf_table.customContextMenuRequested.connect(self.on_pdf_table_context_menu)
+        self.pdf_table.currentCellChanged.connect(self._on_pdf_current_cell_changed)
+
+        # --- filtres (en haut du tableau gauche) ---
+        self.left_filter_mode = "pending"
+
+        filter_bar = QHBoxLayout()
+
+        self.btn_filter_pending = QPushButton("🕓 En attente")
+        self.btn_filter_pending.setCheckable(True)
+        self.btn_filter_pending.setChecked(True)
+
+        self.btn_filter_validated = QPushButton("✅ Validés")
+        self.btn_filter_validated.setCheckable(True)
+
+        self.btn_filter_errors = QPushButton("⚠️ Erreurs")
+        self.btn_filter_errors.setCheckable(True)
+
+        # exclusif
+        self._filter_group = QButtonGroup(self)
+        self._filter_group.setExclusive(True)
+        self._filter_group.addButton(self.btn_filter_pending)
+        self._filter_group.addButton(self.btn_filter_validated)
+        self._filter_group.addButton(self.btn_filter_errors)
+
+        filter_bar.addWidget(self.btn_filter_pending)
+        filter_bar.addWidget(self.btn_filter_validated)
+        filter_bar.addWidget(self.btn_filter_errors)
+        filter_bar.addStretch(1)
+
+        left_layout.addLayout(filter_bar)
+
+        self.btn_filter_pending.clicked.connect(lambda: self.set_left_filter("pending"))
+        self.btn_filter_validated.clicked.connect(lambda: self.set_left_filter("validated"))
+        self.btn_filter_errors.clicked.connect(lambda: self.set_left_filter("errors"))
+
+
+        left_layout.addWidget(self.pdf_table)
+
+        main_layout.addWidget(left_widget, 2)        
 
         left_top_widget = QWidget()
         left_top_layout = QVBoxLayout(left_top_widget)
@@ -117,6 +235,11 @@ class MainWindow(QMainWindow):
         self.pdf_table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.pdf_table.setAlternatingRowColors(True)
         self.pdf_table.cellClicked.connect(self.on_pdf_selected)
+
+        self.pdf_table.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.pdf_table.customContextMenuRequested.connect(self.on_pdf_table_context_menu)
+        self.pdf_table.currentCellChanged.connect(self._on_pdf_current_cell_changed)
+
         left_top_layout.addWidget(self.pdf_table)
 
         left_bottom_widget = QWidget()
@@ -136,11 +259,7 @@ class MainWindow(QMainWindow):
 
         left_bottom_layout.addWidget(self.related_pdf_table)
 
-        left_splitter.addWidget(left_top_widget)
-        left_splitter.addWidget(left_bottom_widget)
-        left_splitter.setStretchFactor(0, 3)
-        left_splitter.setStretchFactor(1, 2)
-        main_layout.addWidget(left_splitter, 2)
+
 
         # =========================
         # Panneau central (PDF)
@@ -153,7 +272,12 @@ class MainWindow(QMainWindow):
         # ✅ navigation documents (même entry_id)
         self.btn_prev_doc = QPushButton("⏪")
         self.btn_next_doc = QPushButton("⏩")
-        self.lbl_doc_info = QLabel("0 / 0")
+        self.lbl_doc_info = QLabel("Doc 0 / 0")
+
+        self.btn_attach_cmr = QPushButton("Rattacher CMR…")
+        self.btn_attach_cmr.setToolTip("Rattacher le document affiché à un dossier (liste de droite)")
+        self.btn_attach_cmr.clicked.connect(self.on_attach_cmr_main)
+
 
         self.btn_prev_doc.setToolTip("Document précédent")
         self.btn_next_doc.setToolTip("Document suivant")
@@ -164,7 +288,7 @@ class MainWindow(QMainWindow):
         # ✅ navigation pages (dans le PDF)
         self.btn_prev_page = QPushButton("⏮")
         self.btn_next_page = QPushButton("⏭")
-        self.lbl_page_info = QLabel("0 / 0")
+        self.lbl_page_info = QLabel("Page 0 / 0")
 
         self.btn_prev_page.clicked.connect(self.on_prev_page)
         self.btn_next_page.clicked.connect(self.on_next_page)
@@ -173,6 +297,10 @@ class MainWindow(QMainWindow):
         pdf_nav.addWidget(self.btn_prev_doc)
         pdf_nav.addWidget(self.lbl_doc_info)
         pdf_nav.addWidget(self.btn_next_doc)
+
+        pdf_nav.addSpacing(8)
+        pdf_nav.addWidget(self.btn_attach_cmr)
+
 
         pdf_nav.addSpacing(16)
 
@@ -250,6 +378,13 @@ class MainWindow(QMainWindow):
         transporter_layout.addWidget(self.btn_transporter_action)
         transporter_layout.addStretch()
         form_layout.addRow("Transporteur :", transporter_layout)
+        self.transporter_vat_input = QLineEdit()
+        self.transporter_vat_input.setReadOnly(True)
+        self.transporter_vat_input.setPlaceholderText("N° TVA (BDD)…")
+        self.transporter_vat_input.setFocusPolicy(Qt.NoFocus)
+        self.transporter_vat_input.setStyleSheet("background-color: #f3f3f3;")
+
+        form_layout.addRow("N° TVA transporteur :", self.transporter_vat_input)
 
         form_layout.addRow("Date facture :", self.date_input)
         form_layout.addRow("N° facture :", self.invoice_number_input)
@@ -257,14 +392,13 @@ class MainWindow(QMainWindow):
         # =========================
         # Table dossiers (N° dossier / Montant HT)
         # =========================
-        self.folder_table = QTableWidget(0, 2)
-        self.folder_table.setHorizontalHeaderLabels(["N° dossier", "Montant HT (OCR)"])
+        self.folder_table = QTableWidget(0, 4)
+        self.folder_table.setHorizontalHeaderLabels(["N° dossier", "Montant HT (OCR)", "TVA théorique (%)", "CMR"])
         self.folder_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
         self.folder_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
-        self.folder_table.setAlternatingRowColors(True)
-        self.folder_table.setSelectionBehavior(QTableWidget.SelectRows)
-        self.folder_table.setEditTriggers(QTableWidget.NoEditTriggers)
-        self.folder_table.setMinimumHeight(140)
+        self.folder_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        self.folder_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeToContents)
+
 
         # Totaux dossiers
         self.lbl_folder_totals = QLabel("")
@@ -281,10 +415,31 @@ class MainWindow(QMainWindow):
         self.vat_table.setAlternatingRowColors(True)
         self.vat_table.setSelectionBehavior(QTableWidget.SelectRows)
         self.vat_table.setEditTriggers(QTableWidget.NoEditTriggers)
-        self.vat_table.setMinimumHeight(110)
+        self.vat_table.setMinimumHeight(50)
+        self.vat_table.setMaximumHeight(100)
 
         self.lbl_vat_total = QLabel("")
         self.lbl_vat_total.setStyleSheet("padding:4px;")
+
+        # =========================
+        # Frais (table au-dessus de TVA)
+        # =========================
+        self.fees_table = QTableWidget(0, 3)
+        self.fees_table.setHorizontalHeaderLabels(["GebNr", "Désignation", "Montant"])
+        self.fees_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        self.fees_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
+        self.fees_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        self.fees_table.setAlternatingRowColors(True)
+        self.fees_table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.fees_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.fees_table.setMinimumHeight(50)
+        self.fees_table.setMaximumHeight(50)
+
+        self.btn_add_fee = QPushButton("➕ Ajouter un frais")
+        self.btn_add_fee.clicked.connect(self.on_add_fee)
+
+        self.btn_remove_fee = QPushButton("🗑 Supprimer")
+        self.btn_remove_fee.clicked.connect(self.on_remove_fee)
 
         # =========================
         # Conteneur vertical (dossiers + totaux + TVA)
@@ -292,6 +447,17 @@ class MainWindow(QMainWindow):
         folders_box = QWidget()
         self.folders_layout = QVBoxLayout(folders_box)
         self.folders_layout.setContentsMargins(0, 0, 0, 0)
+
+        self.folders_layout.addWidget(self.folder_table)
+        self.folders_layout.addWidget(self.lbl_folder_totals)
+
+        self.folders_layout.addWidget(QLabel("Frais :"))
+        fees_bar = QHBoxLayout()
+        fees_bar.addWidget(self.btn_add_fee)
+        fees_bar.addWidget(self.btn_remove_fee)
+        fees_bar.addStretch(1)
+        self.folders_layout.addLayout(fees_bar)
+        self.folders_layout.addWidget(self.fees_table)
 
         self.folders_layout.addWidget(self.folder_table)
         self.folders_layout.addWidget(self.lbl_folder_totals)
@@ -322,11 +488,25 @@ class MainWindow(QMainWindow):
 
         self.btn_save_data = QPushButton("💾 Sauvegarder")
         self.btn_save_data.clicked.connect(self.save_current_data)
-        right_panel.addWidget(self.btn_save_data)
 
-        self.btn_save_supplier = QPushButton("⭐ Mettre à jour modèle fournisseur")
-        self.btn_save_supplier.clicked.connect(self.save_supplier_model)
-        right_panel.addWidget(self.btn_save_supplier)
+        self.shortcut_save = QShortcut(QKeySequence("Ctrl+S"), self)
+        self.shortcut_save.setContext(Qt.ApplicationShortcut)
+        self.shortcut_save.activated.connect(self.on_ctrl_s_save)
+
+        self.btn_validate = QPushButton("✅ Valider la facture (V)")
+        self.btn_validate.clicked.connect(self.on_validate_invoice)
+        
+ 
+        self.shortcut_validate = QShortcut(QKeySequence("V"), self)
+        self.shortcut_validate.setContext(Qt.ApplicationShortcut)
+        self.shortcut_validate.activated.connect(self.on_validate_invoice)
+
+        right_panel.addWidget(self.btn_save_data)
+        right_panel.addWidget(self.btn_validate)
+
+        #self.btn_save_supplier = QPushButton("⭐ Mettre à jour modèle fournisseur")
+        #self.btn_save_supplier.clicked.connect(self.save_supplier_model)
+        #right_panel.addWidget(self.btn_save_supplier)
 
         right_panel.addLayout(form_layout)
         right_panel.addStretch()
@@ -389,6 +569,8 @@ class MainWindow(QMainWindow):
         self.btn_prev_doc.setEnabled(False)
         self.btn_next_doc.setEnabled(False)
 
+
+
     # =========================
     # Active field / PDF selection
     # =========================
@@ -414,8 +596,8 @@ class MainWindow(QMainWindow):
             return
 
         for r in range(self.folder_table.rowCount()):
-            dossier_le, amount_le = self._get_row_widgets(r)
-            if field == dossier_le or field == amount_le:
+            dossier_le, amount_le, vat_theo_le = self._get_row_widgets(r)
+            if field == dossier_le or field == amount_le or field == vat_theo_le:
                 self.load_tour_information(dossier_le.text())
                 return
 
@@ -441,6 +623,12 @@ class MainWindow(QMainWindow):
             value = value.replace(" ", "").upper()
 
         self.active_field.setText(value)
+        self.active_field.setText(value)
+        self.active_field.setStyleSheet("background-color: #e6ffe6;")
+
+        if self.active_field in (self.iban_input, self.bic_input):
+            QTimer.singleShot(0, self._refresh_transporter_after_bank_autofill)
+
         self.active_field.setStyleSheet("background-color: #e6ffe6;")
 
     # =========================
@@ -449,7 +637,7 @@ class MainWindow(QMainWindow):
     def get_folder_line_edits(self) -> list[QLineEdit]:
         out = []
         for r in range(self.folder_table.rowCount()):
-            dossier_le, _ = self._get_row_widgets(r)
+            dossier_le, _ , vat_theo_le= self._get_row_widgets(r)
             if dossier_le:
                 out.append(dossier_le)
         return out
@@ -470,19 +658,27 @@ class MainWindow(QMainWindow):
     # PDF list / display
     # =========================
     def select_folder(self):
-        DEFAULT_OCR_FOLDER = r"C:\Users\hrouillard\Documents\clients\ED trans\OCR\modeles"
-        folder = QFileDialog.getExistingDirectory(self, "Sélectionner un dossier", DEFAULT_OCR_FOLDER)
+        
+        folder = QFileDialog.getExistingDirectory(self, "Sélectionner un dossier", self.DEFAULT_PDF_FOLDER)
         if not folder:
             return
 
         self.pdf_table.setRowCount(0)
-
         pdf_files = [f for f in sorted(os.listdir(folder)) if f.lower().endswith(".pdf")]
         for row, file in enumerate(pdf_files):
             self.pdf_table.insertRow(row)
-            item = QTableWidgetItem(file)
-            item.setData(Qt.UserRole, os.path.join(folder, file))
-            self.pdf_table.setItem(row, 0, item)
+
+            pdf_path = os.path.join(folder, file)
+
+            # Col 0: nom fichier
+            item0 = QTableWidgetItem(file)
+            item0.setData(Qt.UserRole, pdf_path)
+            self.pdf_table.setItem(row, 0, item0)
+
+            # Col 1-2: IBAN / BIC depuis JSON si existe
+            iban, bic = self._get_saved_iban_bic_for_pdf(pdf_path)
+            self.pdf_table.setItem(row, 1, QTableWidgetItem(iban))
+            self.pdf_table.setItem(row, 2, QTableWidgetItem(bic))
 
         self.current_pdf_path = None
         self.clear_fields()
@@ -494,21 +690,42 @@ class MainWindow(QMainWindow):
 
         self.current_pdf_path = item.data(Qt.UserRole)
         invoice_filename = os.path.basename(self.current_pdf_path)
+
+        invoice_filename = os.path.basename(self.current_pdf_path)
         self.selected_invoice_filename = invoice_filename
-        self.selected_invoice_entry_id = self.logmail_repo.get_entry_id_for_file(invoice_filename)
+
+        # ✅ entry_id direct depuis la ligne (évite SQL)
+        entry_id = item.data(Qt.UserRole + 4)
+        self.selected_invoice_entry_id = entry_id if entry_id and not str(entry_id).startswith("__NO_ENTRY__") else None
+
+        # ✅ liste complète des PDFs du groupe (évite SQL)
+        group_paths = item.data(Qt.UserRole + 5)
+        if isinstance(group_paths, list) and group_paths:
+            # met le représentant en premier
+            rep = self.current_pdf_path
+            paths = [rep] + [p for p in group_paths if p != rep]
+            self.entry_pdf_paths = paths
+            self.current_doc_index = 0
+            self.update_doc_indicator()
+            self.show_doc_by_index(0)
+        else:
+            self.build_entry_pdf_group()
+            self.show_doc_by_index(0)
+
 
         # facture = PDF cible
         self.view_pdf_path = self.current_pdf_path
 
-        # construit la liste des PDFs du même entry_id
-        self.build_entry_pdf_group()
-        self.show_doc_by_index(0)
 
+        # ✅ Met à jour le panneau de droite : recharge JSON si existe, sinon OCR direct
+        self.refresh_invoice_data()
 
-        ##self.clear_fields()
-        ##self.ocr_text_view.clear()
-        ##self.load_saved_data()
-        ##self.load_related_pdfs()
+        new_path = item.data(Qt.UserRole)
+        if getattr(self, "_last_main_selected_path", None) == new_path:
+            return
+        self._last_main_selected_path = new_path
+        self.current_pdf_path = new_path
+
 
     def display_pdf(self):
         pdf_path = self.view_pdf_path or self.current_pdf_path
@@ -527,10 +744,69 @@ class MainWindow(QMainWindow):
         except Exception as e:
             QMessageBox.critical(self, "Erreur PDF", str(e))
 
+    def refresh_invoice_data(self):
+        """Recharge les données pour le PDF sélectionné.
+        - Si un JSON existe : on recharge.
+        - Sinon : on OCR automatiquement.
+        """
+        if not self.current_pdf_path:
+            return
+
+        # reset UI
+        self.bank_valid = None
+        self.selected_kundennr = None
+        self.current_db_iban = None
+        self.current_db_bic = None
+        self.transporter_selected_mode = False
+
+        # champs facture
+        for field in [self.iban_input, self.bic_input, self.date_input, self.invoice_number_input]:
+            field.blockSignals(True)
+            field.clear()
+            field.setStyleSheet("")
+            field.blockSignals(False)
+
+        # transporteur
+        self.transporter_input.blockSignals(True)
+        self.transporter_input.clear()
+        self.transporter_input.blockSignals(False)
+        self.btn_transporter_action.setEnabled(False)
+        self.transporter_info.clear()
+
+        # dossiers + TVA
+        self.clear_folder_fields()
+        self.vat_table.setRowCount(0)
+        self._ensure_empty_vat_row()
+        self.update_vat_total()
+
+        self.fees_table.setRowCount(0)
+
+        # OCR texte + recherche
+        self.ocr_text_view.setPlainText("")
+        self.search_selections = []
+        self.current_match_index = -1
+        self.search_counter_label.setText("0 / 0")
+
+        # 1) Si un JSON existe -> on recharge et on NE FAIT PAS d'OCR (même si le load échoue)
+        json_path = self._get_saved_json_path(self.current_pdf_path)
+        if os.path.exists(json_path):
+            ok = self.load_saved_data()
+            if ok:
+                self.check_bank_information()
+                self.load_transporter_information()
+                self.highlight_missing_fields()
+            else:
+                # pas d'OCR automatique : on évite d'écraser les champs
+                self.statusBar().showMessage("Données sauvegardées trouvées mais chargement impossible (pas d'OCR auto).", 5000)
+            return
+
+        # 2) Sinon -> OCR direct (sans popup)
+        self.analyze_pdf(show_message=False)
+
     # =========================
     # OCR
     # =========================
-    def analyze_pdf(self):
+    def analyze_pdf(self, checked: bool = False, show_message: bool = False):
 
         if not self.current_pdf_path:
             QMessageBox.warning(self, "Erreur", "Aucun PDF sélectionné.")
@@ -543,6 +819,8 @@ class MainWindow(QMainWindow):
             data = parse_invoice(text)
 
             self.fill_fields(data)
+            self.autofill_folder_amounts_from_ocr(text)
+            self.update_folder_totals()
             self.check_bank_information()
             self.load_transporter_information()
 
@@ -577,9 +855,11 @@ class MainWindow(QMainWindow):
                     self.apply_supplier_model(model)
 
 
-            QMessageBox.information(self, "OCR terminé", "Analyse OCR terminée.\nVous pouvez corriger les champs.")
+            self.statusBar().showMessage("OCR terminé.", 3000)
         except Exception as e:
             QMessageBox.critical(self, "Erreur OCR", str(e))
+        if show_message:
+            QMessageBox.information(...)
 
     def fill_fields(self, data):
         # Champs simples
@@ -628,7 +908,7 @@ class MainWindow(QMainWindow):
         has_any = any(r.get("tour_nr") for r in rows)
 
         for r in range(self.folder_table.rowCount()):
-            dossier_le, _ = self._get_row_widgets(r)
+            dossier_le, _, vat_theo_le = self._get_row_widgets(r)
             if not dossier_le:
                 continue
             if has_any:
@@ -669,7 +949,7 @@ class MainWindow(QMainWindow):
 
             # remplir la première ligne dont la colonne dossier est vide (en évitant la ligne vide du bas si elle existe)
             for r in range(self.folder_table.rowCount()):
-                dossier_le, _ = self._get_row_widgets(r)
+                dossier_le, _ , vat_theo_le= self._get_row_widgets(r)
                 if dossier_le and not dossier_le.text().strip():
                     dossier_le.setText(dossier)
                     dossier_le.setStyleSheet("background-color: #e6ffe6;")
@@ -684,11 +964,13 @@ class MainWindow(QMainWindow):
         if field_key == "iban":
             self.iban_input.setText(text.replace(" ", "").upper())
             self.iban_input.setStyleSheet("background-color: #e6ffe6;")
+            QTimer.singleShot(0, self._refresh_transporter_after_bank_autofill)
             return
 
         if field_key == "bic":
             self.bic_input.setText(text.replace(" ", "").upper())
             self.bic_input.setStyleSheet("background-color: #e6ffe6;")
+            QTimer.singleShot(0, self._refresh_transporter_after_bank_autofill)
             return
 
         if field_key == "date":
@@ -766,13 +1048,56 @@ class MainWindow(QMainWindow):
     # =========================
     # Save / Load JSON (multi dossiers)
     # =========================
-    def save_current_data(self):
+    def save_current_data(self, status: str | None = None, show_message: bool = True):
         if not self.current_pdf_path:
             QMessageBox.warning(self, "Erreur", "Aucun PDF sélectionné.")
             return
+        self.compact_folder_rows()
+        json_path = self._get_saved_json_path(self.current_pdf_path)
 
+        # --- load existing (to preserve extra keys like pallet_details / block_options / etc.) ---
+        existing = {}
+        if os.path.exists(json_path):
+            try:
+                with open(json_path, "r", encoding="utf-8") as f:
+                    existing = json.load(f) or {}
+            except Exception:
+                existing = {}
+
+        existing_status = (existing.get("status") or "").strip()
+        existing_validated_at = (existing.get("validated_at") or "").strip()
+
+        final_status = (status or existing_status or "draft").strip()
+        validated_at = existing_validated_at
+        if status == "validated" and not validated_at:
+            validated_at = datetime.now().isoformat(timespec="seconds")
+
+        # --- folders + transporter ---
         folders = self.get_folder_rows()
 
+        trans_kundennr = (self.selected_kundennr or "").strip()
+        # fallback si selected_kundennr n'est pas set mais que le champ contient "Nom (12345)"
+        if not trans_kundennr:
+            m = re.search(r"\((\d+)\)\s*$", self.transporter_input.text() or "")
+            if m:
+                trans_kundennr = m.group(1)
+
+        vat_lines = self.get_vat_rows()
+
+        base_total = 0.0
+        vat_total = 0.0
+        for ln in vat_lines:
+            b = self._parse_amount((ln.get("base") or "").strip())
+            v = self._parse_amount((ln.get("vat") or "").strip())
+            if b is not None:
+                base_total += b
+            if v is not None:
+                vat_total += v
+
+        ttc_total = base_total + vat_total
+
+
+        # --- build data payload ---
         data = {
             "iban": self.iban_input.text().strip(),
             "bic": self.bic_input.text().strip(),
@@ -780,31 +1105,78 @@ class MainWindow(QMainWindow):
             "invoice_number": self.invoice_number_input.text().strip(),
             "folders": folders,
             "folder_number": folders[0]["tour_nr"] if folders else "",
-            "vat_lines": self.get_vat_rows(),
+            "fees": self.get_fee_rows(),  
+            "vat_lines": vat_lines,
+            "total_base_ht": round(base_total, 2),
+            "total_vat": round(vat_total, 2),
+            "total_ttc": round(ttc_total, 2),
+            "ocr_text": self.ocr_text_view.toPlainText(),
+            "transporter_kundennr": trans_kundennr,
+            "status": final_status,
+            "validated_at": validated_at,
         }
+        # --- entry_id + récap CMR ---
+        data["entry_id"] = (self.selected_invoice_entry_id or "").strip()
+        data["cmr_attachments"] = self._collect_cmr_attachments_for_current_entry()
+ # --- tags (ex: 'supprime') ---
+        existing_tags = existing.get("tags") or []
+        if isinstance(existing_tags, str):
+            existing_tags = [existing_tags]
+        if not isinstance(existing_tags, list):
+            existing_tags = []
 
-        base_name = os.path.splitext(os.path.basename(self.current_pdf_path))[0]
-        model_dir = r"C:\git\OCR\OCR\models"
-        os.makedirs(model_dir, exist_ok=True)
-        json_path = os.path.join(model_dir, f"{base_name}.json")
+        tags_set = {str(t).strip() for t in existing_tags if str(t).strip()}
+        pending = getattr(self, "_pending_tags_to_add", set()) or set()
+        for t in pending:
+            tt = str(t).strip()
+            if tt:
+                tags_set.add(tt)
+
+        data["tags"] = sorted(tags_set)
+
+        # clear pending tags
+        try:
+            self._pending_tags_to_add.clear()
+        except Exception:
+            pass
+
+        os.makedirs(os.path.dirname(json_path), exist_ok=True)
 
         try:
-            existing = {}
-            if os.path.exists(json_path):
-                try:
-                    with open(json_path, "r", encoding="utf-8") as f:
-                        existing = json.load(f) or {}
-                except Exception:
-                    existing = {}
-
-            existing.update(data)  # garde pallet_details / block_options si déjà présents
+            # merge: keep anything already stored
+            existing.update(data)
 
             with open(json_path, "w", encoding="utf-8") as f:
                 json.dump(existing, f, ensure_ascii=False, indent=2)
 
-            QMessageBox.information(self, "Sauvegarde", "Données sauvegardées avec succès.")
-        except Exception as e:
-            QMessageBox.critical(self, "Erreur sauvegarde", str(e))
+            # update left table in real-time
+            self._update_left_table_iban_bic(
+                self.current_pdf_path,
+                self.iban_input.text(),
+                self.bic_input.text()
+            )
+            # rafraîchit la couleur de la ligne courante
+            for row in range(self.pdf_table.rowCount()):
+                it0 = self.pdf_table.item(row, 0)
+                if it0 and it0.data(Qt.UserRole) == self.current_pdf_path:
+                    self.refresh_left_row_processing_state(row)
+                    break
+
+            self.apply_left_filter_to_table()
+            # ✅ mettre à jour le status stocké en table + re-filtrer
+            for row in range(self.pdf_table.rowCount()):
+                it0 = self.pdf_table.item(row, 0)
+                if it0 and it0.data(Qt.UserRole) == self.current_pdf_path:
+                    it0.setData(Qt.UserRole + 1, final_status)  # final_status existe dans save_current_data
+                    break
+
+            self.apply_left_filter_to_table()
+
+            if show_message:
+                QMessageBox.information(self, "Sauvegarde", "Données sauvegardées avec succès.")
+            else:
+                self.statusBar().showMessage("Données sauvegardées.", 2500)
+
         except Exception as e:
             QMessageBox.critical(self, "Erreur sauvegarde", str(e))
 
@@ -812,29 +1184,54 @@ class MainWindow(QMainWindow):
         if not self.current_pdf_path:
             return
 
-        base_name = os.path.splitext(os.path.basename(self.current_pdf_path))[0]
-        model_dir = r"C:\git\OCR\OCR\models"
-        json_path = os.path.join(model_dir, f"{base_name}.json")
+        json_path = self._get_saved_json_path(self.current_pdf_path)
         if not os.path.exists(json_path):
             return
 
         try:
             with open(json_path, "r", encoding="utf-8") as f:
                 data = json.load(f)
+            # --- Transporteur (KundenNr sauvegardé) ---
+            self.selected_kundennr = (data.get("transporter_kundennr") or "").strip() or None
+            self.transporter_selected_mode = bool(self.selected_kundennr)
+
+            # reset visuel (évite de garder un ancien transporteur affiché)
+            self.transporter_input.blockSignals(True)
+            self.transporter_input.setText("")
+            self.transporter_input.blockSignals(False)
+
+            # si on a un KundenNr -> on recharge depuis la BDD sans passer par IBAN/BIC
+            if self.selected_kundennr:
+                self.load_transporter_information(force_by_kundennr=True)
+            else:
+                # sinon on retombe sur la logique existante (IBAN/BIC)
+                self.load_transporter_information(force_by_kundennr=False)
             self.pallet_details = data.get("pallet_details", {}) or {}
             self.block_options = data.get("block_options", {}) or {}
             self.iban_input.setText(data.get("iban", ""))
             self.bic_input.setText(data.get("bic", ""))
+            self._update_left_table_iban_bic(
+            self.current_pdf_path,
+            self.iban_input.text(),
+            self.bic_input.text()
+            )
             self.date_input.setText(data.get("invoice_date", ""))
             self.invoice_number_input.setText(data.get("invoice_number", ""))
             self.vat_table.setRowCount(0)
             vat_lines = data.get("vat_lines", [])
+            ocr_text = data.get("ocr_text", "")
+            if isinstance(ocr_text, str):
+                self.ocr_text_view.setPlainText(ocr_text)
+            else:
+                self.ocr_text_view.setPlainText("")
             if isinstance(vat_lines, list):
                 for r in vat_lines:
                     self._add_vat_row(r.get("rate", ""), r.get("base", ""), r.get("vat", ""))
 
             self._ensure_empty_vat_row()
             self.update_vat_total()
+
+            self.rebuild_fees_from_json(data)
 
             # ✅ dossiers -> table
             self.rebuild_folder_fields_from_json(data)
@@ -871,61 +1268,68 @@ class MainWindow(QMainWindow):
         self._ensure_empty_folder_row()
         self.update_folder_totals()
 
-    # =========================
-    # OCR batch
-    # =========================
     def ocr_all_pdfs(self):
-        total = self.pdf_table.rowCount()
-        if total == 0:
-            QMessageBox.warning(self, "OCR", "Aucun PDF à traiter.")
+        # sécurité table
+        if not hasattr(self, "pdf_table") or self.pdf_table is None or self.pdf_table.rowCount() == 0:
+            QMessageBox.information(self, "OCR", "Aucun PDF à traiter.")
             return
 
-        progress = QProgressDialog("OCR en cours…", "Annuler", 0, total, self)
-        progress.setWindowTitle("OCR batch")
-        progress.setWindowModality(Qt.WindowModal)
-        progress.setMinimumDuration(0)
-        progress.setValue(0)
+        # sauvegarde l'état courant
+        previous_pdf = self.current_pdf_path
 
-        processed = skipped = errors = 0
+        processed = 0
+        skipped = 0
+        errors = 0
 
-        for row in range(total):
-            if progress.wasCanceled():
-                break
-
-            item = self.pdf_table.item(row, 0)
-            if not item:
+        for row in range(self.pdf_table.rowCount()):
+            it0 = self.pdf_table.item(row, 0)
+            if not it0:
                 continue
 
-            pdf_path = item.data(Qt.UserRole)
+            pdf_path = it0.data(Qt.UserRole)
             if not pdf_path or not os.path.exists(pdf_path):
-                errors += 1
                 continue
 
-            if self._model_exists_for_pdf(pdf_path):
+            # ✅ On OCRise uniquement les non-sauvegardés (pas de JSON)
+            if self._has_saved_json_for_pdf(pdf_path):
                 skipped += 1
-                progress.setValue(row + 1)
-                QApplication.processEvents()
                 continue
 
             try:
-                progress.setLabelText(f"OCR en cours : {os.path.basename(pdf_path)}")
-                text = extract_text_from_pdf(pdf_path)
-                data = parse_invoice(text)
-                self._save_data_for_pdf(pdf_path, data)
+                self.current_pdf_path = pdf_path
+
+                # OCR (sans popup)
+                self.analyze_pdf(show_message=False)
+
+                # ✅ sauvegarde pour créer le JSON + mettre à jour IBAN/BIC dans la table
+                self.save_current_data(status="draft", show_message=False)
+
+                # status en table (pour filtres)
+                self._set_left_row_status(pdf_path, "draft")
+
                 processed += 1
+
             except Exception as e:
-                print(f"OCR erreur sur {pdf_path} :", e)
                 errors += 1
+                # (optionnel) marquer en erreur pour ton futur onglet “Erreurs”
+                self._set_left_row_status(pdf_path, "error")
+                # on continue sur les autres
+                print(f"OCR error on {pdf_path}: {e}")
 
-            progress.setValue(row + 1)
-            QApplication.processEvents()
+        # restore
+        self.current_pdf_path = previous_pdf
 
-        progress.close()
+        self.refresh_left_table_processing_states()
+        self.apply_left_filter_to_table()
+
+        # ré-applique tes filtres si tu les as
+        if hasattr(self, "apply_left_filter_to_table"):
+            self.apply_left_filter_to_table()
 
         QMessageBox.information(
             self,
             "OCR terminé",
-            f"OCR terminé.\nNouveaux OCR : {processed}\nDéjà traités : {skipped}\nErreurs : {errors}"
+            f"Traités : {processed}\nDéjà sauvegardés (skip) : {skipped}\nErreurs : {errors}"
         )
 
     def _save_data_for_pdf(self, pdf_path, data):
@@ -957,10 +1361,7 @@ class MainWindow(QMainWindow):
         json_path = os.path.join(model_dir, f"{base_name}.json")
         return os.path.exists(json_path)
 
-    # =========================
-    # Supplier model
-    # =========================
-    def save_supplier_model(self):
+    def save_supplier_model(self, checked: bool = False, show_message: bool = True) -> bool:
         ocr_text = self.ocr_text_view.toPlainText() or ""
 
         # 1) récupérer IBAN/BIC robustes depuis l’OCR (validation + scoring)
@@ -973,20 +1374,24 @@ class MainWindow(QMainWindow):
         iban = best.get("iban") or self.iban_input.text().strip()
         bic  = best.get("bic")  or self.bic_input.text().strip()
 
-        if iban:
-            self.iban_input.setText(iban)
-        if bic:
-            self.bic_input.setText(bic)
+        # En mode "silencieux" (validation), on ne modifie pas les champs UI
+        if show_message:
+            if iban:
+                self.iban_input.setText(iban)
+            if bic:
+                self.bic_input.setText(bic)
 
         supplier_key = build_supplier_key(iban, bic)
         if not supplier_key:
-            QMessageBox.warning(
-                self,
-                "Modèle fournisseur",
-                "Impossible de sauvegarder : IBAN/BIC non fiables.\n"
+            msg = (
+                "Impossible de sauvegarder le modèle : IBAN/BIC non fiables.\n"
                 "Corrige IBAN/BIC puis réessaie."
             )
-            return
+            if show_message:
+                QMessageBox.warning(self, "Modèle transporteur", msg)
+            else:
+                self.statusBar().showMessage("Modèle transporteur non mis à jour (IBAN/BIC non fiables).", 4000)
+            return False
 
         # 2) charger l’existant
         existing = load_supplier_model(supplier_key) or {}
@@ -1003,7 +1408,7 @@ class MainWindow(QMainWindow):
 
         folders = self.get_folder_numbers()
 
-        # 4) construire data (TOUJOURS défini)
+        # 4) construire data
         data = dict(existing)
         data.update({
             "supplier_key": supplier_key,
@@ -1020,9 +1425,17 @@ class MainWindow(QMainWindow):
         # 5) sauver le fichier
         try:
             save_supplier_model(supplier_key, data)
-            QMessageBox.information(self, "Modèle fournisseur", "Modèle fournisseur sauvegardé / mis à jour.")
+            if show_message:
+                QMessageBox.information(self, "Modèle transporteur", "Modèle transporteur sauvegardé / mis à jour.")
+            else:
+                self.statusBar().showMessage("Modèle transporteur mis à jour.", 3000)
+            return True
         except Exception as e:
-            QMessageBox.critical(self, "Erreur", str(e))
+            if show_message:
+                QMessageBox.critical(self, "Erreur modèle transporteur", str(e))
+            else:
+                self.statusBar().showMessage("Erreur MAJ modèle transporteur.", 4000)
+            return False
 
     def apply_supplier_model(self, model: dict):
         if not model:
@@ -1052,7 +1465,7 @@ class MainWindow(QMainWindow):
         if not self.get_folder_numbers():
             example = model.get("folder_number_example", "")
             if example:
-                dossier_le, _ = self._get_row_widgets(0)
+                dossier_le, _ , vat_theo_le= self._get_row_widgets(0)
                 if dossier_le:
                     dossier_le.setText(example)
                     self._ensure_empty_folder_row()
@@ -1074,7 +1487,7 @@ class MainWindow(QMainWindow):
             self.lbl_page_info.setText("0 / 0")
             return
         current = self.pdf_viewer.current_page_index() + 1
-        self.lbl_page_info.setText(f"{current} / {total}")
+        self.lbl_page_info.setText(f"Page {current} / {total}")
         self.btn_prev_page.setEnabled(current > 1)
         self.btn_next_page.setEnabled(current < total)
 
@@ -1151,6 +1564,7 @@ class MainWindow(QMainWindow):
 
     def load_transporter_information(self, force_by_kundennr: bool = False):
         self.transporter_info.clear()
+        self.transporter_vat_input.setText("")
 
         iban = self.iban_input.text().strip()
         bic = self.bic_input.text().strip()
@@ -1172,9 +1586,22 @@ class MainWindow(QMainWindow):
 
             if not record:
                 self.transporter_info.setPlainText("❌ Transporteur non trouvé en base.")
+                self.transporter_vat_input.setText("")
+                self._set_transporter_match_color(False)
                 return
 
             kundennr = record.get("KundenNr") or record.get("kundennr") or ""
+
+            # ✅ Charger le N° TVA (UstId) du transporteur
+            try:
+                vat_row = self.transporter_repo.get_ustid_by_kundennr(str(kundennr))
+                ustid = ""
+                if vat_row:
+                    ustid = vat_row.get("UstId") or vat_row.get("ustid") or ""
+                self.transporter_vat_input.setText(str(ustid).strip())
+            except Exception:
+                # on laisse vide si erreur SQL
+                self.transporter_vat_input.setText("")
             name = record.get("name1", "")
 
             self.selected_kundennr = str(kundennr) if kundennr is not None else None
@@ -1193,15 +1620,17 @@ class MainWindow(QMainWindow):
                 f"SWIFT : {record.get('SWIFT', '')}\n\n"
                 f"🚚 Transporteur : {record.get('name1', '')}\n"
                 f"Adresse : {record.get('Strasse', '')}\n"
-                f"Ville : {record.get('Ort', '')}\n"
+                f"Ville : {record.get('Ort', '')+record.get('PLZ', '')}\n"
                 f"Pays : {record.get('LKZ', '')}"
             )
             self.transporter_info.setPlainText(text)
 
             self.enable_transporter_update()
+            self.update_transporter_vs_dossiers_status()
 
         except Exception as e:
             self.transporter_info.setPlainText(f"Erreur chargement transporteur :\n{e}")
+            self._set_transporter_match_color(False)
 
 
     def on_bank_fields_changed(self):
@@ -1295,6 +1724,7 @@ class MainWindow(QMainWindow):
 
 
     def load_tour_information(self, tour_nr: str):
+        self.last_loaded_tour_nr = (tour_nr or "").strip()
         self.transporter_info.clear()
         tour_nr = (tour_nr or "").strip()
 
@@ -1312,14 +1742,56 @@ class MainWindow(QMainWindow):
                 self.transporter_info.setPlainText(f"❌ Tour non trouvée : {tour_nr}")
                 return
 
-            self.transporter_info.setPlainText(
-                "🧾 Tour trouvée\n"
-                f"TourNr : {record.get('TourNr', '')}"
+            info = self.tour_repo.get_tour_extended_info(tour_nr) or {}
+
+            invoice_tours = self._get_current_invoice_tours()
+            cmr_tours = self._get_cmr_attached_tours_for_entry()
+
+            missing = sorted(invoice_tours - cmr_tours) if invoice_tours else []
+            all_ok = bool(invoice_tours) and not missing
+            this_ok = tour_nr in cmr_tours
+
+            global_icon = "✅" if all_ok else ("⚠️" if invoice_tours else "—")
+            this_icon = "🧾✅" if this_ok else "🧾❌"
+
+            header = f"🧾 Tour trouvée {global_icon}"
+            if missing:
+                header += f" | CMR manquantes: {', '.join(missing)}"
+
+            txt = (
+                f"{header}\n"
+                f"TourNr : {info.get('TourNr', tour_nr)} {this_icon}\n"
+                f"Départ : {info.get('Depart', '')}\n"
+                f"Arrivée : {info.get('Arrivee', '')}\n"
+                f"Date Tour : {info.get('DateTour', '')}\n"
+                f"Date Livraison : {info.get('DateLivraison', '')}\n"
+                f"Total Poids : {info.get('Total_Poids', '')}\n"
+                f"Total MPL : {info.get('Total_MPL', '')}"
             )
+
+            self.transporter_info.setPlainText(txt)
+
         except Exception as e:
             self.transporter_info.setPlainText(f"Erreur chargement tour :\n{e}")
 
     def on_related_pdf_context_menu(self, pos):
+
+        invoice_row = self.pdf_table.currentRow()
+        entry_id = None
+        invoice_filename = None
+
+        if invoice_row >= 0:
+            it = self.pdf_table.item(invoice_row, 0)
+            if it:
+                invoice_filename = it.text().strip()
+                entry_id = self.logmail_repo.get_entry_id_for_file(invoice_filename)
+
+        action_associer.setEnabled(bool(entry_id))
+
+        # (optionnel) garder en mémoire
+        self.selected_invoice_filename = invoice_filename
+        self.selected_invoice_entry_id = entry_id
+
         item = self.related_pdf_table.itemAt(pos)
         if not item:
             return
@@ -1357,6 +1829,169 @@ class MainWindow(QMainWindow):
                 self.load_related_pdfs()  # refresh
             except Exception as e:
                 QMessageBox.critical(self, "Erreur association", str(e))
+
+
+    def _format_amount_2(self, v: float) -> str:
+        return f"{v:.2f}"
+
+    def _best_ht_amount_for_tour(self, lines: list[str], tour_nr: str) -> float | None:
+        # 1) Trouver la 1ère ligne contenant le dossier
+        idx = next((i for i, ln in enumerate(lines) if tour_nr in ln), None)
+        if idx is None:
+            return None
+
+        # 2) Délimiter le bloc : du dossier jusqu’au prochain dossier (8 chiffres) différent
+        start = idx
+        end = min(len(lines), idx + 30)  # sécurité
+        for j in range(idx + 1, end):
+            ln = lines[j]
+            # si on voit un autre dossier 8 chiffres, on stoppe le bloc
+            for d in DOSSIER_8DIG_RE.findall(ln):
+                if d != tour_nr:
+                    end = j
+                    break
+            if end == j:
+                break
+
+        # 3) Collecter les candidats dans le bloc
+        best = None  # (score, position, value)
+        found_strict_2dec = False
+
+        # helper : précédente ligne "utile"
+        def prev_nonempty(k: int) -> str:
+            for x in range(k - 1, start - 1, -1):
+                t = lines[x].strip()
+                if t:
+                    return t
+            return ""
+
+        for j in range(start, end):
+            raw = lines[j].strip()
+            if not raw:
+                continue
+
+            up = raw.upper()
+
+            # ignorer lignes avec unités / CO2 / etc.
+            if "CO2" in up or "CO2E" in up or "KG" in up:
+                continue
+
+            # très important : si la ligne contient des lettres (hors € / EUR), on ignore
+            # (ça évite "0,080 t", "De :", "A :", etc.)
+            if HAS_LETTERS_RE.search(raw) and ("€" not in raw and "EUR" not in up):
+                continue
+
+            # bonus énorme si ligne = "montant seul" avec 2 décimales
+            strict_line = bool(ONLY_AMOUNT_2DEC_RE.match(raw))
+
+            for s_amt in AMOUNT_CANDIDATE_RE.findall(raw):
+                v = self._parse_amount(s_amt)
+                if v is None or v <= 0:
+                    continue
+
+                # filtre valeurs trop petites
+                if v < 50:
+                    continue
+
+                # longueur décimales
+                mdec = re.search(r"[.,](\d+)$", s_amt)
+                dlen = len(mdec.group(1)) if mdec else 0
+
+                # on privilégie 2 décimales ; 1 décimale est très suspect (ex: 244,8)
+                if dlen == 2:
+                    found_strict_2dec = True
+
+                score = 0
+
+                # proximité du début de bloc (souvent le total est pas très loin)
+                score += max(0, 15 - (j - start) * 1)
+
+                # décimales
+                if dlen == 2:
+                    score += 30
+                elif dlen == 3:
+                    score += 10
+                else:
+                    score -= 40  # très suspect
+
+                # bonus si la ligne ne contient QUE le montant
+                if strict_line:
+                    score += 80
+
+                    # bonus si la ligne précédente ressemble à une quantité (ex: "1", "5")
+                    prev = prev_nonempty(j)
+                    if re.fullmatch(r"\d{1,3}", prev.strip()):
+                        score += 25
+
+                # malus si la ligne contient "t" ou "kg" (même si on a filtré les lettres, prudence)
+                if re.search(r"\bT\b", up) or "KG" in up:
+                    score -= 50
+
+                # garde le meilleur (à score égal on prend celui le plus proche de la fin du bloc)
+                candidate = (score, j, round(v, 2))
+                if best is None or candidate[0] > best[0] or (candidate[0] == best[0] and candidate[1] > best[1]):
+                    best = candidate
+
+        if not best:
+            return None
+
+        # 4) Si on a trouvé au moins un vrai 2 décimales dans le bloc, on refuse les candidats non-2 décimales
+        if found_strict_2dec:
+            # rescanner pour garder seulement dlen==2 + max score
+            best2 = None
+            for j in range(start, end):
+                raw = lines[j].strip()
+                if not raw:
+                    continue
+                if HAS_LETTERS_RE.search(raw) and ("€" not in raw and "EUR" not in raw.upper()):
+                    continue
+                strict_line = bool(ONLY_AMOUNT_2DEC_RE.match(raw))
+                for s_amt in AMOUNT_CANDIDATE_RE.findall(raw):
+                    v = self._parse_amount(s_amt)
+                    if v is None or v < 50:
+                        continue
+                    mdec = re.search(r"[.,](\d+)$", s_amt)
+                    dlen = len(mdec.group(1)) if mdec else 0
+                    if dlen != 2:
+                        continue
+                    score = 0
+                    score += max(0, 15 - (j - start) * 1)
+                    score += 30
+                    if strict_line:
+                        score += 80
+                        prev = prev_nonempty(j)
+                        if re.fullmatch(r"\d{1,3}", prev.strip()):
+                            score += 25
+                    cand = (score, j, round(v, 2))
+                    if best2 is None or cand[0] > best2[0] or (cand[0] == best2[0] and cand[1] > best2[1]):
+                        best2 = cand
+            if best2:
+                return best2[2]
+
+        return best[2]
+
+    def autofill_folder_amounts_from_ocr(self, ocr_text: str):
+        txt = ocr_text or ""
+        lines = [ln.strip() for ln in txt.splitlines() if ln.strip()]
+        if not lines:
+            return
+
+        for r in range(self.folder_table.rowCount()):
+            dossier_le, amount_le, vat_theo_le = self._get_row_widgets(r)
+            if not dossier_le or not amount_le:
+                continue
+
+            tour_nr = (dossier_le.text() or "").strip()
+            if not tour_nr:
+                continue
+
+            # ne pas écraser si déjà rempli
+            if (amount_le.text() or "").strip():
+                continue
+
+            best = self._best_ht_amount_for_tour(lines, tour_nr)
+            if best is not None:
+                amount_le.setText(self._format_amount_2(best))
 
     def _parse_amount(self, s: str):
         if not s:
@@ -1414,30 +2049,42 @@ class MainWindow(QMainWindow):
     def _get_row_widgets(self, row: int):
         dossier_le = self.folder_table.cellWidget(row, 0)
         amount_le = self.folder_table.cellWidget(row, 1)
-        return dossier_le, amount_le    
+        vat_theo_le = self.folder_table.cellWidget(row, 2)
+        return dossier_le, amount_le, vat_theo_le 
     
-    def _add_folder_row(self, dossier: str = "", amount: str = ""):
+    def _add_folder_row(self, dossier: str = "", amount: str = "", vat_theo: str = ""):
         row = self.folder_table.rowCount()
         self.folder_table.insertRow(row)
 
         dossier_le = self._make_folder_cell("Numéro de dossier")
         amount_le = self._make_folder_cell("Montant HT (OCR)")
 
+        vat_theo_le = self._make_folder_cell("TVA théorique (%)")
+        vat_theo_le.setReadOnly(True)
+        vat_theo_le.setFocusPolicy(Qt.NoFocus)
+        vat_theo_le.setStyleSheet("background-color: #f3f3f3;")
+
+        cmr_lbl = QLabel("")
+        cmr_lbl.setAlignment(Qt.AlignCenter)
+        cmr_lbl.setToolTip("CMR OK ?")
+        self.folder_table.setCellWidget(row, 3, cmr_lbl)
+
         dossier_le.setText("" if dossier is None else str(dossier))
         amount_le.setText("" if amount is None else str(amount))
+        vat_theo_le.setText("" if vat_theo is None else str(vat_theo))
 
-        # Focus => champ actif (pour PDF -> champ)
         dossier_le.mousePressEvent = lambda e, f=dossier_le: self.set_active_field(f)
         amount_le.mousePressEvent = lambda e, f=amount_le: self.set_active_field(f)
 
-        # Change => calcul + ligne vide + volet info
         dossier_le.textChanged.connect(lambda _=None, r=row: self._on_folder_row_changed(r))
         amount_le.textChanged.connect(lambda _=None, r=row: self._on_folder_row_changed(r))
+        dossier_le.editingFinished.connect(self.compact_folder_rows)
+        amount_le.editingFinished.connect(self.compact_folder_rows)
 
         self.folder_table.setCellWidget(row, 0, dossier_le)
         self.folder_table.setCellWidget(row, 1, amount_le)
+        self.folder_table.setCellWidget(row, 2, vat_theo_le)
 
-        # 1er calcul
         self._update_folder_row_status(row)
 
 
@@ -1448,7 +2095,7 @@ class MainWindow(QMainWindow):
             return
 
         last = self.folder_table.rowCount() - 1
-        dossier_le, amount_le = self._get_row_widgets(last)
+        dossier_le, amount_le, vat_theo_le = self._get_row_widgets(last)
         dossier_txt = (dossier_le.text() if dossier_le else "").strip()
         amount_txt = (amount_le.text() if amount_le else "").strip()
 
@@ -1462,14 +2109,14 @@ class MainWindow(QMainWindow):
         self._ensure_empty_folder_row()
 
         # si le champ actif est le dossier de cette ligne, refresh le volet tour
-        dossier_le, _ = self._get_row_widgets(row)
+        dossier_le, _, vat_theo_le = self._get_row_widgets(row)
         if self.active_field == dossier_le:
             self.load_tour_information(dossier_le.text())
 
     def get_folder_rows(self):
         rows = []
         for r in range(self.folder_table.rowCount()):
-            dossier_le, amount_le = self._get_row_widgets(r)
+            dossier_le, amount_le, vat_theo_le = self._get_row_widgets(r)
             dossier = (dossier_le.text() if dossier_le else "").strip()
             amount = (amount_le.text() if amount_le else "").strip()
             # ignorer la ligne totalement vide (celle du bas)
@@ -1478,11 +2125,30 @@ class MainWindow(QMainWindow):
         return rows
     
     def _update_folder_row_status(self, row: int):
-        dossier_le, amount_le = self._get_row_widgets(row)
+        dossier_le, amount_le, vat_theo_le = self._get_row_widgets(row)
         if not dossier_le or not amount_le:
             return
 
         tour_nr = dossier_le.text().strip()
+
+        cmr_lbl = self._get_row_cmr_widget(row)
+
+        # CMR icon
+        if cmr_lbl is not None:
+            if not tour_nr:
+                cmr_lbl.setText("")
+                cmr_lbl.setToolTip("")
+            else:
+                cmr_tours = self._get_cmr_attached_tours_for_entry()  # set de TourNr
+                if tour_nr in cmr_tours:
+                    cmr_lbl.setText("🧾✅")
+                    cmr_lbl.setToolTip(f"CMR rattachée au dossier {tour_nr}")
+                else:
+                    cmr_lbl.setText("🧾❌")
+                    cmr_lbl.setToolTip(f"Aucune CMR rattachée au dossier {tour_nr}")
+
+
+
         amount_ocr = self._parse_amount(amount_le.text())
 
         dossier_le.setStyleSheet("")
@@ -1491,7 +2157,28 @@ class MainWindow(QMainWindow):
 
         # ligne vide => neutre
         if not tour_nr:
+            vat_theo_le.setText("")
+            vat_theo_le.setToolTip("")
             return
+        
+        # TVA théorique (BDD)
+        try:
+            if tour_nr in self._vat_theo_cache:
+                vat_val = self._vat_theo_cache.get(tour_nr)
+            else:
+                vat_val = self.tour_repo.get_theoretical_vat_percent_by_tournr(tour_nr)
+                self._vat_theo_cache[tour_nr] = vat_val
+
+            if vat_val is not None:
+                vat_theo_le.setText(self._format_percent(vat_val))
+                vat_theo_le.setToolTip(f"TVA théorique BDD = {vat_val}")
+            else:
+                vat_theo_le.setText("")
+                vat_theo_le.setToolTip("TVA théorique introuvable en BDD.")
+        except Exception as e:
+            vat_theo_le.setText("")
+            vat_theo_le.setToolTip(f"Erreur BDD TVA: {e}")
+
 
         try:
             db_kosten = self.tour_repo.get_kosten_by_tournr(tour_nr)
@@ -1594,14 +2281,24 @@ class MainWindow(QMainWindow):
         return rows
 
     def update_vat_total(self):
-        total = 0.0
+        base_total = 0.0
+        vat_total = 0.0
         has_any = False
+
         for r in range(self.vat_table.rowCount()):
-            _, _, vat_le = self._get_vat_row_widgets(r)
-            vat_txt = (vat_le.text() if vat_le else "").strip()
+            _, base_le, vat_le = self._get_vat_row_widgets(r)
+
+            base_txt = (base_le.text() if base_le else "").strip()
+            vat_txt  = (vat_le.text() if vat_le else "").strip()
+
+            b = self._parse_amount(base_txt)
             v = self._parse_amount(vat_txt)
+
+            if b is not None:
+                base_total += b
+                has_any = True
             if v is not None:
-                total += v
+                vat_total += v
                 has_any = True
 
         if not has_any:
@@ -1609,7 +2306,11 @@ class MainWindow(QMainWindow):
             self.lbl_vat_total.setStyleSheet("padding:4px;")
             return
 
-        self.lbl_vat_total.setText(f"Total TVA = {total:.2f}")
+        ttc_total = base_total + vat_total
+
+        self.lbl_vat_total.setText(
+            f"Base HT = {base_total:.2f} | Total TVA = {vat_total:.2f} | Total TTC = {ttc_total:.2f}"
+        )
         self.lbl_vat_total.setStyleSheet("padding:4px; background-color:#e6ffe6;")
 
 
@@ -1643,8 +2344,8 @@ class MainWindow(QMainWindow):
             name = str(name).strip()
             if not name:
                 continue
-            if not os.name.lower().endswith(".pdf"):
-                return
+            if not name.lower().endswith(".pdf"):
+                continue
             full_path = os.path.join(current_dir, name)
             if os.path.exists(full_path) and full_path not in paths:
                 paths.append(full_path)
@@ -1675,12 +2376,12 @@ class MainWindow(QMainWindow):
     def update_doc_indicator(self):
         total = len(self.entry_pdf_paths)
         if total <= 0:
-            self.lbl_doc_info.setText("0 / 0")
+            self.lbl_doc_info.setText("Doc 0 / 0")
             self.btn_prev_doc.setEnabled(False)
             self.btn_next_doc.setEnabled(False)
             return
 
-        self.lbl_doc_info.setText(f"{self.current_doc_index + 1} / {total}")
+        self.lbl_doc_info.setText(f"Doc {self.current_doc_index + 1} / {total}")
         self.btn_prev_doc.setEnabled(self.current_doc_index > 0)
         self.btn_next_doc.setEnabled(self.current_doc_index < total - 1)
 
@@ -1815,3 +2516,1165 @@ class MainWindow(QMainWindow):
 
         # en mémoire aussi (utile si tu veux t’en servir ailleurs)
         self.block_options = block_options
+
+
+    def on_pdf_table_context_menu(self, pos):
+        """Clic-droit sur la liste du haut : rattacher un document à la facture sélectionnée."""
+
+        item = self.pdf_table.itemAt(pos)
+        if not item:
+            return
+
+        row = item.row()
+        it0 = self.pdf_table.item(row, 0)
+        if not it0:
+            return
+
+        linked_filename = (it0.text() or "").strip()
+        if not linked_filename:
+            return
+
+        menu = QMenu(self)
+
+        pdf_path = it0.data(Qt.UserRole)  # ✅ définir AVANT de l'utiliser
+
+        action_link = menu.addAction("Rattacher ce document à la facture sélectionnée")
+        action_attach_cmr = menu.addAction("Rattacher CMR à un dossier…")
+        action_attach_cmr.setEnabled(bool(pdf_path))  # ✅ maintenant OK
+
+        menu.addSeparator()
+        action_delete = menu.addAction("Supprimer")
+        action_delete.setEnabled(bool(pdf_path))
+
+        # --- cible = ligne actuellement sélectionnée (la facture cible)
+        target_row = self.pdf_table.currentRow()
+        target_filename = None
+        target_entry_id = None
+
+        if target_row >= 0:
+            it = self.pdf_table.item(target_row, 0)
+            if it:
+                target_filename = (it.text() or "").strip()
+                target_entry_id = self.logmail_repo.get_entry_id_for_file(target_filename)
+
+        # fallback: si mémorisé via clic gauche
+        if not target_entry_id and self.selected_invoice_filename:
+            target_filename = self.selected_invoice_filename
+            target_entry_id = self.selected_invoice_entry_id or self.logmail_repo.get_entry_id_for_file(target_filename)
+
+        can_link = bool(target_entry_id and target_filename and linked_filename and linked_filename != target_filename)
+        action_link.setEnabled(can_link)
+
+        chosen = menu.exec(self.pdf_table.viewport().mapToGlobal(pos))
+
+        # ✅ IMPORTANT: gérer l'action CMR AVANT le "chosen != action_link"
+        if chosen == action_attach_cmr:
+            self.attach_cmr_to_dossier_from_right_list(pdf_path, linked_filename)
+            return
+
+        if chosen == action_delete:
+            self.mark_pdf_as_deleted(pdf_path, linked_filename)
+            return
+
+        if chosen != action_link:
+            return
+
+        if not can_link:
+            return
+
+        # ... ici tu continues ton rattachement "document -> facture" existant (entry_id)
+        # en utilisant target_filename/target_entry_id
+
+
+        # cible = ligne actuellement sélectionnée (la facture cible)
+        target_row = self.pdf_table.currentRow()
+        target_filename = None
+        target_entry_id = None
+
+        if target_row >= 0:
+            it = self.pdf_table.item(target_row, 0)
+            if it:
+                target_filename = (it.text() or "").strip()
+                target_entry_id = self.logmail_repo.get_entry_id_for_file(target_filename)
+
+        # fallback: si tu avais déjà mémorisé une cible via clic gauche
+        if not target_entry_id and self.selected_invoice_filename:
+            target_filename = self.selected_invoice_filename
+            target_entry_id = self.selected_invoice_entry_id or self.logmail_repo.get_entry_id_for_file(target_filename)
+
+        can_link = bool(target_entry_id and target_filename and linked_filename and linked_filename != target_filename)
+        action_link.setEnabled(can_link)
+
+        # et pour la suite du code, utilise target_filename/target_entry_id au lieu de selected_invoice_*
+
+        action_link.setEnabled(can_link)
+
+        chosen = menu.exec(self.pdf_table.viewport().mapToGlobal(pos))
+
+        if chosen == action_delete:
+            self.mark_pdf_as_deleted(pdf_path, linked_filename)
+            return
+
+        if chosen == action_attach_cmr:
+            self.attach_cmr_to_dossier_from_right_list(pdf_path, linked_filename)
+            return
+        
+
+        if chosen != action_link:
+            return
+        
+
+
+        if not can_link:
+            QMessageBox.information(
+                self,
+                "Rattachement",
+                "Sélectionne d'abord une facture (clic gauche) dans la liste du haut.",
+            )
+            return
+
+        msg = QMessageBox(self)
+        msg.setWindowTitle("Rattacher un document")
+        msg.setText(
+            f"Rattacher le fichier :\n\n"
+            f"  {linked_filename}\n\n"
+            f"à la facture :\n\n"
+            f"  {self.selected_invoice_filename}\n\n"
+            f"(entry_id = {self.selected_invoice_entry_id})"
+        )
+        msg.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
+
+        if msg.exec() != QMessageBox.Yes:
+            return
+
+        try:
+            self.logmail_repo.update_entry_for_file(linked_filename, self.selected_invoice_entry_id)
+        except Exception as e:
+            QMessageBox.critical(self, "Erreur rattachement", str(e))
+            return
+
+        # Refresh groupe + liste pièces associées
+        current_view = self.view_pdf_path or self.current_pdf_path
+        self.build_entry_pdf_group()
+        if current_view and current_view in self.entry_pdf_paths:
+            self.current_doc_index = self.entry_pdf_paths.index(current_view)
+        self.update_doc_indicator()
+
+        QMessageBox.information(self, "Rattachement", "Document rattaché à la facture.")
+
+    def _on_pdf_current_cell_changed(self, currentRow, currentColumn, previousRow, previousColumn):
+        if currentRow >= 0:
+            self.on_pdf_selected(currentRow, currentColumn)
+
+    def load_default_folder(self):
+        """Charge automatiquement le dossier par défaut au démarrage."""
+        folder = self.DEFAULT_PDF_FOLDER
+        if folder and os.path.isdir(folder):
+            self.load_folder(folder)
+        else:
+            QMessageBox.warning(
+                self,
+                "Dossier PDF introuvable",
+                f"Le dossier PDF par défaut n'existe pas :\n{folder}\n\n"
+                "Vous pouvez en choisir un autre via : 'Analyser un dossier'."
+            )
+
+    def load_folder(self, folder: str):
+        """Remplit la liste de PDFs à partir d'un dossier (avec IBAN/BIC + status pour filtres)."""
+
+        # --- Sécurité : si la table a été détruite, on évite le crash ---
+        if not hasattr(self, "pdf_table") or self.pdf_table is None or not isValid(self.pdf_table):
+            tbl = self.findChild(QTableWidget, "pdf_table")
+            if tbl is not None and isValid(tbl):
+                self.pdf_table = tbl
+            else:
+                return
+
+        self.pdf_table.setRowCount(0)
+
+        try:
+            pdf_files = [f for f in sorted(os.listdir(folder)) if f.lower().endswith(".pdf")]
+        except Exception as e:
+            QMessageBox.critical(self, "Erreur", f"Impossible de lire le dossier :\n{folder}\n\n{e}")
+            return
+
+        self.pdf_table.setRowCount(0)
+
+        try:
+            pdf_files = [f for f in sorted(os.listdir(folder)) if f.lower().endswith(".pdf")]
+        except Exception as e:
+            QMessageBox.critical(self, "Erreur", f"Impossible de lire le dossier :\n{folder}\n\n{e}")
+            return
+
+        # ✅ mapping nom_pdf -> entry_id (en batch)
+        entry_map = {}
+        try:
+            entry_map = self.logmail_repo.get_entry_ids_for_files(pdf_files) or {}
+        except Exception:
+            entry_map = {}
+
+        # ✅ group by entry_id
+        groups: dict[str, list[str]] = {}
+        for fn in pdf_files:
+            entry_id = entry_map.get(fn)
+            if not entry_id:
+                entry_id = f"__NO_ENTRY__::{fn}"  # fichiers sans entry_id => chacun son groupe
+            groups.setdefault(entry_id, []).append(fn)
+
+        # ✅ construire les lignes (1 ligne par entry_id)
+        rows_to_add = []
+        for entry_id, files in groups.items():
+            group_paths = [os.path.join(folder, f) for f in files if os.path.exists(os.path.join(folder, f))]
+            if not group_paths:
+                continue
+
+            rep_path = self._choose_representative_pdf(group_paths)
+            if not rep_path:
+                rep_path = group_paths[0]
+            rep_filename = os.path.basename(rep_path)
+
+            rows_to_add.append((rep_filename, rep_path, entry_id, group_paths))
+
+        # tri stable (par nom du représentant)
+        rows_to_add.sort(key=lambda x: x[0].lower())
+
+        for row, (rep_filename, rep_path, entry_id, group_paths) in enumerate(rows_to_add):
+            iban, bic = self._get_saved_iban_bic_for_pdf(rep_path)
+            status = self._get_saved_status_for_pdf(rep_path)
+
+            self.pdf_table.insertRow(row)
+
+            it0 = QTableWidgetItem(rep_filename)
+            it0.setData(Qt.UserRole, rep_path)           # chemin du PDF représentant
+            it0.setData(Qt.UserRole + 1, status)         # status pour filtres
+            it0.setData(Qt.UserRole + 4, entry_id)       # ✅ entry_id du groupe
+            it0.setData(Qt.UserRole + 5, group_paths)    # ✅ liste complète des PDFs du groupe
+
+            # tooltip utile
+            it0.setToolTip(f"entry_id: {entry_id}\nDocuments: {len(group_paths)}")
+
+            self.pdf_table.setItem(row, 0, it0)
+            self.pdf_table.setItem(row, 1, QTableWidgetItem(iban))
+            self.pdf_table.setItem(row, 2, QTableWidgetItem(bic))
+
+        # filtres + refresh states
+        self.apply_left_filter_to_table()
+        self.refresh_left_table_processing_states()
+        self.apply_left_filter_to_table()
+
+        self.current_pdf_path = None
+        self.clear_fields()
+
+
+        # Appliquer le filtre courant (pending/validated/errors)
+        if hasattr(self, "apply_left_filter_to_table"):
+            self.apply_left_filter_to_table()
+        self.refresh_left_table_processing_states()
+        self.apply_left_filter_to_table()
+
+        # reset panneau de droite
+        self.current_pdf_path = None
+        self.clear_fields()
+
+    def _get_saved_json_path(self, pdf_path: str) -> str:
+        base_name = os.path.splitext(os.path.basename(pdf_path))[0]
+        model_dir = r"C:\git\OCR\OCR\models"
+        return os.path.join(model_dir, f"{base_name}.json")
+    
+    def _get_saved_json_path_for_pdf(self, pdf_path: str) -> str:
+        base_name = os.path.splitext(os.path.basename(pdf_path))[0]
+        model_dir = r"C:\git\OCR\OCR\models"
+        return os.path.join(model_dir, f"{base_name}.json")
+
+    def _get_saved_iban_bic_for_pdf(self, pdf_path: str) -> tuple[str, str]:
+        json_path = self._get_saved_json_path_for_pdf(pdf_path)
+        if not os.path.exists(json_path):
+            return ("", "")
+        try:
+            with open(json_path, "r", encoding="utf-8") as f:
+                data = json.load(f) or {}
+            return (str(data.get("iban", "")).strip(), str(data.get("bic", "")).strip())
+        except Exception:
+            return ("", "")
+        
+    def _update_left_table_iban_bic(self, pdf_path: str, iban: str, bic: str):
+        """Met à jour en temps réel les colonnes IBAN/BIC du tableau de gauche pour un PDF."""
+        if not pdf_path:
+            return
+        if not hasattr(self, "pdf_table"):
+            return
+        if self.pdf_table.columnCount() < 3:
+            return
+
+        iban = (iban or "").strip()
+        bic = (bic or "").strip()
+
+        for row in range(self.pdf_table.rowCount()):
+            it0 = self.pdf_table.item(row, 0)
+            if not it0:
+                continue
+            p = it0.data(Qt.UserRole)
+            if p == pdf_path:
+                # col 1 = IBAN, col 2 = BIC
+                self.pdf_table.setItem(row, 1, QTableWidgetItem(iban))
+                self.pdf_table.setItem(row, 2, QTableWidgetItem(bic))
+                return
+            
+    def showEvent(self, event):
+        super().showEvent(event)
+        if not self._did_autoload_default_folder:
+            self._did_autoload_default_folder = True
+            self.load_default_folder()
+
+
+    def refresh_left_table_saved_infos(self):
+        """Recharge IBAN/BIC pour chaque PDF de la table à partir des JSON sauvegardés."""
+        if not hasattr(self, "pdf_table") or self.pdf_table is None:
+            return
+        if self.pdf_table.columnCount() < 3:
+            return
+
+        for row in range(self.pdf_table.rowCount()):
+            it0 = self.pdf_table.item(row, 0)
+            if not it0:
+                continue
+
+            pdf_path = it0.data(Qt.UserRole)
+            if not pdf_path:
+                continue
+
+            iban, bic = self._get_saved_iban_bic_for_pdf(pdf_path)
+
+            it1 = self.pdf_table.item(row, 1)
+            if it1 is None:
+                self.pdf_table.setItem(row, 1, QTableWidgetItem(iban))
+            else:
+                it1.setText(iban)
+
+            it2 = self.pdf_table.item(row, 2)
+            if it2 is None:
+                self.pdf_table.setItem(row, 2, QTableWidgetItem(bic))
+            else:
+                it2.setText(bic)
+
+    def _is_typing_in_input(self) -> bool:
+        w = QApplication.focusWidget()
+        return isinstance(w, (QLineEdit, QTextEdit, QPlainTextEdit))
+    
+    def on_validate_invoice(self):
+        if self._is_typing_in_input():
+            return
+        if not self.current_pdf_path:
+            self.statusBar().showMessage("Aucun PDF sélectionné.", 3000)
+            return
+        if not self._block_validate_if_missing_cmr():
+            return
+
+        resp = QMessageBox.question(
+            self,
+            "Validation facture",
+            "Valider la facture ?\n",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No
+        )
+        if resp != QMessageBox.Yes:
+            return
+
+        # 1) Toujours re-sauvegarder AVANT les updates SQL
+        self.save_current_data(status="validated", show_message=False)
+    
+        # ✅ Met à jour le modèle transporteur (patterns) à la validation
+        try:
+            self.save_supplier_model(show_message=False)
+        except Exception:
+            # ne bloque pas la validation si le modèle échoue
+            pass
+
+        # 2) Déterminer la valeur à appliquer selon blocage
+        doc_name = os.path.basename(self.current_pdf_path)
+        blocked = bool((self.block_options.get(doc_name, {}) or {}).get("blocked", False))
+        value = 601 if blocked else 600
+
+        # 3) Dossiers (TourNr) -> updates SQL
+        tournrs = sorted({
+            (r.get("tour_nr") or "").strip()
+            for r in self.get_folder_rows()
+            if (r.get("tour_nr") or "").strip()
+        })
+
+        if not tournrs:
+            QMessageBox.warning(self, "Validation", "Aucun dossier (TourNr) trouvé : pas de mise à jour SQL.")
+            return
+
+        errors = []
+        for t in tournrs:
+            try:
+                self.tour_repo.set_infosymbol18_for_tournr(t, value=value)
+            except Exception as e:
+                errors.append(f"{t} : {e}")
+
+        if errors:
+            QMessageBox.warning(
+                self,
+                "Validation",
+                "Facture VALIDÉE et sauvegardée.\n\nErreurs SQL:\n" + "\n".join(errors)
+            )
+        else:
+            suffix = " (document BLOQUÉ)" if blocked else ""
+            QMessageBox.information(
+                self,
+                "Validation",
+                f"Facture VALIDÉE et sauvegardée.\n\nMise à jour SQL appliquée : InfoSymbol18={value} sur {len(tournrs)} dossier(s){suffix}."
+            )
+
+    def _get_saved_status_for_pdf(self, pdf_path: str) -> str:
+        json_path = self._get_saved_json_path(pdf_path)
+        if not os.path.exists(json_path):
+            return "draft"
+        try:
+            with open(json_path, "r", encoding="utf-8") as f:
+                data = json.load(f) or {}
+            return (data.get("status") or "draft").strip()
+        except Exception:
+            return "draft"
+        
+    def set_left_filter(self, mode: str):
+        self.left_filter_mode = mode
+        self.apply_left_filter_to_table()
+
+    def apply_left_filter_to_table(self):
+        if not hasattr(self, "pdf_table") or self.pdf_table is None:
+            return
+
+        for row in range(self.pdf_table.rowCount()):
+            it0 = self.pdf_table.item(row, 0)
+            if not it0:
+                continue
+
+            deleted = bool(it0.data(Qt.UserRole + 3))
+            if deleted:
+                visible = (self.left_filter_mode == "errors")
+                self.pdf_table.setRowHidden(row, not visible)
+                continue           
+
+            status = (it0.data(Qt.UserRole + 1) or "draft").strip()
+
+            if self.left_filter_mode == "pending":
+                visible = (status != "validated")
+            elif self.left_filter_mode == "validated":
+                visible = (status == "validated")
+            elif self.left_filter_mode == "errors":
+                state = (it0.data(Qt.UserRole + 2) or "").strip()
+                visible = (state == "error")
+
+            self.pdf_table.setRowHidden(row, not visible)
+
+    def _has_saved_json_for_pdf(self, pdf_path: str) -> bool:
+        if not pdf_path:
+            return False
+        return os.path.exists(self._get_saved_json_path(pdf_path))
+
+    def _set_left_row_status(self, pdf_path: str, status: str):
+        """Stocke le status dans la colonne 0 (UserRole+1) pour tes filtres."""
+        if not pdf_path or not hasattr(self, "pdf_table") or self.pdf_table is None:
+            return
+        for row in range(self.pdf_table.rowCount()):
+            it0 = self.pdf_table.item(row, 0)
+            if it0 and it0.data(Qt.UserRole) == pdf_path:
+                it0.setData(Qt.UserRole + 1, (status or "draft").strip())
+                break
+
+
+    def _set_transporter_match_color(self, ok: bool | None):
+        """
+        ok=True  => vert
+        ok=False => rouge
+        ok=None  => neutre
+        """
+        if ok is None:
+            self.transporter_info.setStyleSheet("")
+            # si tu veux aussi colorer le champ TVA transporteur :
+            self.transporter_vat_input.setStyleSheet("background-color: #f3f3f3;")
+            return
+
+        if ok:
+            bg = "#d4edda"  # vert clair
+            border = "#28a745"
+        else:
+            bg = "#f8d7da"  # rouge clair
+            border = "#dc3545"
+
+        self.transporter_info.setStyleSheet(f"background-color: {bg}; border: 2px solid {border};")
+        self.transporter_vat_input.setStyleSheet(f"background-color: {bg}; border: 2px solid {border};")
+
+    def update_transporter_vs_dossiers_status(self):
+        """
+        Règle demandée :
+        - si IBAN/BIC => transporteur trouvé en base
+        - et si TOUS les dossiers sont trouvés via :
+            SELECT tournr FROM xxatour WHERE tournr IN (...)
+        => VERT
+        sinon => ROUGE
+        """
+        dossiers = sorted({d.strip() for d in self.get_folder_numbers() if d and d.strip()})
+        if not dossiers:
+            self._set_transporter_match_color(None)
+            return
+
+        # transporteur non trouvé
+        if not self.selected_kundennr:
+            self._set_transporter_match_color(False)
+            return
+
+        try:
+            found = self.tour_repo.get_existing_tournrs_in_xxatour(dossiers)
+            missing = set(dossiers) - set(found)
+            self._set_transporter_match_color(len(missing) == 0)
+
+            # optionnel: un petit message barre de statut
+            if missing:
+                self.statusBar().showMessage(f"Transporteur/dossiers incohérents : {len(missing)} dossier(s) non trouvés en xxatour.", 5000)
+        except Exception as e:
+            # en cas d'erreur SQL => rouge
+            self._set_transporter_match_color(False)
+            self.statusBar().showMessage(f"Erreur contrôle xxatour : {e}", 5000)
+
+    def _read_saved_invoice_json(self, pdf_path: str) -> dict:
+        json_path = self._get_saved_json_path(pdf_path)
+        if not os.path.exists(json_path):
+            return {}
+        try:
+            with open(json_path, "r", encoding="utf-8") as f:
+                return json.load(f) or {}
+        except Exception:
+            return {}
+
+    def _extract_tournrs_from_saved(self, data: dict) -> list[str]:
+        tournrs = []
+        folders = data.get("folders") or []
+        if isinstance(folders, list):
+            for f in folders:
+                if isinstance(f, dict):
+                    t = f.get("tour_nr") or f.get("TourNr") or f.get("tournr") or ""
+                else:
+                    t = str(f)
+                t = str(t).strip()
+                if t:
+                    tournrs.append(t)
+
+        if not tournrs:
+            t = str(data.get("folder_number") or "").strip()
+            if t:
+                tournrs.append(t)
+
+        # unique, stable
+        return sorted(set(tournrs))
+
+    def _set_left_row_visual(self, row: int, state: str, tooltip: str = ""):
+        """
+        state: 'ok' | 'error' | 'unknown'
+        """
+        if not hasattr(self, "pdf_table") or self.pdf_table is None:
+            return
+
+        it0 = self.pdf_table.item(row, 0)
+        if it0:
+            it0.setData(Qt.UserRole + 2, state)  # pour le filtre "Erreurs"
+
+        if state == "ok":
+            color = QColor(212, 237, 218)   # vert clair
+        elif state == "error":
+            color = QColor(248, 215, 218)   # rouge clair
+        else:
+            color = None
+
+        for col in range(self.pdf_table.columnCount()):
+            it = self.pdf_table.item(row, col)
+            if it is None:
+                it = QTableWidgetItem("")
+                self.pdf_table.setItem(row, col, it)
+
+            if color is None:
+                it.setBackground(QBrush())
+            else:
+                it.setBackground(color)
+
+            it.setToolTip(tooltip or "")
+
+    def refresh_left_row_processing_state(self, row: int):
+        it0 = self.pdf_table.item(row, 0)
+
+        if not it0:
+            return
+        pdf_path = it0.data(Qt.UserRole)
+        if not pdf_path:
+            self._set_left_row_visual(row, "unknown", "")
+            return
+
+        data = self._read_saved_invoice_json(pdf_path)
+        if not data:
+            # pas encore sauvegardé => neutre
+            self._set_left_row_visual(row, "unknown", "Non sauvegardé.")
+            return
+        
+        # Tag "supprime" => toujours en erreurs
+        tags = data.get("tags") or []
+        if isinstance(tags, str):
+            tags = [tags]
+        tags_norm = {str(t).strip().lower() for t in tags if str(t).strip()}
+
+        if "supprime" in tags_norm:
+            it0.setData(Qt.UserRole + 3, 1)  # flag "deleted"
+            self._set_left_row_visual(row, "error", "Tag 'supprime' : fichier marqué comme supprimé.")
+            return
+
+        iban = str(data.get("iban") or "").strip()
+        bic = str(data.get("bic") or "").strip()
+        tournrs = self._extract_tournrs_from_saved(data)
+
+        if not iban or not bic:
+            self._set_left_row_visual(row, "error", "IBAN/BIC manquant dans le JSON.")
+            return
+        if not tournrs:
+            self._set_left_row_visual(row, "error", "Aucun dossier (TourNr) dans le JSON.")
+            return
+
+        # 1) transporteur trouvé par iban/bic ?
+        try:
+            rec = self.transporter_repo.find_transporter_by_bank(iban, bic)
+        except Exception as e:
+            self._set_left_row_visual(row, "error", f"Erreur SQL transporteur: {e}")
+            return
+
+        if not rec:
+            self._set_left_row_visual(row, "error", "Transporteur introuvable en base pour cet IBAN/BIC.")
+            return
+
+        # 2) tous les dossiers existent dans xxatour ?
+        try:
+            found = self.tour_repo.get_existing_tournrs_in_xxatour(tournrs)
+            missing = sorted(set(tournrs) - set(found))
+        except Exception as e:
+            self._set_left_row_visual(row, "error", f"Erreur SQL xxatour: {e}")
+            return
+
+        if missing:
+            more = "" if len(missing) <= 6 else f" (+{len(missing)-6})"
+            self._set_left_row_visual(row, "error", f"Dossier(s) manquant(s) en xxatour: {', '.join(missing[:6])}{more}")
+            return
+
+        self._set_left_row_visual(row, "ok", "OK : transporteur trouvé + tous les dossiers présents en base.")
+
+    def refresh_left_table_processing_states(self):
+        if not hasattr(self, "pdf_table") or self.pdf_table is None:
+            return
+        for row in range(self.pdf_table.rowCount()):
+            self.refresh_left_row_processing_state(row)
+
+    def _add_fee_row(self, gebnr: str, bez: str, amount: str = ""):
+        row = self.fees_table.rowCount()
+        self.fees_table.insertRow(row)
+
+        it0 = QTableWidgetItem(str(gebnr))
+        it0.setFlags(it0.flags() & ~Qt.ItemIsEditable)
+        it1 = QTableWidgetItem(str(bez))
+        it1.setFlags(it1.flags() & ~Qt.ItemIsEditable)
+
+        self.fees_table.setItem(row, 0, it0)
+        self.fees_table.setItem(row, 1, it1)
+
+        le = QLineEdit()
+        le.setPlaceholderText("Montant")
+        le.setClearButtonEnabled(True)
+        le.setText("" if amount is None else str(amount))
+        le.mousePressEvent = lambda e, f=le: self.set_active_field(f)  # si tu veux le click->champ actif
+        self.fees_table.setCellWidget(row, 2, le)
+
+    def on_add_fee(self):
+        dlg = GebSearchDialog(self.geb_repo, self)
+
+        if dlg.exec() != QDialog.Accepted or not dlg.selected:
+            return
+
+        gebnr = dlg.selected["gebnr"]
+        bez = dlg.selected["bez"]
+
+        # éviter doublon
+        for r in range(self.fees_table.rowCount()):
+            it = self.fees_table.item(r, 0)
+            if it and it.text().strip() == gebnr:
+                return
+
+        self._add_fee_row(gebnr, bez, "")
+
+    def on_remove_fee(self):
+        rows = sorted({idx.row() for idx in self.fees_table.selectionModel().selectedRows()}, reverse=True)
+        for r in rows:
+            self.fees_table.removeRow(r)
+
+    def get_fee_rows(self):
+        out = []
+        for r in range(self.fees_table.rowCount()):
+            gebnr = (self.fees_table.item(r, 0).text().strip() if self.fees_table.item(r, 0) else "")
+            bez = (self.fees_table.item(r, 1).text().strip() if self.fees_table.item(r, 1) else "")
+            le = self.fees_table.cellWidget(r, 2)
+            amount = (le.text().strip() if le else "")
+            if gebnr or bez or amount:
+                out.append({"gebnr": gebnr, "bez": bez, "amount": amount})
+        return out
+
+    def rebuild_fees_from_json(self, data: dict):
+        self.fees_table.setRowCount(0)
+        fees = data.get("fees", [])
+        if isinstance(fees, list):
+            for f in fees:
+                if not isinstance(f, dict):
+                    continue
+                gebnr = str(f.get("gebnr", "") or "").strip()
+                bez = str(f.get("bez", "") or "").strip()
+                amount = str(f.get("amount", "") or "").strip()
+                if gebnr or bez or amount:
+                    self._add_fee_row(gebnr, bez, amount)
+
+    def on_ctrl_s_save(self):
+        self.save_current_data()
+
+    def _format_percent(self, v: float | None) -> str:
+        if v is None:
+            return ""
+        try:
+            fv = float(v)
+        except Exception:
+            return ""
+        if abs(fv - round(fv)) < 1e-9:
+            return str(int(round(fv)))
+        return f"{fv:.2f}"
+    
+    def on_delete_folder_row(self):
+        # pas de PDF => pas de sauvegarde/tag
+        if not self.current_pdf_path:
+            return
+
+        # lignes sélectionnées (ou ligne courante)
+        rows = sorted({idx.row() for idx in self.folder_table.selectionModel().selectedRows()}, reverse=True)
+        if not rows:
+            cr = self.folder_table.currentRow()
+            if cr >= 0:
+                rows = [cr]
+
+        if not rows:
+            return
+
+        removed_any = False
+
+        for r in rows:
+            dossier_le, amount_le, _ = self._get_row_widgets(r)
+            dossier_txt = (dossier_le.text() if dossier_le else "").strip()
+            amount_txt = (amount_le.text() if amount_le else "").strip()
+
+            # ne pas supprimer la ligne "vide" de fin
+            if not dossier_txt and not amount_txt:
+                continue
+
+            self.folder_table.removeRow(r)
+            removed_any = True
+
+        if not removed_any:
+            return
+
+        # re-garantir une ligne vide en bas + totaux
+        self._ensure_empty_folder_row()
+        self.update_folder_totals()
+        self.update_transporter_vs_dossiers_status()
+
+        # tag + sauvegarde
+        self._pending_tags_to_add.add("supprime")
+        self.save_current_data(show_message=False)
+
+
+    def mark_pdf_as_deleted(self, pdf_path: str, filename: str = ""):
+        if not pdf_path:
+            return
+
+        msg = QMessageBox(self)
+        msg.setWindowTitle("Supprimer")
+        msg.setText(
+            "Marquer ce fichier comme supprimé ?\n\n"
+            f"{filename or os.path.basename(pdf_path)}\n\n"
+            "→ Ajoute le tag 'supprime' au JSON et apparaîtra dans le filtre 'Erreurs'."
+        )
+        msg.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
+        if msg.exec() != QMessageBox.Yes:
+            return
+
+        # si c'est le PDF ouvert, on sauvegarde aussi l'état courant de l'UI
+        try:
+            if self.current_pdf_path == pdf_path:
+                self.save_current_data(show_message=False)
+        except Exception:
+            pass
+
+        json_path = self._get_saved_json_path(pdf_path)
+
+        # load existing JSON (si existe)
+        existing = {}
+        if os.path.exists(json_path):
+            try:
+                with open(json_path, "r", encoding="utf-8") as f:
+                    existing = json.load(f) or {}
+            except Exception:
+                existing = {}
+
+        # add tag
+        tags = existing.get("tags") or []
+        if isinstance(tags, str):
+            tags = [tags]
+        if not isinstance(tags, list):
+            tags = []
+
+        tags_set = {str(t).strip() for t in tags if str(t).strip()}
+        tags_set.add("supprime")
+        existing["tags"] = sorted(tags_set)
+
+        # optionnel: garder une trace
+        existing["deleted_at"] = datetime.now().isoformat(timespec="seconds")
+
+        os.makedirs(os.path.dirname(json_path), exist_ok=True)
+        with open(json_path, "w", encoding="utf-8") as f:
+            json.dump(existing, f, ensure_ascii=False, indent=2)
+
+        # refresh la ligne dans la table gauche + refiltre
+        for r in range(self.pdf_table.rowCount()):
+            it0 = self.pdf_table.item(r, 0)
+            if it0 and it0.data(Qt.UserRole) == pdf_path:
+                self.refresh_left_row_processing_state(r)
+                break
+
+        self.apply_left_filter_to_table()
+        self.statusBar().showMessage("Fichier marqué comme supprimé.", 2500)
+
+    def _refresh_transporter_after_bank_autofill(self):
+        # équivalent au clic sur IBAN/BIC : on repasse en recherche par banque
+        self.transporter_selected_mode = False
+        self.selected_kundennr = None
+
+        iban = self.iban_input.text().strip()
+        bic = self.bic_input.text().strip()
+        if not iban or not bic:
+            return  # on attend d'avoir les deux
+
+        self.check_bank_information()
+        self.load_transporter_information(force_by_kundennr=False)
+
+    def compact_folder_rows(self):
+        # évite les appels re-entrants
+        if getattr(self, "_compacting_folder_rows", False):
+            return
+        self._compacting_folder_rows = True
+        try:
+            kept = []
+            for r in range(self.folder_table.rowCount()):
+                dossier_le, amount_le, _ = self._get_row_widgets(r)
+                dossier = (dossier_le.text() if dossier_le else "").strip()
+                amount = (amount_le.text() if amount_le else "").strip()
+
+                # on garde les lignes non vides
+                if dossier or amount:
+                    kept.append((dossier, amount))
+
+            # rebuild table (sans trous)
+            self.folder_table.setRowCount(0)
+            for dossier, amount in kept:
+                self._add_folder_row(dossier=dossier, amount=amount)
+
+            # garde une ligne vide en bas
+            self._ensure_empty_folder_row()
+
+            # refresh totaux / statuts
+            self.update_folder_totals()
+            self.update_transporter_vs_dossiers_status()
+
+        finally:
+            self._compacting_folder_rows = False
+
+    def _find_pdf_path_by_filename(self, filename: str) -> str | None:
+        """Retrouve le chemin PDF (UserRole) à partir du nom affiché en colonne 0."""
+        filename = (filename or "").strip()
+        if not filename:
+            return None
+        for r in range(self.pdf_table.rowCount()):
+            it0 = self.pdf_table.item(r, 0)
+            if it0 and (it0.text() or "").strip() == filename:
+                return it0.data(Qt.UserRole)
+        return None
+
+
+    def _get_folder_choices_for_entry(self, entry_id: str) -> list[dict]:
+        """
+        Retourne la liste des dossiers (tour_nr + amount_ht_ocr) UNIQUEMENT depuis
+        le tableau de droite SI l'entry_id correspond au document sélectionné.
+        Sinon fallback: on cherche dans les JSON des documents du même entry_id.
+        """
+        entry_id = (entry_id or "").strip()
+        if not entry_id:
+            return []
+
+        # 1) Source prioritaire : le tableau de droite (UI) si on est sur le même entry_id
+        if self.selected_invoice_entry_id == entry_id:
+            folders = self.get_folder_rows() or []
+            folders = [f for f in folders if str(f.get("tour_nr") or "").strip()]
+            if folders:
+                return folders
+
+        # 2) Fallback : lire les JSON d'un doc du même entry_id (utile si clic-droit sans ouvrir)
+        try:
+            rows = self.logmail_repo.get_files_for_entry(entry_id) or []
+        except Exception:
+            rows = []
+
+        found: dict[str, dict] = {}
+        for r in rows:
+            name = str(r.get("nom_pdf") or "").strip()
+            if not name:
+                continue
+            pdf_path = self._find_pdf_path_by_filename(name)
+            if not pdf_path:
+                continue
+            data = self._read_saved_invoice_json(pdf_path) or {}
+            folders = data.get("folders") or []
+            if not isinstance(folders, list):
+                continue
+            for f in folders:
+                tournr = str(f.get("tour_nr") or "").strip()
+                if tournr and tournr not in found:
+                    found[tournr] = {"tour_nr": tournr, "amount_ht_ocr": str(f.get("amount_ht_ocr") or "").strip()}
+
+        return list(found.values())
+    
+
+    def attach_cmr_to_dossier_from_right_list(self, pdf_path: str, filename: str, entry_id: str | None = None):
+        if not pdf_path or not filename:
+            return
+
+        # ✅ priorité : entry_id déjà connu (fenêtre principale), sinon fallback SQL
+        entry_id = (entry_id or self.selected_invoice_entry_id or self.logmail_repo.get_entry_id_for_file(filename))
+        entry_id = (entry_id or "").strip()
+
+        if not entry_id:
+            QMessageBox.information(
+                self,
+                "Rattacher CMR",
+                "Impossible de déterminer l'entry_id de ce document."
+            )
+            return
+
+        folders = self._get_folder_choices_for_entry(entry_id)
+
+        if not folders:
+            QMessageBox.information(
+                self,
+                "Rattacher CMR",
+                "Aucun dossier disponible.\n\n"
+                "➡️ Renseigne d'abord les numéros de dossier dans le tableau de droite "
+                "(sur un document du même entry_id), puis sauvegarde."
+            )
+            return
+
+        dlg = FolderSelectDialog(folders, parent=self, title="Rattacher CMR à un dossier")
+        if dlg.exec() != QDialog.Accepted or not dlg.selected_tour_nr:
+            return
+
+        tour_nr = dlg.selected_tour_nr
+
+        # sauvegarde UI si c'est le doc courant
+        try:
+            if self.current_pdf_path == pdf_path:
+                self.save_current_data(show_message=False)
+        except Exception:
+            pass
+
+        json_path = self._get_saved_json_path(pdf_path)
+        existing = self._read_saved_invoice_json(pdf_path) or {}
+
+        tags = existing.get("tags") or []
+        if isinstance(tags, str):
+            tags = [tags]
+        if not isinstance(tags, list):
+            tags = []
+        tags_set = {str(t).strip() for t in tags if str(t).strip()}
+        tags_set.add("cmr")
+        existing["tags"] = sorted(tags_set)
+
+        existing["cmr_tour_nr"] = tour_nr
+        existing["cmr_attached_at"] = datetime.now().isoformat(timespec="seconds")
+
+        os.makedirs(os.path.dirname(json_path), exist_ok=True)
+        with open(json_path, "w", encoding="utf-8") as f:
+            json.dump(existing, f, ensure_ascii=False, indent=2)
+
+        # refresh visuel ligne gauche si elle existe
+        for r in range(self.pdf_table.rowCount()):
+            it0 = self.pdf_table.item(r, 0)
+            if it0 and it0.data(Qt.UserRole) == pdf_path:
+                it0.setToolTip(f"CMR rattachée au dossier {tour_nr}")
+                self.refresh_left_row_processing_state(r)
+                break
+
+        self.apply_left_filter_to_table()
+        self.statusBar().showMessage(f"CMR rattachée au dossier {tour_nr}.", 2500)
+
+        try:
+            # refresh icônes CMR sur les lignes dossiers
+            for r in range(self.folder_table.rowCount()):
+                self._update_folder_row_status(r)
+        except Exception:
+            pass     
+
+        try:
+            if getattr(self, "last_loaded_tour_nr", None):
+                self.load_tour_information(self.last_loaded_tour_nr)
+        except Exception:
+            pass
+
+
+    def _choose_representative_pdf(self, group_paths: list[str]) -> str:
+        """
+        Choisit le meilleur PDF pour représenter un entry_id.
+        Priorité :
+        1) JSON avec iban+bic + au moins un dossier (TourNr)
+        2) JSON avec iban+bic
+        3) premier fichier
+        """
+        if not group_paths:
+            return ""
+
+        best_iban_bic_and_folders = None
+        best_iban_bic = None
+
+        for p in group_paths:
+            data = self._read_saved_invoice_json(p) or {}
+            if not data:
+                continue
+
+            iban = str(data.get("iban") or "").strip()
+            bic = str(data.get("bic") or "").strip()
+            folders = self._extract_tournrs_from_saved(data) if hasattr(self, "_extract_tournrs_from_saved") else []
+
+            if iban and bic and folders:
+                best_iban_bic_and_folders = p
+                break
+            if iban and bic and best_iban_bic is None:
+                best_iban_bic = p
+
+        return best_iban_bic_and_folders or best_iban_bic or group_paths[0]
+    
+
+    def on_attach_cmr_main(self):
+        # Le document réellement affiché peut être view_pdf_path (navigation doc)
+        pdf_path = self.view_pdf_path or self.current_pdf_path
+        if not pdf_path or not os.path.exists(pdf_path):
+            QMessageBox.information(self, "Rattacher CMR", "Aucun document affiché.")
+            return
+
+        filename = os.path.basename(pdf_path)
+
+        # On passe entry_id si déjà connu (plus rapide)
+        entry_id = self.selected_invoice_entry_id
+        self.attach_cmr_to_dossier_from_right_list(pdf_path, filename, entry_id=entry_id)
+
+    def _collect_cmr_attachments_for_current_entry(self) -> list[dict]:
+        """
+        Construit la liste des CMR rattachées (depuis les JSON des docs du même entry_id).
+        Stocké dans le JSON de la facture sous 'cmr_attachments'.
+        """
+        out: list[dict] = []
+        seen = set()
+
+        paths = self.entry_pdf_paths or []
+        for p in paths:
+            # on exclut la facture elle-même (current_pdf_path) par sécurité
+            if self.current_pdf_path and os.path.abspath(p) == os.path.abspath(self.current_pdf_path):
+                continue
+
+            data = self._read_saved_invoice_json(p) or {}
+            tour_nr = str(data.get("cmr_tour_nr") or "").strip()
+
+            tags = data.get("tags") or []
+            if isinstance(tags, str):
+                tags = [tags]
+            tags_norm = {str(t).strip().lower() for t in tags if str(t).strip()}
+
+            # on considère "CMR" si tag cmr OU cmr_tour_nr rempli
+            if "cmr" not in tags_norm and not tour_nr:
+                continue
+
+            fn = os.path.basename(p)
+            key = (fn, tour_nr)
+            if key in seen:
+                continue
+            seen.add(key)
+
+            out.append({
+                "filename": fn,
+                "tour_nr": tour_nr,
+                "attached_at": str(data.get("cmr_attached_at") or "").strip()
+            })
+
+        return out
+    
+
+    def _get_current_invoice_tours(self) -> set[str]:
+        """TourNr présents dans le tableau de droite (dossiers)."""
+        tours = set()
+        for f in (self.get_folder_rows() or []):
+            t = str(f.get("tour_nr") or "").strip()
+            if t:
+                tours.add(t)
+        return tours
+
+
+    def _get_cmr_attached_tours_for_entry(self) -> set[str]:
+        """TourNr qui ont au moins une CMR rattachée (via JSON des docs du même entry_id)."""
+        tours = set()
+        for p in (self.entry_pdf_paths or []):
+            data = self._read_saved_invoice_json(p) or {}
+            t = str(data.get("cmr_tour_nr") or "").strip()
+            if t:
+                tours.add(t)
+        return tours
+
+    def _get_row_cmr_widget(self, row: int):
+        return self.folder_table.cellWidget(row, 3)
+    
+
+    def _check_all_dossiers_have_cmr(self) -> tuple[bool, list[str]]:
+        """
+        Retourne (ok, missing_tours).
+        ok = True si tous les TourNr présents dans le tableau de droite ont au moins une CMR rattachée.
+        """
+        invoice_tours = self._get_current_invoice_tours()  # set[str] depuis tableau de droite
+        if not invoice_tours:
+            # s'il n'y a aucun dossier, on ne bloque pas ici (tu as peut-être déjà d'autres règles)
+            return True, []
+
+        cmr_tours = self._get_cmr_attached_tours_for_entry()  # set[str] depuis JSON CMR
+        missing = sorted(invoice_tours - cmr_tours)
+        return (len(missing) == 0), missing
+
+
+    def _block_validate_if_missing_cmr(self) -> bool:
+        """
+        Retourne True si on peut continuer la validation.
+        Retourne False si bloqué + message.
+        """
+        ok, missing = self._check_all_dossiers_have_cmr()
+        if ok:
+            return True
+
+        QMessageBox.warning(
+            self,
+            "Validation impossible",
+            "Tous les dossiers doivent être rattachés à au moins une CMR avant validation.\n\n"
+            f"Dossiers sans CMR : {', '.join(missing)}"
+        )
+        return False

@@ -1,6 +1,7 @@
 # db/logmail_repository.py
 
 from db.repository import BaseRepository
+from typing import Dict, List
 
 
 class LogmailRepository(BaseRepository):
@@ -26,10 +27,40 @@ class LogmailRepository(BaseRepository):
         """
         return self.fetch_all(query, (entry_id,))
 
-def update_entry_for_file(self, nom_pdf: str, entry_id: str) -> None:
-    query = """
-        UPDATE XXA_LOGMAIL_PDF
-        SET entry_id = ?
-        WHERE nom_pdf = ?
-    """
-    self.execute(query, (entry_id, nom_pdf))
+    def update_entry_for_file(self, nom_pdf: str, entry_id: str) -> None:
+        query = """
+            UPDATE XXA_LOGMAIL_228794
+            SET entry_id = ?
+            WHERE nom_pdf = ?
+        """
+        self.execute(query, (entry_id, nom_pdf))
+
+    def get_entry_ids_for_files(self, filenames: List[str]) -> Dict[str, str]:
+        """
+        Retourne un mapping {nom_pdf -> entry_id} en batch (bien plus rapide que 1 requête / fichier).
+        """
+        if not filenames:
+            return {}
+
+        out: Dict[str, str] = {}
+        chunk_size = 200  # safe pour SQL Server
+
+        for i in range(0, len(filenames), chunk_size):
+            chunk = [f for f in filenames[i:i + chunk_size] if f]
+            if not chunk:
+                continue
+
+            placeholders = ",".join(["?"] * len(chunk))
+            query = f"""
+                SELECT nom_pdf, entry_id
+                FROM XXA_LOGMAIL_228794
+                WHERE nom_pdf IN ({placeholders})
+            """
+            rows = self.fetch_all(query, tuple(chunk)) or []
+            for r in rows:
+                n = str(r.get("nom_pdf") or "").strip()
+                e = str(r.get("entry_id") or "").strip()
+                if n and e:
+                    out[n] = e
+
+        return out

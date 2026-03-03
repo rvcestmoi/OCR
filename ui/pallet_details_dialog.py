@@ -37,7 +37,7 @@ class PalletDetailsDialog(QDialog):
 
         root = QVBoxLayout(self)
 
-        root.addWidget(QLabel("Palettes par dossier (TourNr) :"))
+        root.addWidget(QLabel("Palettes par dossier :"))
 
         self.tabs = QTabWidget()
         root.addWidget(self.tabs, 1)
