@@ -11,9 +11,10 @@ class LogmailRepository(BaseRepository):
 
     def get_entry_id_for_file(self, nom_pdf: str):
         query = """
-            SELECT entry_id
+            SELECT TOP 1 entry_id
             FROM XXA_LOGMAIL_228794
             WHERE nom_pdf = ?
+            ORDER BY date_creation DESC, id_log DESC
         """
         row = self.fetch_one(query, (nom_pdf,))
         return row["entry_id"] if row else None
@@ -35,15 +36,13 @@ class LogmailRepository(BaseRepository):
         """
         self.execute(query, (entry_id, nom_pdf))
 
+
     def get_entry_ids_for_files(self, filenames: List[str]) -> Dict[str, str]:
-        """
-        Retourne un mapping {nom_pdf -> entry_id} en batch (bien plus rapide que 1 requête / fichier).
-        """
         if not filenames:
             return {}
 
         out: Dict[str, str] = {}
-        chunk_size = 200  # safe pour SQL Server
+        chunk_size = 200
 
         for i in range(0, len(filenames), chunk_size):
             chunk = [f for f in filenames[i:i + chunk_size] if f]
@@ -52,9 +51,20 @@ class LogmailRepository(BaseRepository):
 
             placeholders = ",".join(["?"] * len(chunk))
             query = f"""
+                WITH x AS (
+                    SELECT
+                        nom_pdf,
+                        entry_id,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY nom_pdf
+                            ORDER BY date_creation DESC, id_log DESC
+                        ) AS rn
+                    FROM XXA_LOGMAIL_228794
+                    WHERE nom_pdf IN ({placeholders})
+                )
                 SELECT nom_pdf, entry_id
-                FROM XXA_LOGMAIL_228794
-                WHERE nom_pdf IN ({placeholders})
+                FROM x
+                WHERE rn = 1
             """
             rows = self.fetch_all(query, tuple(chunk)) or []
             for r in rows:

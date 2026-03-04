@@ -191,4 +191,38 @@ class TourRepository(BaseRepository):
         WHERE LTRIM(RTRIM(CAST(tour.TourNr AS VARCHAR(20)))) = ?
         """
         return self.fetch_one(query, (tour_nr, tour_nr))   
+
+
+    def get_palette_details_with_trajet_by_tournrs(self, tour_numbers: List[str]) -> List[Dict[str, Any]]:
+        """Retourne les lignes palettes/poids + trajet pour une liste de TourNr."""
+        tour_numbers = [str(t).strip() for t in (tour_numbers or []) if str(t).strip()]
+        if not tour_numbers:
+            return []
+
+        placeholders = ",".join(["?"] * len(tour_numbers))
+        query = f"""
+            SELECT
+                LTRIM(RTRIM(CAST(auf.TourNr AS VARCHAR(20)))) AS Dossier,
+                pos.VPE,
+                SUM(pos.VPEAnz) AS Palettes,
+                SUM(pos.TatsGew) AS Poids,
+                CONCAT(
+                    MAX(tour.BELLKZ), '-', MAX(tour.BelPLZ), ' ', MAX(tour.BelOrt),
+                    '-',
+                    MAX(tour.EmgLKZ), '-', MAX(tour.EmgPLZ), ' ', MAX(tour.EmgOrt)
+                ) AS Trajet
+            FROM XXAV_FR_MainAufIntNrByLegs leg
+            LEFT JOIN xxaslauf auf ON auf.AufIntNr = leg.leg_AufIntNr
+            LEFT JOIN xxaaufpos pos ON pos.aufintnr = leg.MAin_aufintnr
+            LEFT JOIN XXATour tour ON tour.TourNr = auf.TourNr
+            WHERE pos.VPE IS NOT NULL
+            AND LTRIM(RTRIM(CAST(auf.TourNr AS VARCHAR(20)))) IN ({placeholders})
+            GROUP BY
+                LTRIM(RTRIM(CAST(auf.TourNr AS VARCHAR(20)))),
+                pos.VPE
+            ORDER BY
+                LTRIM(RTRIM(CAST(auf.TourNr AS VARCHAR(20)))),
+                pos.VPE
+        """
+        return self.fetch_all(query, tuple(tour_numbers))
     

@@ -17,6 +17,7 @@ from PySide6.QtWidgets import (
     QTextEdit, QTableWidget, QTableWidgetItem, QProgressDialog,
     QApplication, QSplitter, QCompleter, QHeaderView
 )
+from webcolors import names
 ##from matplotlib import text
 
 
@@ -32,7 +33,7 @@ from ocr.supplier_model import (
     extract_fields_with_model,
 )
 from PySide6.QtWidgets import QMenu
-from ui.pallet_details_dialog import PalletDetailsDialog
+from ui.pallet_details_dialog import FolderSelectDialog
 from PySide6.QtWidgets import QDialog
 from ui.block_options_dialog import BlockOptionsDialog
 
@@ -156,7 +157,7 @@ class MainWindow(QMainWindow):
         self.btn_ocr_all.clicked.connect(self.ocr_all_pdfs)
 
         left_layout.addWidget(self.btn_ocr_all)
-        left_layout.addWidget(self.btn_scan_folder)
+        #left_layout.addWidget(self.btn_scan_folder)
 
         self.pdf_table = QTableWidget(left_widget)
         self.pdf_table.setObjectName("pdf_table")
@@ -225,7 +226,7 @@ class MainWindow(QMainWindow):
         self.btn_ocr_all.clicked.connect(self.ocr_all_pdfs)
 
         left_top_layout.addWidget(self.btn_ocr_all)
-        left_top_layout.addWidget(self.btn_scan_folder)
+        ##left_top_layout.addWidget(self.btn_scan_folder)
 
         self.pdf_table = QTableWidget()
         self.pdf_table.setColumnCount(1)
@@ -448,8 +449,6 @@ class MainWindow(QMainWindow):
         self.folders_layout = QVBoxLayout(folders_box)
         self.folders_layout.setContentsMargins(0, 0, 0, 0)
 
-        self.folders_layout.addWidget(self.folder_table)
-        self.folders_layout.addWidget(self.lbl_folder_totals)
 
         self.folders_layout.addWidget(QLabel("Frais :"))
         fees_bar = QHBoxLayout()
@@ -1250,6 +1249,8 @@ class MainWindow(QMainWindow):
 
         self._ensure_empty_vat_row()
         self.update_vat_total()
+
+        self.folder_table.setRowCount(0)
 
         folders = data.get("folders")
 
@@ -2707,7 +2708,6 @@ class MainWindow(QMainWindow):
             return
 
         # ✅ mapping nom_pdf -> entry_id (en batch)
-        entry_map = {}
         try:
             entry_map = self.logmail_repo.get_entry_ids_for_files(pdf_files) or {}
         except Exception:
@@ -2718,8 +2718,11 @@ class MainWindow(QMainWindow):
         for fn in pdf_files:
             entry_id = entry_map.get(fn)
             if not entry_id:
-                entry_id = f"__NO_ENTRY__::{fn}"  # fichiers sans entry_id => chacun son groupe
+                entry_id = f"__NO_ENTRY__::{fn}"
             groups.setdefault(entry_id, []).append(fn)
+
+        # (option debug OK ICI, car groups existe)
+        print("NB groupes:", len(groups), {k: len(v) for k, v in groups.items()})
 
         # ✅ construire les lignes (1 ligne par entry_id)
         rows_to_add = []
@@ -2744,14 +2747,19 @@ class MainWindow(QMainWindow):
 
             self.pdf_table.insertRow(row)
 
-            it0 = QTableWidgetItem(rep_filename)
+            extra = max(0, len(group_paths) - 1)
+            display_name = rep_filename if extra == 0 else f"{rep_filename} (+{extra})"
+
+            it0 = QTableWidgetItem(display_name)
+
+            names = "\n".join([os.path.basename(p) for p in group_paths])
+            it0.setToolTip(f"entry_id: {entry_id}\nDocuments: {len(group_paths)}\n\n{names}")
             it0.setData(Qt.UserRole, rep_path)           # chemin du PDF représentant
             it0.setData(Qt.UserRole + 1, status)         # status pour filtres
             it0.setData(Qt.UserRole + 4, entry_id)       # ✅ entry_id du groupe
             it0.setData(Qt.UserRole + 5, group_paths)    # ✅ liste complète des PDFs du groupe
 
-            # tooltip utile
-            it0.setToolTip(f"entry_id: {entry_id}\nDocuments: {len(group_paths)}")
+           
 
             self.pdf_table.setItem(row, 0, it0)
             self.pdf_table.setItem(row, 1, QTableWidgetItem(iban))
@@ -3453,23 +3461,30 @@ class MainWindow(QMainWindow):
     
 
     def attach_cmr_to_dossier_from_right_list(self, pdf_path: str, filename: str, entry_id: str | None = None):
-        if not pdf_path or not filename:
-            return
+        """
+        Rattache un PDF (souvent une CMR) à un dossier (TourNr) du même entry_id.
 
-        # ✅ priorité : entry_id déjà connu (fenêtre principale), sinon fallback SQL
+        - Les choix de dossiers viennent du tableau de droite (si l'entry_id est celui affiché),
+        sinon fallback : lecture des JSON des docs du même entry_id.
+        - La popup n'affiche plus les montants : elle affiche Dossier / Trajet / VPE / Palettes / Poids.
+        - On écrit dans le JSON du document : tag 'cmr', cmr_tour_nr, cmr_attached_at.
+        """
+
+        if not pdf_path:
+            return
+        if not filename:
+            filename = os.path.basename(pdf_path)
+
+        # ✅ priorité : entry_id déjà connu (fenêtre principale), sinon fallback BDD
         entry_id = (entry_id or self.selected_invoice_entry_id or self.logmail_repo.get_entry_id_for_file(filename))
         entry_id = (entry_id or "").strip()
 
         if not entry_id:
-            QMessageBox.information(
-                self,
-                "Rattacher CMR",
-                "Impossible de déterminer l'entry_id de ce document."
-            )
+            QMessageBox.information(self, "Rattacher CMR", "Impossible de déterminer l'entry_id de ce document.")
             return
 
+        # Liste des dossiers possibles
         folders = self._get_folder_choices_for_entry(entry_id)
-
         if not folders:
             QMessageBox.information(
                 self,
@@ -3480,22 +3495,47 @@ class MainWindow(QMainWindow):
             )
             return
 
-        dlg = FolderSelectDialog(folders, parent=self, title="Rattacher CMR à un dossier")
+        # TourNr uniques (dans l'ordre)
+        tour_numbers: list[str] = []
+        seen = set()
+        for f in folders:
+            t = str((f or {}).get("tour_nr") or "").strip()
+            if t and t not in seen:
+                seen.add(t)
+                tour_numbers.append(t)
+
+        if not tour_numbers:
+            QMessageBox.information(self, "Rattacher CMR", "Aucun numéro de dossier valide.")
+            return
+
+        # Détails SQL (VPE / palettes / poids / trajet)
+        details_rows = []
+        try:
+            # nécessite la méthode ajoutée dans TourRepository
+            details_rows = self.tour_repo.get_palette_details_with_trajet_by_tournrs(tour_numbers) or []
+        except Exception:
+            details_rows = []
+
+        dlg = FolderSelectDialog(tour_numbers, details_rows, parent=self, title="Rattacher CMR à un dossier")
         if dlg.exec() != QDialog.Accepted or not dlg.selected_tour_nr:
             return
 
-        tour_nr = dlg.selected_tour_nr
+        tour_nr = str(dlg.selected_tour_nr).strip()
+        if not tour_nr:
+            return
 
-        # sauvegarde UI si c'est le doc courant
+        # Si le document courant = celui qu'on rattache, on sauvegarde d'abord l'UI (optionnel mais safe)
         try:
             if self.current_pdf_path == pdf_path:
                 self.save_current_data(show_message=False)
         except Exception:
             pass
 
+        # --- Update JSON du document CMR ---
         json_path = self._get_saved_json_path(pdf_path)
         existing = self._read_saved_invoice_json(pdf_path) or {}
 
+        # tags -> ajouter "cmr"
         tags = existing.get("tags") or []
         if isinstance(tags, str):
             tags = [tags]
@@ -3505,6 +3545,8 @@ class MainWindow(QMainWindow):
         tags_set.add("cmr")
         existing["tags"] = sorted(tags_set)
 
+        # rattachement
+        existing["entry_id"] = entry_id
         existing["cmr_tour_nr"] = tour_nr
         existing["cmr_attached_at"] = datetime.now().isoformat(timespec="seconds")
 
@@ -3512,24 +3554,27 @@ class MainWindow(QMainWindow):
         with open(json_path, "w", encoding="utf-8") as f:
             json.dump(existing, f, ensure_ascii=False, indent=2)
 
-        # refresh visuel ligne gauche si elle existe
+        # --- Refresh UI gauche (ligne fichier) ---
         for r in range(self.pdf_table.rowCount()):
             it0 = self.pdf_table.item(r, 0)
             if it0 and it0.data(Qt.UserRole) == pdf_path:
                 it0.setToolTip(f"CMR rattachée au dossier {tour_nr}")
+                # (le statut couleur ne dépend pas du tag cmr, mais on refresh quand même)
                 self.refresh_left_row_processing_state(r)
                 break
 
         self.apply_left_filter_to_table()
         self.statusBar().showMessage(f"CMR rattachée au dossier {tour_nr}.", 2500)
 
+        # --- Refresh icônes CMR (table dossiers à droite) si on est sur le même entry affiché ---
         try:
-            # refresh icônes CMR sur les lignes dossiers
-            for r in range(self.folder_table.rowCount()):
-                self._update_folder_row_status(r)
+            if self.selected_invoice_entry_id and self.selected_invoice_entry_id.strip() == entry_id:
+                for r in range(self.folder_table.rowCount()):
+                    self._update_folder_row_status(r)
         except Exception:
-            pass     
+            pass
 
+        # Optionnel : refresh volet tour si tu en as un affiché
         try:
             if getattr(self, "last_loaded_tour_nr", None):
                 self.load_tour_information(self.last_loaded_tour_nr)
