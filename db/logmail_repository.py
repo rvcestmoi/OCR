@@ -74,3 +74,21 @@ class LogmailRepository(BaseRepository):
                     out[n] = e
 
         return out
+
+    def set_entry_id_for_file(self, nom_pdf: str, new_entry_id: str):
+        """
+        Regroupe un fichier dans un autre entry_id (ne touche pas message_id).
+        Si le fichier n'existe pas en base, on l'insère en MANUAL.
+        """
+        sql = """
+            UPDATE dbo.XXA_LOGMAIL_228794
+            SET entry_id = ?
+            WHERE nom_pdf = ?;
+
+            IF @@ROWCOUNT = 0
+            BEGIN
+                INSERT INTO dbo.XXA_LOGMAIL_228794 (date_creation, message_id, entry_id, nom_pdf, sujet, expediteur)
+                VALUES (SYSDATETIME(), CONCAT('MANUAL-', CONVERT(varchar(36), NEWID())), ?, ?, '', '')
+            END
+        """
+        self.execute(sql, (new_entry_id, nom_pdf, new_entry_id, nom_pdf))

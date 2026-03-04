@@ -8,31 +8,35 @@ from PySide6.QtCore import Qt
 from PySide6.QtGui import QFont
 from PySide6.QtWidgets import (
     QDialog, QLabel, QTreeWidget, QTreeWidgetItem,
-    QVBoxLayout, QDialogButtonBox, QHeaderView
+    QVBoxLayout, QDialogButtonBox, QHeaderView, QMessageBox
 )
 
+ROLE_TOUR = Qt.UserRole
+ROLE_AUF  = Qt.UserRole + 1
+
 class FolderSelectDialog(QDialog):
-    """Sélection d'un dossier (TourNr) avec détails palettes/poids/trajet."""
+    """Sélection d'une commande (AufNr) dans un dossier (TourNr) avec détails palettes/poids/trajet."""
 
     def __init__(
         self,
         tour_numbers: list[str],
         details_rows: list[dict[str, Any]] | None = None,
         parent=None,
-        title: str = "Rattacher CMR à un dossier",
+        title: str = "Rattacher CMR à une commande",
     ):
         super().__init__(parent)
         self.selected_tour_nr: str | None = None
+        self.selected_auf_nr: str | None = None
 
         self.setWindowTitle(title)
-        self.resize(980, 520)
+        self.resize(1050, 560)
 
         layout = QVBoxLayout(self)
-        layout.addWidget(QLabel("Sélectionne le dossier (TourNr). Détails palettes/poids/trajet :"))
+        layout.addWidget(QLabel("Sélectionne une COMMANDE (AufNr) à rattacher. 1 CMR = 1 commande."))
 
         self.tree = QTreeWidget()
-        self.tree.setColumnCount(5)
-        self.tree.setHeaderLabels(["Dossier", "Trajet", "VPE", "Palettes", "Poids"])
+        self.tree.setColumnCount(6)
+        self.tree.setHeaderLabels(["Dossier", "Commande", "Trajet", "VPE", "Palettes", "Poids"])
         self.tree.setSelectionMode(QTreeWidget.SingleSelection)
         self.tree.setSelectionBehavior(QTreeWidget.SelectRows)
         self.tree.setUniformRowHeights(True)
@@ -41,74 +45,93 @@ class FolderSelectDialog(QDialog):
 
         header = self.tree.header()
         header.setSectionResizeMode(0, QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(1, QHeaderView.Stretch)
-        header.setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(2, QHeaderView.Stretch)
         header.setSectionResizeMode(3, QHeaderView.ResizeToContents)
         header.setSectionResizeMode(4, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(5, QHeaderView.ResizeToContents)
 
         layout.addWidget(self.tree)
 
         details_rows = details_rows or []
-        by_dossier = defaultdict(list)
-        trajet_by_dossier: dict[str, str] = {}
+        tour_numbers = [str(t).strip() for t in (tour_numbers or []) if str(t).strip()]
+
+        by_tour_auf = defaultdict(list)          # (tour, auf) -> rows
+        trajet_by_tour = {}                      # tour -> trajet
 
         for r in details_rows:
-            dossier = str(r.get("Dossier") or r.get("dossier") or "").strip()
-            if not dossier:
+            tour = str(r.get("Dossier") or "").strip()
+            auf  = str(r.get("AufNr") or "").strip()
+            if not tour:
                 continue
-            by_dossier[dossier].append(r)
-            trajet = str(r.get("Trajet") or r.get("trajet") or "").strip()
-            if trajet and dossier not in trajet_by_dossier:
-                trajet_by_dossier[dossier] = trajet
-
-        tour_numbers = [str(t).strip() for t in (tour_numbers or []) if str(t).strip()]
+            if tour not in trajet_by_tour:
+                tr = str(r.get("Trajet") or "").strip()
+                if tr:
+                    trajet_by_tour[tour] = tr
+            if auf:
+                by_tour_auf[(tour, auf)].append(r)
 
         bold = QFont()
         bold.setBold(True)
 
         first_item = None
 
-        for tour_nr in tour_numbers:
-            rows = by_dossier.get(tour_nr, [])
-            trajet = trajet_by_dossier.get(tour_nr, "")
+        for tour in tour_numbers:
+            trajet = trajet_by_tour.get(tour, "")
 
-            total_pal = 0.0
-            total_poids = 0.0
-            for rr in rows:
-                try:
-                    total_pal += float(rr.get("Palettes") or rr.get("palettes") or 0)
-                except Exception:
-                    pass
-                try:
-                    total_poids += float(rr.get("Poids") or rr.get("poids") or 0)
-                except Exception:
-                    pass
+            # noeud Dossier
+            tour_item = QTreeWidgetItem([tour, "", trajet, "TOTAL", "", ""])
+            tour_item.setData(0, ROLE_TOUR, tour)
+            tour_item.setData(0, ROLE_AUF, "")
+            for c in range(6):
+                tour_item.setFont(c, bold)
 
-            parent_item = QTreeWidgetItem(
-                [tour_nr, trajet, "TOTAL", self._fmt_num(total_pal), self._fmt_num(total_poids)]
-            )
-            parent_item.setData(0, Qt.UserRole, tour_nr)
-            for c in range(5):
-                parent_item.setFont(c, bold)
-
-            self.tree.addTopLevelItem(parent_item)
+            self.tree.addTopLevelItem(tour_item)
             if first_item is None:
-                first_item = parent_item
+                first_item = tour_item
 
-            if rows:
+            # commandes dans ce dossier
+            aufnrs = sorted({auf for (t, auf) in by_tour_auf.keys() if t == tour})
+            if not aufnrs:
+                child = QTreeWidgetItem(["", "(aucune commande trouvée)", "", "", "", ""])
+                child.setData(0, ROLE_TOUR, tour)
+                child.setData(0, ROLE_AUF, "")
+                tour_item.addChild(child)
+                tour_item.setExpanded(True)
+                continue
+
+            for auf in aufnrs:
+                rows = by_tour_auf.get((tour, auf), [])
+
+                total_pal = 0.0
+                total_poids = 0.0
                 for rr in rows:
-                    vpe = str(rr.get("VPE") or rr.get("vpe") or "").strip()
-                    pal = self._fmt_num(rr.get("Palettes") or rr.get("palettes") or "")
-                    poids = self._fmt_num(rr.get("Poids") or rr.get("poids") or "")
-                    child = QTreeWidgetItem(["", "", vpe, pal, poids])
-                    child.setData(0, Qt.UserRole, tour_nr)  # important: sélection enfant => même dossier
-                    parent_item.addChild(child)
-            else:
-                child = QTreeWidgetItem(["", "", "(aucun détail)", "", ""])
-                child.setData(0, Qt.UserRole, tour_nr)
-                parent_item.addChild(child)
+                    try: total_pal += float(rr.get("Palettes") or 0)
+                    except Exception: pass
+                    try: total_poids += float(rr.get("Poids") or 0)
+                    except Exception: pass
 
-            parent_item.setExpanded(True)
+                auf_item = QTreeWidgetItem(["", auf, "", "TOTAL", self._fmt_num(total_pal), self._fmt_num(total_poids)])
+                auf_item.setData(0, ROLE_TOUR, tour)
+                auf_item.setData(0, ROLE_AUF, auf)
+                for c in range(6):
+                    auf_item.setFont(c, bold)
+
+                tour_item.addChild(auf_item)
+
+                # VPE lignes
+                for rr in rows:
+                    vpe = str(rr.get("VPE") or "").strip()
+                    pal = self._fmt_num(rr.get("Palettes") or "")
+                    poids = self._fmt_num(rr.get("Poids") or "")
+                    vpe_item = QTreeWidgetItem(["", "", "", vpe, pal, poids])
+                    vpe_item.setData(0, ROLE_TOUR, tour)
+                    vpe_item.setData(0, ROLE_AUF, auf)
+                    auf_item.addChild(vpe_item)
+
+                auf_item.setExpanded(True)
+
+            tour_item.setExpanded(True)
 
         if first_item is not None:
             self.tree.setCurrentItem(first_item)
@@ -139,10 +162,18 @@ class FolderSelectDialog(QDialog):
         it = self.tree.currentItem()
         if not it:
             return
-        tour_nr = str(it.data(0, Qt.UserRole) or "").strip()
-        if not tour_nr:
-            tour_nr = (it.text(0) or "").strip()
-        if not tour_nr:
+
+        tour = str(it.data(0, ROLE_TOUR) or "").strip()
+        auf  = str(it.data(0, ROLE_AUF) or "").strip()
+
+        if not tour:
             return
-        self.selected_tour_nr = tour_nr
+
+        # ✅ on exige une commande
+        if not auf:
+            QMessageBox.information(self, "Rattacher CMR", "Sélectionne une COMMANDE (AufNr), pas uniquement le dossier.")
+            return
+
+        self.selected_tour_nr = tour
+        self.selected_auf_nr = auf
         self.accept()

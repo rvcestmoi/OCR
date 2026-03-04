@@ -54,7 +54,9 @@ DOSSIER_CANDIDATE = re.compile(
     r"(?<!\d)(?:1|150|845|255|355|445|645|675|695|725|785)"
     r"[0-9 \u00A0\-\n]{4,25}\d(?!\d)"
 )
-
+BASE_LABEL_RE = re.compile(r"(BASE\s*HT|TOTAL\s*HT|TOTAL\s*HT\s*NET)", re.IGNORECASE)
+VAT_LABEL_RE  = re.compile(r"(MONTANT\s*TVA|TOTAL\s*TVA)", re.IGNORECASE)
+RATE_LABEL_RE = re.compile(r"(\bTAUX\b|%?\s*TVA\b)", re.IGNORECASE)
 
 def _clean_dossier_candidate(s: str) -> str:
     return re.sub(r"[ \u00A0-]", "", s or "").strip()
@@ -217,23 +219,73 @@ def extract_date(text: str) -> str:
 
 
 def extract_invoice_number(text: str) -> str:
-    match = re.search(
-        r"(Invoice|Inv\.?|Facture)[^\w]{0,10}([A-Z0-9\-_/\.]{3,})",
-        text,
+    if not text:
+        return ""
+
+    BAD = {
+        "DESCRIPTION", "DATE", "FACTURE", "INVOICE", "TOTAL", "MONTANT", "BASE",
+        "CLIENT", "REFERENCE", "RÉFÉRENCE", "QTE", "QTÉ", "PU", "HT", "TVA", "TTC"
+    }
+
+    label_rx = re.compile(
+        r"\b(N[°O]\s*FACTURE|FACTURE\s*(N[°O]|NO\.?)|INVOICE\s*(NO\.?|NUMBER)|INV\.?\s*NO\.?)\b",
         re.IGNORECASE
     )
-    return match.group(2) if match else ""
+    token_rx = re.compile(r"\b[A-Z0-9][A-Z0-9\-_/\.]{2,}\b", re.IGNORECASE)
 
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+
+    def ok(tok: str) -> bool:
+        t = (tok or "").strip()
+        if not t:
+            return False
+        if not any(ch.isdigit() for ch in t):
+            return False
+        if t.upper() in BAD:
+            return False
+        # évite des “codes client” trop courts/bizarres
+        if len(t) < 4 or len(t) > 40:
+            return False
+        return True
+
+    # 1) priorité : chercher autour de "N° Facture" / "Invoice number"
+    for i, ln in enumerate(lines):
+        m = label_rx.search(ln)
+        if not m:
+            continue
+
+        # a) valeur sur la même ligne (après le label)
+        after = ln[m.end():]
+        for tok in token_rx.findall(after):
+            if ok(tok):
+                return tok
+
+        # b) valeur sur les lignes suivantes
+        for j in range(i + 1, min(i + 6, len(lines))):
+            for tok in token_rx.findall(lines[j]):
+                if ok(tok):
+                    return tok
+
+    # 2) fallback : ancien comportement, mais avec garde-fous
+    m = re.search(r"(?:N[°O]\s*)?(?:INVOICE|INV\.?|FACTURE)\b[^\w]{0,20}([A-Z0-9\-_/\.]{3,})",
+                  text, re.IGNORECASE)
+    if m:
+        cand = m.group(1).strip()
+        if ok(cand):
+            return cand
+
+    return ""
 
 # =========================
 # TVA
 # =========================
 
 VAT_RATE_RE = re.compile(r"(?P<rate>\d{1,2}(?:[.,]\d{1,2})?)\s*%")
-MONEY_RE = re.compile(r"\b\d{1,3}(?:[ \u00A0]\d{3})*(?:[.,]\d{2})\b")
+
+MONEY_RE = re.compile(r"\b\d+(?:[ \u00A0]\d{3})*(?:[.,]\d{2})\b")
 
 ONLY_AMOUNT_RE = re.compile(
-    r"^\s*\d{1,3}(?:[ \u00A0]\d{3})*(?:[.,]\d{2})\s*(?:€|EUR)?\s*$",
+    r"^\s*\d+(?:[ \u00A0]\d{3})*(?:[.,]\d{2})\s*(?:€|EUR)?\s*$",
     re.IGNORECASE
 )
 
@@ -293,6 +345,7 @@ def parse_vat_lines(text: str):
 
     # --- 2) format "table TVA" (comme ton exemple) ---
     lines = [ln.strip() for ln in (text or "").splitlines() if ln.strip()]
+    label_table = _extract_vat_by_labels(lines)
 
     centers = [i for i, ln in enumerate(lines) if VAT_BLOCK_HINT_RE.search(ln)]
     # si rien trouvé, on tente quand même autour de "Total TVA"
@@ -317,6 +370,18 @@ def parse_vat_lines(text: str):
         if score > best_score:
             best_score = score
             best_table = res
+
+    # ✅ priorité au résultat label-based (quand dispo)
+    chosen = label_table if label_table else best_table
+
+    if chosen:
+        rate = chosen["rate"]
+        base = chosen["base"]
+        vat = chosen["vat"]
+
+        key = (rate.replace(",", "."), base, vat)
+        if key not in seen:
+            lines_out.append({"rate": rate, "base": base, "vat": vat})
 
     if best_table:
         rate = best_table["rate"]
@@ -483,3 +548,98 @@ def _infer_vat_line_from_block(lines: list[str], center: int, window: int = 25):
 
     _, rstr, bstr, vstr = best
     return {"rate": rstr, "base": bstr, "vat": vstr}
+
+
+
+def _money_in_line_or_next(lines: list[str], idx: int) -> str:
+    """Retourne le 1er montant trouvé sur la ligne idx, sinon sur idx+1 si c'est une ligne 'montant seul'."""
+    if idx is None or idx < 0 or idx >= len(lines):
+        return ""
+    ln = lines[idx].strip()
+
+    m = MONEY_RE.search(ln)
+    if m:
+        return _norm_amount_str(m.group(0))
+
+    if idx + 1 < len(lines):
+        ln2 = (lines[idx + 1] or "").strip()
+        if ONLY_AMOUNT_RE.match(ln2):
+            m2 = MONEY_RE.search(ln2)
+            if m2:
+                return _norm_amount_str(m2.group(0))
+
+    return ""
+
+def _rate_in_line_or_next(lines: list[str], idx: int) -> str:
+    """Trouve un taux (<=30) sur la ligne idx ou idx+1."""
+    if idx is None or idx < 0 or idx >= len(lines):
+        return ""
+    ln = lines[idx].strip()
+
+    # 1) taux explicite avec %
+    m = VAT_RATE_RE.search(ln)
+    if m:
+        return m.group("rate").replace(",", ".")
+
+    # 2) sinon un nombre <= 30 sur la ligne (ou la suivante)
+    def pick_rate_from_text(t: str) -> str:
+        cands = []
+        for s in MONEY_RE.findall(t):
+            v = _to_float(s)
+            if v is not None and 0.0 < v <= 30.0:
+                cands.append((v, _norm_amount_str(s)))
+        if not cands:
+            return ""
+        # prend le plus grand (évite 5.5 vs 20)
+        cands.sort(key=lambda x: x[0], reverse=True)
+        return cands[0][1].replace(",", ".")
+
+    r = pick_rate_from_text(ln)
+    if r:
+        return r
+
+    if idx + 1 < len(lines):
+        ln2 = (lines[idx + 1] or "").strip()
+        if ONLY_AMOUNT_RE.match(ln2):
+            r2 = pick_rate_from_text(ln2)
+            if r2:
+                return r2
+
+    return ""
+
+def _extract_vat_by_labels(lines: list[str]) -> dict | None:
+    """
+    Extrait TVA via structure:
+      Base HT -> montant
+      % TVA / Taux -> taux
+      Montant TVA / Total TVA -> montant TVA
+    """
+    idx_base = next((i for i, ln in enumerate(lines) if BASE_LABEL_RE.search(ln)), None)
+    idx_vat  = next((i for i, ln in enumerate(lines) if VAT_LABEL_RE.search(ln)), None)
+    idx_rate = next((i for i, ln in enumerate(lines) if RATE_LABEL_RE.search(ln) and "TOTAL TVA" not in ln.upper()), None)
+
+    base = _money_in_line_or_next(lines, idx_base) if idx_base is not None else ""
+    vat  = _money_in_line_or_next(lines, idx_vat)  if idx_vat  is not None else ""
+    rate = _rate_in_line_or_next(lines, idx_rate)  if idx_rate is not None else ""
+
+    bv = _to_float(base) if base else None
+    vv = _to_float(vat)  if vat  else None
+    rv = _to_float(rate) if rate else None
+
+    # si on a base + vat mais pas de rate => calcule
+    if (bv is not None and bv > 0) and (vv is not None and vv > 0):
+        if rv is None or rv <= 0 or rv > 30:
+            rv = (vv / bv) * 100.0
+            rate = f"{rv:.2f}"
+
+    # petite validation de cohérence
+    if bv is not None and vv is not None and rv is not None:
+        expected = (bv * rv) / 100.0
+        if abs(vv - expected) > max(0.06, expected * 0.03):
+            # incohérent => on ne force pas
+            return None
+
+    if rate and base and vat:
+        return {"rate": rate.replace(",", "."), "base": base, "vat": vat}
+
+    return None

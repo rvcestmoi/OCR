@@ -5,7 +5,21 @@ import os
 import re
 import json
 import fitz  # PyMuPDF
+import os, re, json
+import fitz
+from datetime import datetime
+from urllib.request import Request, urlopen
+from urllib.parse import urlparse
+from urllib.error import URLError, HTTPError
+from PySide6.QtWidgets import QMessageBox, QProgressDialog
+from PySide6.QtCore import Qt
+from urllib.request import Request, urlopen
+from urllib.parse import urlparse
+from urllib.error import URLError, HTTPError
+from PySide6.QtWidgets import QInputDialog
 
+_URL_RE = re.compile(r"(https?://[^\s<>\"]+)", re.IGNORECASE)
+_URL_RE = re.compile(r"(https?://[^\s<>\"]+)", re.IGNORECASE)
 
 
 from PySide6.QtCore import Qt, QStringListModel, QTimer
@@ -19,7 +33,7 @@ from PySide6.QtWidgets import (
 )
 from webcolors import names
 ##from matplotlib import text
-
+from PySide6.QtCore import QObject, QThread, Signal, Slot
 
 from ui.pdf_viewer import PdfViewer
 from ocr.ocr_engine import extract_text_from_pdf
@@ -33,12 +47,12 @@ from ocr.supplier_model import (
     extract_fields_with_model,
 )
 from PySide6.QtWidgets import QMenu
-from ui.pallet_details_dialog import FolderSelectDialog
 from PySide6.QtWidgets import QDialog
 from ui.block_options_dialog import BlockOptionsDialog
 
 from datetime import datetime
 from ocr.supplier_model import extract_best_bank_ids
+from collections import defaultdict
 
 try:
     from shiboken6 import isValid
@@ -58,16 +72,17 @@ from ui.geb_search_dialog import GebSearchDialog
 from ui.folder_select_dialog import FolderSelectDialog
 
 
-AMOUNT_CANDIDATE_RE = re.compile(r"\b\d{1,3}(?:[ \u00A0]\d{3})*(?:[.,]\d{2,3})\b")
-DOSSIER_8DIG_RE = re.compile(r"\b\d{8}\b")
+
+AMOUNT_CANDIDATE_RE = re.compile(r"\b\d+(?:[ \u00A0]\d{3})*(?:[.,]\d{2,3})\b")
 ONLY_AMOUNT_2DEC_RE = re.compile(
-    r"^\s*\d{1,3}(?:[ \u00A0]\d{3})*(?:[.,]\d{2})\s*(?:€|EUR)?\s*$",
+    r"^\s*\d+(?:[ \u00A0]\d{3})*(?:[.,]\d{2})\s*(?:€|EUR)?\s*$",
     re.IGNORECASE
 )
 HAS_LETTERS_RE = re.compile(r"[A-Za-z]")
 
 
 class MainWindow(QMainWindow):
+
 
     DOSSIER_PATTERN = re.compile(
         r"(?<!\d)(?:"
@@ -90,7 +105,7 @@ class MainWindow(QMainWindow):
         from ui.ocr_text_view import OcrTextView
         from db.tour_repository import TourRepository
         from db.geb_repository import GebRepository
-
+   
         
 
         self.db_conn = SqlServerConnection(**DB_CONFIG)
@@ -279,6 +294,10 @@ class MainWindow(QMainWindow):
         self.btn_attach_cmr.setToolTip("Rattacher le document affiché à un dossier (liste de droite)")
         self.btn_attach_cmr.clicked.connect(self.on_attach_cmr_main)
 
+        self.btn_fetch_links = QPushButton("🔗 Télécharger liens…")
+        self.btn_fetch_links.setToolTip("Télécharger les documents pointés par des liens dans le PDF actuellement affiché")
+        self.btn_fetch_links.clicked.connect(self.on_fetch_links_main)
+
 
         self.btn_prev_doc.setToolTip("Document précédent")
         self.btn_next_doc.setToolTip("Document suivant")
@@ -301,6 +320,8 @@ class MainWindow(QMainWindow):
 
         pdf_nav.addSpacing(8)
         pdf_nav.addWidget(self.btn_attach_cmr)
+
+        pdf_nav.addWidget(self.btn_fetch_links)
 
 
         pdf_nav.addSpacing(16)
@@ -486,7 +507,7 @@ class MainWindow(QMainWindow):
         self.btn_analyze_pdf.clicked.connect(self.analyze_pdf)
 
         self.btn_save_data = QPushButton("💾 Sauvegarder")
-        self.btn_save_data.clicked.connect(self.save_current_data)
+        self.btn_save_data.clicked.connect(self.on_save_clicked)
 
         self.shortcut_save = QShortcut(QKeySequence("Ctrl+S"), self)
         self.shortcut_save.setContext(Qt.ApplicationShortcut)
@@ -799,8 +820,8 @@ class MainWindow(QMainWindow):
                 self.statusBar().showMessage("Données sauvegardées trouvées mais chargement impossible (pas d'OCR auto).", 5000)
             return
 
-        # 2) Sinon -> OCR direct (sans popup)
-        self.analyze_pdf(show_message=False)
+        # 2) Sinon -> OCR direct (sans popup) ***** A decocher pour océrisation
+        ##self.analyze_pdf(show_message=False)
 
     # =========================
     # OCR
@@ -1452,7 +1473,9 @@ class MainWindow(QMainWindow):
         if not self.bic_input.text().strip():
             self.bic_input.setText(found.get("bic") or model.get("bic", ""))
 
-        if not self.invoice_number_input.text().strip():
+        cur = (self.invoice_number_input.text() or "").strip()
+        is_ok = cur and any(c.isdigit() for c in cur) and cur.upper() not in {"DESCRIPTION", "DATE", "FACTURE", "INVOICE"}
+        if not is_ok:
             self.invoice_number_input.setText(
                 found.get("invoice_number") or model.get("invoice_number_example", "")
             )
@@ -1836,29 +1859,47 @@ class MainWindow(QMainWindow):
         return f"{v:.2f}"
 
     def _best_ht_amount_for_tour(self, lines: list[str], tour_nr: str) -> float | None:
-        # 1) Trouver la 1ère ligne contenant le dossier
-        idx = next((i for i, ln in enumerate(lines) if tour_nr in ln), None)
+        dossier_re = re.compile(r"\b\d{8}\b")
+        def contains_tour(ln: str) -> bool:
+            if tour_nr in ln:
+                return True
+            # fallback si OCR a mis des espaces / tirets dans le numéro
+            compact = re.sub(r"[ \u00A0-]", "", ln)
+            return tour_nr in compact
+
+        idx = next((i for i, ln in enumerate(lines) if contains_tour(ln)), None)
         if idx is None:
             return None
 
-        # 2) Délimiter le bloc : du dossier jusqu’au prochain dossier (8 chiffres) différent
-        start = idx
-        end = min(len(lines), idx + 30)  # sécurité
+        # ✅ fenêtre centrée sur la ligne du dossier (les montants sont souvent juste AVANT)
+        start = max(0, idx - 12)
+        end = min(len(lines), idx + 25)
+
+        # stop si autre dossier apparaît (avant)
+        for j in range(idx - 1, start - 1, -1):
+            ln = lines[j]
+            for d in dossier_re.findall(ln):
+                if d != tour_nr:
+                    start = j + 1
+                    break
+            else:
+                continue
+            break
+
+        # stop si autre dossier apparaît (après)
         for j in range(idx + 1, end):
             ln = lines[j]
-            # si on voit un autre dossier 8 chiffres, on stoppe le bloc
-            for d in DOSSIER_8DIG_RE.findall(ln):
+            for d in dossier_re.findall(ln):
                 if d != tour_nr:
                     end = j
                     break
-            if end == j:
-                break
+            else:
+                continue
+            break
 
-        # 3) Collecter les candidats dans le bloc
         best = None  # (score, position, value)
-        found_strict_2dec = False
+        found_2dec = False
 
-        # helper : précédente ligne "utile"
         def prev_nonempty(k: int) -> str:
             for x in range(k - 1, start - 1, -1):
                 t = lines[x].strip()
@@ -1873,16 +1914,14 @@ class MainWindow(QMainWindow):
 
             up = raw.upper()
 
-            # ignorer lignes avec unités / CO2 / etc.
+            # ignorer unités parasites
             if "CO2" in up or "CO2E" in up or "KG" in up:
                 continue
 
-            # très important : si la ligne contient des lettres (hors € / EUR), on ignore
-            # (ça évite "0,080 t", "De :", "A :", etc.)
+            # si lettres (hors € / EUR), ignorer
             if HAS_LETTERS_RE.search(raw) and ("€" not in raw and "EUR" not in up):
                 continue
 
-            # bonus énorme si ligne = "montant seul" avec 2 décimales
             strict_line = bool(ONLY_AMOUNT_2DEC_RE.match(raw))
 
             for s_amt in AMOUNT_CANDIDATE_RE.findall(raw):
@@ -1890,22 +1929,20 @@ class MainWindow(QMainWindow):
                 if v is None or v <= 0:
                     continue
 
-                # filtre valeurs trop petites
+                # on évite les taux/quantités
                 if v < 50:
                     continue
 
-                # longueur décimales
                 mdec = re.search(r"[.,](\d+)$", s_amt)
                 dlen = len(mdec.group(1)) if mdec else 0
-
-                # on privilégie 2 décimales ; 1 décimale est très suspect (ex: 244,8)
                 if dlen == 2:
-                    found_strict_2dec = True
+                    found_2dec = True
 
                 score = 0
 
-                # proximité du début de bloc (souvent le total est pas très loin)
-                score += max(0, 15 - (j - start) * 1)
+                # ✅ priorité à la proximité de la ligne dossier
+                dist = abs(j - idx)
+                score += max(0, 25 - dist * 2)
 
                 # décimales
                 if dlen == 2:
@@ -1913,38 +1950,32 @@ class MainWindow(QMainWindow):
                 elif dlen == 3:
                     score += 10
                 else:
-                    score -= 40  # très suspect
+                    score -= 40
 
-                # bonus si la ligne ne contient QUE le montant
+                # bonus si montant seul
                 if strict_line:
                     score += 80
-
-                    # bonus si la ligne précédente ressemble à une quantité (ex: "1", "5")
+                    # bonus si la ligne précédente ressemble à une quantité (rare, mais utile)
                     prev = prev_nonempty(j)
                     if re.fullmatch(r"\d{1,3}", prev.strip()):
                         score += 25
 
-                # malus si la ligne contient "t" ou "kg" (même si on a filtré les lettres, prudence)
-                if re.search(r"\bT\b", up) or "KG" in up:
-                    score -= 50
-
-                # garde le meilleur (à score égal on prend celui le plus proche de la fin du bloc)
-                candidate = (score, j, round(v, 2))
-                if best is None or candidate[0] > best[0] or (candidate[0] == best[0] and candidate[1] > best[1]):
-                    best = candidate
+                cand = (score, j, round(v, 2))
+                if best is None or cand[0] > best[0] or (cand[0] == best[0] and cand[1] > best[1]):
+                    best = cand
 
         if not best:
             return None
 
-        # 4) Si on a trouvé au moins un vrai 2 décimales dans le bloc, on refuse les candidats non-2 décimales
-        if found_strict_2dec:
-            # rescanner pour garder seulement dlen==2 + max score
+        # si on a trouvé des montants en 2 décimales, on refuse les autres
+        if found_2dec:
             best2 = None
             for j in range(start, end):
                 raw = lines[j].strip()
                 if not raw:
                     continue
-                if HAS_LETTERS_RE.search(raw) and ("€" not in raw and "EUR" not in raw.upper()):
+                up = raw.upper()
+                if HAS_LETTERS_RE.search(raw) and ("€" not in raw and "EUR" not in up):
                     continue
                 strict_line = bool(ONLY_AMOUNT_2DEC_RE.match(raw))
                 for s_amt in AMOUNT_CANDIDATE_RE.findall(raw):
@@ -1955,14 +1986,11 @@ class MainWindow(QMainWindow):
                     dlen = len(mdec.group(1)) if mdec else 0
                     if dlen != 2:
                         continue
-                    score = 0
-                    score += max(0, 15 - (j - start) * 1)
-                    score += 30
+
+                    dist = abs(j - idx)
+                    score = max(0, 25 - dist * 2) + 30
                     if strict_line:
                         score += 80
-                        prev = prev_nonempty(j)
-                        if re.fullmatch(r"\d{1,3}", prev.strip()):
-                            score += 25
                     cand = (score, j, round(v, 2))
                     if best2 is None or cand[0] > best2[0] or (cand[0] == best2[0] and cand[1] > best2[1]):
                         best2 = cand
@@ -1970,6 +1998,7 @@ class MainWindow(QMainWindow):
                 return best2[2]
 
         return best[2]
+
 
     def autofill_folder_amounts_from_ocr(self, ocr_text: str):
         txt = ocr_text or ""
@@ -2140,13 +2169,29 @@ class MainWindow(QMainWindow):
                 cmr_lbl.setText("")
                 cmr_lbl.setToolTip("")
             else:
-                cmr_tours = self._get_cmr_attached_tours_for_entry()  # set de TourNr
-                if tour_nr in cmr_tours:
+                ok, missing_by_tour = self._check_all_orders_have_cmr()
+                required = self._get_required_orders_by_tour({tour_nr})
+                attached = self._get_cmr_attached_orders_for_entry()
+
+                req = required.get(tour_nr, set())
+                att = attached.get(tour_nr, set())
+
+                if not tour_nr:
+                    cmr_lbl.setText("")
+                    cmr_lbl.setToolTip("")
+                elif not req:
+                    cmr_lbl.setText("🧾❓")
+                    cmr_lbl.setToolTip("Aucune commande (AufNr) trouvée en BDD pour ce dossier.")
+                elif req.issubset(att):
                     cmr_lbl.setText("🧾✅")
-                    cmr_lbl.setToolTip(f"CMR rattachée au dossier {tour_nr}")
+                    cmr_lbl.setToolTip(f"Toutes les commandes ont une CMR ({len(req)}/{len(req)}).")
+                elif len(att) > 0:
+                    miss = sorted(req - att)
+                    cmr_lbl.setText("🧾⚠️")
+                    cmr_lbl.setToolTip(f"CMR partielle: {len(att)}/{len(req)}. Manque: {', '.join(miss[:10])}" + ("..." if len(miss) > 10 else ""))
                 else:
                     cmr_lbl.setText("🧾❌")
-                    cmr_lbl.setToolTip(f"Aucune CMR rattachée au dossier {tour_nr}")
+                    cmr_lbl.setToolTip(f"Aucune CMR sur les commandes. Attendu: {len(req)} commande(s).")
 
 
 
@@ -2286,14 +2331,34 @@ class MainWindow(QMainWindow):
         vat_total = 0.0
         has_any = False
 
-        for r in range(self.vat_table.rowCount()):
-            _, base_le, vat_le = self._get_vat_row_widgets(r)
+        # ✅ dédoublonnage des lignes (rate, base, vat) pour éviter double comptage
+        seen = set()  # (rate, base, vat) arrondis
 
+        for r in range(self.vat_table.rowCount()):
+            rate_le, base_le, vat_le = self._get_vat_row_widgets(r)
+
+            rate_txt = (rate_le.text() if rate_le else "").strip()
             base_txt = (base_le.text() if base_le else "").strip()
             vat_txt  = (vat_le.text() if vat_le else "").strip()
 
+            # ligne vide -> ignore
+            if not rate_txt and not base_txt and not vat_txt:
+                continue
+
             b = self._parse_amount(base_txt)
             v = self._parse_amount(vat_txt)
+            rt = self._parse_amount(rate_txt)
+
+            # si on n'a pas base+vat, on n'additionne pas (évite les lignes incomplètes)
+            if b is None and v is None:
+                continue
+
+            # clé de déduplication si on a tout
+            if rt is not None and b is not None and v is not None:
+                key = (round(rt, 2), round(b, 2), round(v, 2))
+                if key in seen:
+                    continue
+                seen.add(key)
 
             if b is not None:
                 base_total += b
@@ -2312,6 +2377,8 @@ class MainWindow(QMainWindow):
         self.lbl_vat_total.setText(
             f"Base HT = {base_total:.2f} | Total TVA = {vat_total:.2f} | Total TTC = {ttc_total:.2f}"
         )
+
+        # vert (info) : total calculé
         self.lbl_vat_total.setStyleSheet("padding:4px; background-color:#e6ffe6;")
 
 
@@ -2417,6 +2484,7 @@ class MainWindow(QMainWindow):
             self.open_block_options_dialog()
 
     def open_pallet_details_dialog(self):
+        from ui.pallet_details_dialog import PalletDetailsDialog
         tour_nrs = self.get_folder_numbers()
         if not tour_nrs:
             QMessageBox.information(self, "Palettes", "Aucun numéro de dossier renseigné.")
@@ -2546,7 +2614,8 @@ class MainWindow(QMainWindow):
         menu.addSeparator()
         action_delete = menu.addAction("Supprimer")
         action_delete.setEnabled(bool(pdf_path))
-
+        action_fetch_links = menu.addAction("Télécharger documents via liens (CMR)…")
+        action_fetch_links.setEnabled(bool(pdf_path))
         # --- cible = ligne actuellement sélectionnée (la facture cible)
         target_row = self.pdf_table.currentRow()
         target_filename = None
@@ -2565,8 +2634,11 @@ class MainWindow(QMainWindow):
 
         can_link = bool(target_entry_id and target_filename and linked_filename and linked_filename != target_filename)
         action_link.setEnabled(can_link)
+        action_relink = menu.addAction("Rattacher à un Dossier (regrouper avec un autre fichier)…")
+        action_relink.setEnabled(bool(pdf_path))
 
         chosen = menu.exec(self.pdf_table.viewport().mapToGlobal(pos))
+
 
         # ✅ IMPORTANT: gérer l'action CMR AVANT le "chosen != action_link"
         if chosen == action_attach_cmr:
@@ -2576,8 +2648,16 @@ class MainWindow(QMainWindow):
         if chosen == action_delete:
             self.mark_pdf_as_deleted(pdf_path, linked_filename)
             return
+        
+        if chosen == action_relink:
+            self.relink_left_document_to_other_group(row)
+            return
 
         if chosen != action_link:
+            return
+
+        if chosen == action_fetch_links:
+            self.fetch_linked_documents_from_pdf(pdf_path, linked_filename)
             return
 
         if not can_link:
@@ -2836,7 +2916,7 @@ class MainWindow(QMainWindow):
 
 
     def refresh_left_table_saved_infos(self):
-        """Recharge IBAN/BIC pour chaque PDF de la table à partir des JSON sauvegardés."""
+        """Recharge IBAN/BIC pour chaque PDF de la table."""
         if not hasattr(self, "pdf_table") or self.pdf_table is None:
             return
         if self.pdf_table.columnCount() < 3:
@@ -2902,6 +2982,7 @@ class MainWindow(QMainWindow):
         doc_name = os.path.basename(self.current_pdf_path)
         blocked = bool((self.block_options.get(doc_name, {}) or {}).get("blocked", False))
         value = 601 if blocked else 600
+        comment = str((self.block_options.get(doc_name, {}) or {}).get("comment", "") or "").strip()
 
         # 3) Dossiers (TourNr) -> updates SQL
         tournrs = sorted({
@@ -2918,6 +2999,7 @@ class MainWindow(QMainWindow):
         for t in tournrs:
             try:
                 self.tour_repo.set_infosymbol18_for_tournr(t, value=value)
+                self.tour_repo.set_block_status_for_tournr(t, is_blocked=blocked, motif=comment)
             except Exception as e:
                 errors.append(f"{t} : {e}")
 
@@ -2932,7 +3014,7 @@ class MainWindow(QMainWindow):
             QMessageBox.information(
                 self,
                 "Validation",
-                f"Facture VALIDÉE et sauvegardée.\n\nMise à jour SQL appliquée : InfoSymbol18={value} sur {len(tournrs)} dossier(s){suffix}."
+                f"Facture VALIDÉE et sauvegardée. Dossier(s){suffix}."
             )
 
     def _get_saved_status_for_pdf(self, pdf_path: str) -> str:
@@ -3245,7 +3327,14 @@ class MainWindow(QMainWindow):
                     self._add_fee_row(gebnr, bez, amount)
 
     def on_ctrl_s_save(self):
-        self.save_current_data()
+        # Ctrl+S = pas de popup, juste statusbar
+        self.save_current_data(show_message=False)
+
+        # MAJ modèle supplier en silencieux
+        try:
+            self.save_supplier_model(show_message=False)
+        except Exception:
+            pass
 
     def _format_percent(self, v: float | None) -> str:
         if v is None:
@@ -3516,11 +3605,12 @@ class MainWindow(QMainWindow):
         except Exception:
             details_rows = []
 
-        dlg = FolderSelectDialog(tour_numbers, details_rows, parent=self, title="Rattacher CMR à un dossier")
-        if dlg.exec() != QDialog.Accepted or not dlg.selected_tour_nr:
+        dlg = FolderSelectDialog(tour_numbers, details_rows, parent=self, title="Rattacher CMR à une commande")
+        if dlg.exec() != QDialog.Accepted or not dlg.selected_tour_nr or not dlg.selected_auf_nr:
             return
 
         tour_nr = str(dlg.selected_tour_nr).strip()
+        auf_nr  = str(dlg.selected_auf_nr).strip()
         if not tour_nr:
             return
 
@@ -3549,6 +3639,7 @@ class MainWindow(QMainWindow):
         existing["entry_id"] = entry_id
         existing["cmr_tour_nr"] = tour_nr
         existing["cmr_attached_at"] = datetime.now().isoformat(timespec="seconds")
+        existing["cmr_auf_nr"] = auf_nr
 
         os.makedirs(os.path.dirname(json_path), exist_ok=True)
         with open(json_path, "w", encoding="utf-8") as f:
@@ -3558,9 +3649,8 @@ class MainWindow(QMainWindow):
         for r in range(self.pdf_table.rowCount()):
             it0 = self.pdf_table.item(r, 0)
             if it0 and it0.data(Qt.UserRole) == pdf_path:
-                it0.setToolTip(f"CMR rattachée au dossier {tour_nr}")
-                # (le statut couleur ne dépend pas du tag cmr, mais on refresh quand même)
-                self.refresh_left_row_processing_state(r)
+                it0.setToolTip(f"CMR rattachée au dossier {tour_nr} / commande {auf_nr}")
+                self.statusBar().showMessage(f"CMR rattachée au dossier {tour_nr} / commande {auf_nr}.", 2500)
                 break
 
         self.apply_left_filter_to_table()
@@ -3722,4 +3812,646 @@ class MainWindow(QMainWindow):
             "Tous les dossiers doivent être rattachés à au moins une CMR avant validation.\n\n"
             f"Dossiers sans CMR : {', '.join(missing)}"
         )
+        return False   
+
+
+
+    def on_fetch_links_main(self):
+        pdf_path = self.view_pdf_path or self.current_pdf_path
+        if not pdf_path or not os.path.exists(pdf_path):
+            QMessageBox.information(self, "Liens", "Aucun document affiché.")
+            return
+
+        source_filename = os.path.basename(pdf_path)
+
+        info = self._get_logmail_info_for_pdf(source_filename)
+        entry_id = (info.get("entry_id") or "").strip()
+        message_id = (info.get("message_id") or "").strip()
+        sujet = info.get("sujet") or ""
+        expediteur = info.get("expediteur") or ""
+
+        if not entry_id:
+            try:
+                json_path = self._get_saved_json_path(pdf_path)
+                if os.path.exists(json_path):
+                    with open(json_path, "r", encoding="utf-8") as f:
+                        data = json.load(f) or {}
+                    entry_id = str(data.get("entry_id") or "").strip()
+            except Exception:
+                pass
+
+        if not entry_id:
+            QMessageBox.information(self, "Liens", "Impossible de déterminer l'entry_id pour ce document.")
+            return
+
+        if not message_id:
+            message_id = entry_id
+
+        urls = self._extract_urls_from_pdf(pdf_path)
+        if not urls:
+            QMessageBox.information(self, "Liens", "Aucun lien HTTP(S) trouvé dans ce document.")
+            return
+
+        dest_folder = os.path.dirname(pdf_path)
+
+        # ✅ progress dialog
+        self._links_prog = QProgressDialog("Téléchargement des documents liés…", "Annuler", 0, len(urls), self)
+        self._links_prog.setWindowModality(Qt.WindowModal)
+        self._links_prog.setMinimumDuration(0)
+        self._links_prog.setValue(0)
+        self._links_prog.show()
+
+        # ✅ thread + worker
+        self._links_thread = QThread(self)
+        self._links_worker = LinkDownloadWorker(urls, dest_folder)
+        self._links_worker.moveToThread(self._links_thread)
+
+        # cancel
+        self._links_prog.canceled.connect(self._links_worker.cancel)
+
+        # start
+        self._links_thread.started.connect(self._links_worker.run)
+
+        # progress UI
+        self._links_worker.progress.connect(lambda v, txt: (self._links_prog.setValue(v), self._links_prog.setLabelText(txt)))
+
+        def _done(downloaded_paths: list[str], errors: list[str], canceled: bool):
+            try:
+                self._links_prog.close()
+            except Exception:
+                pass
+
+            downloaded_names = []
+
+            # ✅ maintenant (dans le thread UI), on fait l’upsert SQL + json minimal
+            for p in downloaded_paths:
+                try:
+                    new_name = os.path.basename(p)
+                    self._upsert_logmail_for_downloaded_file(
+                        nom_pdf=new_name,
+                        entry_id=entry_id,
+                        message_id=message_id,
+                        sujet=sujet,
+                        expediteur=expediteur
+                    )
+                    self._create_minimal_json_no_ocr(p, entry_id)
+                    downloaded_names.append(new_name)
+                except Exception as e:
+                    errors.append(f"{os.path.basename(p)} -> {e}")
+
+            # refresh table
+            try:
+                self.load_folder(dest_folder)
+            except Exception:
+                pass
+
+            msg = []
+            if downloaded_names:
+                msg.append("Téléchargés:\n- " + "\n- ".join(downloaded_names))
+            if canceled:
+                msg.append("\nAnnulé.")
+            if errors:
+                msg.append("\nErreurs:\n- " + "\n- ".join(errors[:8]) + ("\n(...)" if len(errors) > 8 else ""))
+
+            QMessageBox.information(self, "Liens", "\n\n".join(msg) if msg else "Aucun téléchargement.")
+
+            self._links_thread.quit()
+
+        self._links_worker.finished.connect(_done)
+        self._links_thread.finished.connect(self._links_thread.deleteLater)
+        self._links_worker.finished.connect(self._links_worker.deleteLater)
+
+        self._links_thread.start()
+
+
+    def _extract_urls_from_pdf(self, pdf_path: str) -> list[str]:
+        urls = []
+        try:
+            doc = fitz.open(pdf_path)
+            for page in doc:
+                # liens PDF (annotations)
+                try:
+                    for lk in page.get_links() or []:
+                        uri = lk.get("uri")
+                        if uri and isinstance(uri, str) and uri.lower().startswith(("http://", "https://")):
+                            urls.append(uri)
+                except Exception:
+                    pass
+
+                # liens dans le texte
+                try:
+                    txt = page.get_text() or ""
+                    for m in _URL_RE.findall(txt):
+                        urls.append(m)
+                except Exception:
+                    pass
+            doc.close()
+        except Exception:
+            return []
+
+        # clean + unique
+        out = []
+        seen = set()
+        for u in urls:
+            u = (u or "").strip().rstrip(").,;\"'")
+            if u and u not in seen:
+                seen.add(u)
+                out.append(u)
+        return out
+
+
+    class _DownloadCanceled(Exception):
+        pass
+
+    def _download_linked_pdf(self, url: str, dest_folder: str, cancel_cb=None) -> str:
+        os.makedirs(dest_folder, exist_ok=True)
+
+        # nom par défaut basé sur l'URL
+        filename = self._guess_filename_from_url(url)
+        if not filename.lower().endswith(".pdf"):
+            filename = os.path.splitext(filename)[0] + ".pdf"
+
+        target = os.path.join(dest_folder, filename)
+
+        # éviter overwrite
+        if os.path.exists(target):
+            root, ext = os.path.splitext(target)
+            k = 2
+            while os.path.exists(f"{root}_{k}{ext}"):
+                k += 1
+            target = f"{root}_{k}{ext}"
+
+        tmp_target = target + ".part"
+
+        req = Request(url, headers={"User-Agent": "Mozilla/5.0"})
+
+        try:
+            with urlopen(req, timeout=30) as resp:
+                # Content-Disposition peut donner un nom => on ajuste target AVANT d’écrire
+                cd = resp.headers.get("Content-Disposition", "") or ""
+                m = re.search(r'filename="?([^"]+)"?', cd, re.IGNORECASE)
+                if m:
+                    fn = self._safe_filename(m.group(1))
+                    if not fn.lower().endswith(".pdf"):
+                        fn += ".pdf"
+                    target2 = os.path.join(dest_folder, fn)
+                    if not os.path.exists(target2):
+                        target = target2
+                        tmp_target = target + ".part"
+
+                # écriture en chunks (UI reste responsive)
+                with open(tmp_target, "wb") as f:
+                    # lire un petit début pour valider PDF
+                    head = resp.read(5)
+                    if cancel_cb and cancel_cb():
+                        raise _DownloadCanceled()
+
+                    if not head.startswith(b"%PDF"):
+                        raise ValueError("Le lien ne renvoie pas un PDF (%PDF manquant).")
+
+                    f.write(head)
+
+                    while True:
+                        if cancel_cb and cancel_cb():
+                            raise _DownloadCanceled()
+
+                        chunk = resp.read(256 * 1024)  # 256 KB
+                        if not chunk:
+                            break
+                        f.write(chunk)
+
+                        # ✅ laisse respirer l'UI (sinon freeze)
+                        QApplication.processEvents()
+
+            # commit atomique
+            if os.path.exists(target):
+                os.remove(target)
+            os.replace(tmp_target, target)
+            return target
+
+        except _DownloadCanceled:
+            # annulation propre
+            try:
+                if os.path.exists(tmp_target):
+                    os.remove(tmp_target)
+            except Exception:
+                pass
+            raise
+
+        except (HTTPError, URLError) as e:
+            try:
+                if os.path.exists(tmp_target):
+                    os.remove(tmp_target)
+            except Exception:
+                pass
+            raise ValueError(f"Erreur réseau: {e}")
+
+        except Exception:
+            try:
+                if os.path.exists(tmp_target):
+                    os.remove(tmp_target)
+            except Exception:
+                pass
+            raise
+
+
+    def _guess_filename_from_url(self, url: str) -> str:
+        try:
+            p = urlparse(url)
+            base = os.path.basename(p.path) or ""
+            if base:
+                return self._safe_filename(base)
+        except Exception:
+            pass
+        return "document.pdf"
+
+
+    def _safe_filename(self, name: str) -> str:
+        name = re.sub(r"[\\/:*?\"<>|]+", "_", name)
+        name = re.sub(r"\s{2,}", " ", name).strip()
+        return name or "document.pdf"
+
+
+    def _get_logmail_info_for_pdf(self, nom_pdf: str) -> dict:
+        # TOP 1 le plus récent (utile si doublons)
+        row = self.logmail_repo.fetch_one(
+            """
+            SELECT TOP 1 message_id, entry_id, sujet, expediteur
+            FROM XXA_LOGMAIL_228794
+            WHERE nom_pdf = ?
+            ORDER BY date_creation DESC, id_log DESC
+            """,
+            (nom_pdf,),
+        )
+        return row or {}
+
+
+    def _upsert_logmail_for_downloaded_file(self, nom_pdf: str, entry_id: str, message_id: str, sujet: str = "", expediteur: str = ""):
+        # Update si existe, sinon insert
+        self.logmail_repo.execute(
+            """
+            UPDATE XXA_LOGMAIL_228794
+            SET entry_id = ?, message_id = ?
+            WHERE nom_pdf = ?;
+
+            IF @@ROWCOUNT = 0
+            BEGIN
+                INSERT INTO XXA_LOGMAIL_228794 (date_creation, message_id, entry_id, nom_pdf, sujet, expediteur)
+                VALUES (SYSDATETIME(), ?, ?, ?, ?, ?)
+            END
+            """,
+            (entry_id, message_id, nom_pdf, message_id, entry_id, nom_pdf, sujet or "", expediteur or ""),
+        )
+
+
+    def _create_minimal_json_no_ocr(self, pdf_path: str, entry_id: str):
+        json_path = self._get_saved_json_path(pdf_path)
+        if os.path.exists(json_path):
+            return
+        data = {
+            "entry_id": entry_id,
+            "status": "draft",
+            "tags": ["cmr"],
+            "ocr_text": "",
+            "folders": [],
+            "vat_lines": [],
+            "fees": [],
+        }
+        os.makedirs(os.path.dirname(json_path), exist_ok=True)
+        with open(json_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+
+    def on_save_clicked(self):
+        # sauvegarde normale (avec popup)
+        self.save_current_data(show_message=True)
+
+        # MAJ modèle supplier en silencieux
+        try:
+            self.save_supplier_model(show_message=False)
+        except Exception:
+            pass
+
+
+    def _get_cmr_attached_orders_for_entry(self) -> dict[str, set[str]]:
+        """
+        Retour: {tour_nr -> set(auf_nr)} pour les CMR rattachées sur les docs du même entry_id.
+        (compat: si une ancienne CMR n'a pas cmr_auf_nr, on la note en legacy)
+        """
+        out = defaultdict(set)
+        legacy = defaultdict(int)
+
+        for p in (self.entry_pdf_paths or []):
+            data = self._read_saved_invoice_json(p) or {}
+            t = str(data.get("cmr_tour_nr") or "").strip()
+            a = str(data.get("cmr_auf_nr") or "").strip()
+            if not t:
+                continue
+            if a:
+                out[t].add(a)
+            else:
+                legacy[t] += 1
+
+        # on garde legacy dispo pour tooltips si besoin
+        self._cmr_legacy_cache = dict(legacy)
+        return dict(out)
+
+    def _get_required_orders_by_tour(self, tours: set[str]) -> dict[str, set[str]]:
+        """Retour: {tour_nr -> set(auf_nr)} depuis la BDD (via get_palette_details_with_trajet_by_tournrs)."""
+        key = tuple(sorted(tours))
+        if getattr(self, "_req_orders_cache_key", None) == key:
+            return getattr(self, "_req_orders_cache", {}) or {}
+
+        req = defaultdict(set)
+        try:
+            rows = self.tour_repo.get_palette_details_with_trajet_by_tournrs(list(tours)) or []
+        except Exception:
+            rows = []
+
+        for r in rows:
+            tour = str(r.get("Dossier") or "").strip()
+            auf  = str(r.get("AufNr") or "").strip()
+            if tour and auf:
+                req[tour].add(auf)
+
+        self._req_orders_cache_key = key
+        self._req_orders_cache = dict(req)
+        return self._req_orders_cache
+
+    def _check_all_orders_have_cmr(self) -> tuple[bool, dict[str, list[str]]]:
+        """
+        ok=True si toutes les commandes (AufNr) de tous les dossiers ont une CMR.
+        Retourne missing_by_tour = {tour_nr: [auf_nr, ...]}
+        """
+        invoice_tours = self._get_current_invoice_tours()
+        if not invoice_tours:
+            return True, {}
+
+        required = self._get_required_orders_by_tour(invoice_tours)
+        attached = self._get_cmr_attached_orders_for_entry()
+        legacy = getattr(self, "_cmr_legacy_cache", {}) or {}
+
+        missing_by_tour = {}
+
+        for tour in sorted(invoice_tours):
+            req = set(required.get(tour, set()))
+            att = set(attached.get(tour, set()))
+
+            # compat: si on a une CMR "ancienne" sans auf_nr et qu'il n'y a qu'UNE commande, on considère OK
+            if not att and legacy.get(tour, 0) > 0 and len(req) == 1:
+                att = set(req)
+
+            if req:
+                miss = sorted(req - att)
+                if miss:
+                    missing_by_tour[tour] = miss
+            else:
+                # pas de commandes trouvées en BDD -> on bloque (sinon validation fausse)
+                missing_by_tour[tour] = ["(aucune commande trouvée en BDD)"]
+
+        return (len(missing_by_tour) == 0), missing_by_tour
+
+    def _block_validate_if_missing_cmr(self) -> bool:
+        ok, missing_by_tour = self._check_all_orders_have_cmr()
+        if ok:
+            return True
+
+        lines = []
+        for tour, miss in missing_by_tour.items():
+            lines.append(f"{tour}: {', '.join(miss)}")
+
+        QMessageBox.warning(
+            self,
+            "Validation impossible",
+            "Tous les dossiers doivent avoir une CMR pour CHAQUE commande.\n\n"
+            "Commandes sans CMR :\n" + "\n".join(lines)
+        )
         return False
+    
+
+    def relink_left_document_to_other_group(self, row: int):
+        it0 = self.pdf_table.item(row, 0)
+        if not it0:
+            return
+
+        # --- source: choisir quel PDF du groupe on déplace ---
+        group_paths = it0.data(Qt.UserRole + 5)
+        if isinstance(group_paths, (list, tuple)) and group_paths:
+            src_paths = [p for p in group_paths if p and os.path.exists(p)]
+        else:
+            p = it0.data(Qt.UserRole)
+            src_paths = [p] if p and os.path.exists(p) else []
+
+        if not src_paths:
+            QMessageBox.information(self, "Regrouper", "Impossible de retrouver le fichier source.")
+            return
+
+        # si plusieurs docs dans le groupe, on laisse choisir lequel déplacer
+        if len(src_paths) > 1:
+            labels = [f"{i+1}) {os.path.basename(p)}" for i, p in enumerate(src_paths)]
+            default_idx = 0
+            # si le PDF affiché fait partie du groupe, on le pré-sélectionne
+            if getattr(self, "current_pdf_path", None) in src_paths:
+                default_idx = src_paths.index(self.current_pdf_path)
+
+            choice, ok = QInputDialog.getItem(
+                self, "Regrouper", "Document à rattacher :", labels, default_idx, False
+            )
+            if not ok or not choice:
+                return
+            src_path = src_paths[int(choice.split(")")[0]) - 1]
+        else:
+            src_path = src_paths[0]
+
+        src_name = os.path.basename(src_path)
+        src_entry_id = (self.logmail_repo.get_entry_id_for_file(src_name) or "").strip()
+
+        # --- cible: choisir un autre fichier (donc un autre entry_id) ---
+        candidates = []
+        targets = []
+
+        for r in range(self.pdf_table.rowCount()):
+            it = self.pdf_table.item(r, 0)
+            if not it:
+                continue
+
+            target_entry = str(it.data(Qt.UserRole + 4) or "").strip()  # ✅ entry_id
+            target_path = it.data(Qt.UserRole)
+            if not target_entry or not target_path:
+                continue
+
+            # exclure le même groupe
+            if src_entry_id and target_entry == src_entry_id:
+                continue
+
+            rep_name = os.path.basename(str(target_path))
+            group_paths2 = it.data(Qt.UserRole + 5)
+            n_docs = len(group_paths2) if isinstance(group_paths2, (list, tuple)) else 1
+            label = f"{rep_name}   ({n_docs} doc)   [{target_entry}]"
+            candidates.append(label)
+            targets.append(target_entry)
+
+        if not candidates:
+            QMessageBox.information(self, "Regrouper", "Aucune cible disponible (pas d'autre groupe).")
+            return
+
+        choice, ok = QInputDialog.getItem(
+            self, "Rattacher à un Dossier", "Choisis le fichier/groupe cible :", candidates, 0, False
+        )
+        if not ok or not choice:
+            return
+
+        idx = candidates.index(choice)
+        target_entry_id = targets[idx]
+
+        # --- UPDATE base: regrouper en base ---
+        try:
+            self.logmail_repo.set_entry_id_for_file(src_name, target_entry_id)
+        except Exception as e:
+            QMessageBox.warning(self, "Regrouper", f"Erreur SQL:\n{e}")
+            return
+
+        # --- UPDATE JSON local: entry_id ---
+        try:
+            data = self._read_saved_invoice_json(src_path) or {}
+            data["entry_id"] = target_entry_id
+            json_path = self._get_saved_json_path(src_path)
+            os.makedirs(os.path.dirname(json_path), exist_ok=True)
+            with open(json_path, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+        except Exception:
+            # pas bloquant
+            pass
+
+        # --- refresh UI ---
+        try:
+            self.load_folder(os.path.dirname(src_path))
+        except Exception:
+            pass
+
+        self.statusBar().showMessage(f"{src_name} rattaché au groupe {target_entry_id}.", 3000)
+
+class LinkDownloadWorker(QObject):
+    progress = Signal(int, str)          # (index, label)
+    finished = Signal(list, list, bool)  # (downloaded_paths, errors, canceled)
+
+    def __init__(self, urls: list[str], dest_folder: str, parent=None):
+        super().__init__(parent)
+        self.urls = urls
+        self.dest_folder = dest_folder
+        self._cancelled = False
+        self._current_resp = None
+
+    @Slot()
+    def cancel(self):
+        self._cancelled = True
+        # ✅ tente d'interrompre un read bloqué
+        try:
+            if self._current_resp is not None:
+                self._current_resp.close()
+        except Exception:
+            pass
+
+    def _safe_filename(self, name: str) -> str:
+        name = re.sub(r"[\\/:*?\"<>|]+", "_", name)
+        name = re.sub(r"\s{2,}", " ", name).strip()
+        return name or "document.pdf"
+
+    def _guess_filename_from_url(self, url: str) -> str:
+        try:
+            p = urlparse(url)
+            base = os.path.basename(p.path) or ""
+            if base:
+                return self._safe_filename(base)
+        except Exception:
+            pass
+        return "document.pdf"
+
+    def _unique_path(self, path: str) -> str:
+        if not os.path.exists(path):
+            return path
+        root, ext = os.path.splitext(path)
+        k = 2
+        while os.path.exists(f"{root}_{k}{ext}"):
+            k += 1
+        return f"{root}_{k}{ext}"
+
+    @Slot()
+    def run(self):
+        os.makedirs(self.dest_folder, exist_ok=True)
+
+        downloaded = []
+        errors = []
+        canceled = False
+
+        for i, url in enumerate(self.urls, start=1):
+            if self._cancelled:
+                canceled = True
+                break
+
+            self.progress.emit(i - 1, f"{i}/{len(self.urls)}\n{url}")
+
+            try:
+                req = Request(url, headers={"User-Agent": "Mozilla/5.0"})
+                with urlopen(req, timeout=20) as resp:
+                    self._current_resp = resp
+
+                    # nom par défaut
+                    filename = self._guess_filename_from_url(url)
+                    if not filename.lower().endswith(".pdf"):
+                        filename = os.path.splitext(filename)[0] + ".pdf"
+
+                    # content-disposition si présent
+                    cd = resp.headers.get("Content-Disposition", "") or ""
+                    m = re.search(r'filename="?([^"]+)"?', cd, re.IGNORECASE)
+                    if m:
+                        fn = self._safe_filename(m.group(1))
+                        if not fn.lower().endswith(".pdf"):
+                            fn += ".pdf"
+                        filename = fn
+
+                    target = self._unique_path(os.path.join(self.dest_folder, filename))
+                    tmp = target + ".part"
+
+                    with open(tmp, "wb") as f:
+                        # lit un petit header pour valider PDF
+                        head = resp.read(5)
+                        if self._cancelled:
+                            raise RuntimeError("CANCELLED")
+                        if not head.startswith(b"%PDF"):
+                            raise ValueError("Le lien ne renvoie pas un PDF (%PDF manquant).")
+                        f.write(head)
+
+                        while True:
+                            if self._cancelled:
+                                raise RuntimeError("CANCELLED")
+                            chunk = resp.read(256 * 1024)
+                            if not chunk:
+                                break
+                            f.write(chunk)
+
+                    # commit atomique
+                    if os.path.exists(target):
+                        os.remove(target)
+                    os.replace(tmp, target)
+                    downloaded.append(target)
+
+            except Exception as e:
+                # nettoyage .part
+                try:
+                    # si on a pu déterminer un tmp
+                    if 'tmp' in locals() and os.path.exists(tmp):
+                        os.remove(tmp)
+                except Exception:
+                    pass
+
+                if str(e) == "CANCELLED":
+                    canceled = True
+                    break
+                errors.append(f"{url} -> {e}")
+
+            finally:
+                self._current_resp = None
+
+        # finir la barre
+        self.progress.emit(len(self.urls), f"{len(self.urls)}/{len(self.urls)}")
+        self.finished.emit(downloaded, errors, canceled)

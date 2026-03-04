@@ -1,146 +1,149 @@
-# ui/folder_select_dialog.py
+# ui/pallet_details_dialog.py
 from __future__ import annotations
 
-from collections import defaultdict
-from typing import Any
+from typing import Any, Dict, List
 
 from PySide6.QtCore import Qt
-from PySide6.QtGui import QFont
 from PySide6.QtWidgets import (
-    QDialog, QDialogButtonBox, QLabel, QTreeWidget, QTreeWidgetItem,
-    QVBoxLayout, QHeaderView
+    QDialog, QDialogButtonBox, QHBoxLayout, QLabel, QSpinBox,
+    QTabWidget, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget
 )
 
-class FolderSelectDialog(QDialog):
-    """Sélection d'un dossier (TourNr) pour rattachement CMR avec détails SQL."""
 
-    def __init__(
-        self,
-        tour_numbers: list[str],
-        details_rows: list[dict[str, Any]] | None = None,
-        parent=None,
-        title: str = "Rattacher CMR à un dossier",
-    ):
+class PalletDetailsDialog(QDialog):
+    """
+    Dialog d'édition des détails palettes par dossier (TourNr).
+    - Charge VPE / Palettes / Poids depuis TourRepository.get_palette_details_by_tournr
+    - Permet de saisir "delivered" (entier) par ligne VPE
+    - Retourne un dict: {tour_nr: [ {vpe, palettes, poids, delivered}, ...], ...}
+    """
+
+    def __init__(self, parent=None, *, tour_numbers: List[str], tour_repo, existing_saved: Dict[str, Any] | None = None):
         super().__init__(parent)
-        self.selected_tour_nr: str | None = None
+        self.setWindowTitle("Détails palettes")
+        self.resize(900, 520)
 
-        self.setWindowTitle(title)
-        self.resize(980, 520)
+        self.tour_numbers = [str(t).strip() for t in (tour_numbers or []) if str(t).strip()]
+        self.tour_repo = tour_repo
+        self.existing_saved = existing_saved or {}
 
-        layout = QVBoxLayout(self)
-        layout.addWidget(QLabel("Sélectionne le dossier (TourNr). Détails palettes/poids/trajet :"))
+        self._tables: Dict[str, QTableWidget] = {}
 
-        self.tree = QTreeWidget()
-        self.tree.setColumnCount(5)
-        self.tree.setHeaderLabels(["Dossier", "Trajet", "VPE", "Palettes", "Poids"])
-        self.tree.setSelectionMode(QTreeWidget.SingleSelection)
-        self.tree.setSelectionBehavior(QTreeWidget.SelectRows)
-        self.tree.setUniformRowHeights(True)
-        self.tree.setRootIsDecorated(True)
-        self.tree.setAlternatingRowColors(True)
+        main = QVBoxLayout(self)
 
-        header = self.tree.header()
-        header.setSectionResizeMode(0, QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(1, QHeaderView.Stretch)
-        header.setSectionResizeMode(2, QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(3, QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(4, QHeaderView.ResizeToContents)
+        info = QLabel("Saisis la colonne 'Livré' (delivered). Les autres colonnes viennent de la base.")
+        info.setWordWrap(True)
+        main.addWidget(info)
 
-        layout.addWidget(self.tree)
+        self.tabs = QTabWidget()
+        main.addWidget(self.tabs, 1)
 
-        details_rows = details_rows or []
-        by_dossier = defaultdict(list)
-        trajet_by_dossier: dict[str, str] = {}
-
-        for r in details_rows:
-            dossier = str(r.get("Dossier") or r.get("dossier") or "").strip()
-            if not dossier:
-                continue
-            by_dossier[dossier].append(r)
-            trajet = str(r.get("Trajet") or r.get("trajet") or "").strip()
-            if trajet and dossier not in trajet_by_dossier:
-                trajet_by_dossier[dossier] = trajet
-
-        tour_numbers = [str(t).strip() for t in (tour_numbers or []) if str(t).strip()]
-
-        bold = QFont()
-        bold.setBold(True)
-
-        first_item = None
-
-        for tour_nr in tour_numbers:
-            rows = by_dossier.get(tour_nr, [])
-            trajet = trajet_by_dossier.get(tour_nr, "")
-
-            total_pal = 0.0
-            total_poids = 0.0
-            for rr in rows:
-                try:
-                    total_pal += float(rr.get("Palettes") or rr.get("palettes") or 0)
-                except Exception:
-                    pass
-                try:
-                    total_poids += float(rr.get("Poids") or rr.get("poids") or 0)
-                except Exception:
-                    pass
-
-            parent_item = QTreeWidgetItem([tour_nr, trajet, "TOTAL", self._fmt_num(total_pal), self._fmt_num(total_poids)])
-            parent_item.setData(0, Qt.UserRole, tour_nr)
-            for c in range(5):
-                parent_item.setFont(c, bold)
-
-            self.tree.addTopLevelItem(parent_item)
-            if first_item is None:
-                first_item = parent_item
-
-            if rows:
-                for rr in rows:
-                    vpe = str(rr.get("VPE") or rr.get("vpe") or "").strip()
-                    pal = self._fmt_num(rr.get("Palettes") or rr.get("palettes") or "")
-                    poids = self._fmt_num(rr.get("Poids") or rr.get("poids") or "")
-                    child = QTreeWidgetItem(["", "", vpe, pal, poids])
-                    child.setData(0, Qt.UserRole, tour_nr)  # child => même dossier
-                    parent_item.addChild(child)
-            else:
-                child = QTreeWidgetItem(["", "", "(aucun détail)", "", ""])
-                child.setData(0, Qt.UserRole, tour_nr)
-                parent_item.addChild(child)
-
-            parent_item.setExpanded(True)
-
-        if first_item is not None:
-            self.tree.setCurrentItem(first_item)
+        self._build_tabs()
 
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        layout.addWidget(buttons)
-
-        self.tree.itemDoubleClicked.connect(lambda *_: self.accept_selected())
-        buttons.accepted.connect(self.accept_selected)
+        buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
+        main.addWidget(buttons)
 
-    @staticmethod
-    def _fmt_num(v: Any) -> str:
-        if v is None:
-            return ""
-        s = str(v).strip()
-        if s == "":
-            return ""
+    # ---------- UI ----------
+    def _build_tabs(self):
+        self.tabs.clear()
+        self._tables.clear()
+
+        for tour_nr in self.tour_numbers:
+            w = QWidget()
+            lay = QVBoxLayout(w)
+
+            table = QTableWidget()
+            table.setColumnCount(4)
+            table.setHorizontalHeaderLabels(["VPE", "Palettes", "Poids", "Livré"])
+            table.verticalHeader().setVisible(False)
+            table.setAlternatingRowColors(True)
+            table.setSelectionBehavior(QTableWidget.SelectRows)
+
+            lay.addWidget(table)
+
+            self.tabs.addTab(w, tour_nr)
+            self._tables[tour_nr] = table
+
+            self._load_one_tour(tour_nr, table)
+
+            # colonnes
+            table.resizeColumnsToContents()
+            table.horizontalHeader().setStretchLastSection(True)
+
+    def _load_one_tour(self, tour_nr: str, table: QTableWidget):
+        # lignes SQL
         try:
-            f = float(str(v).replace(",", "."))
-            if abs(f - int(f)) < 1e-9:
-                return str(int(f))
-            return f"{f:.4f}".rstrip("0").rstrip(".")
+            rows = self.tour_repo.get_palette_details_by_tournr(tour_nr) or []
         except Exception:
-            return s
+            rows = []
 
-    def accept_selected(self):
-        it = self.tree.currentItem()
-        if not it:
-            return
-        tour_nr = str(it.data(0, Qt.UserRole) or "").strip()
-        if not tour_nr:
-            tour_nr = (it.text(0) or "").strip()
-        if not tour_nr:
-            return
-        self.selected_tour_nr = tour_nr
-        self.accept()
+        # mapping existant (déjà sauvegardé) : vpe -> delivered
+        saved = self.existing_saved.get(tour_nr, []) or []
+        saved_map = {}
+        for sl in saved:
+            vpe = str(sl.get("vpe") or sl.get("VPE") or "").strip()
+            if not vpe:
+                continue
+            try:
+                saved_map[vpe.upper()] = int(sl.get("delivered") or 0)
+            except Exception:
+                saved_map[vpe.upper()] = 0
+
+        table.setRowCount(0)
+
+        for r in rows:
+            vpe = str(r.get("VPE") or r.get("vpe") or "").strip()
+            palettes = r.get("Palettes") if "Palettes" in r else r.get("palettes")
+            poids = r.get("Poids") if "Poids" in r else r.get("poids")
+
+            delivered = saved_map.get(vpe.upper(), 0)
+
+            row = table.rowCount()
+            table.insertRow(row)
+
+            it_vpe = QTableWidgetItem(vpe)
+            it_vpe.setFlags(it_vpe.flags() & ~Qt.ItemIsEditable)
+
+            it_pal = QTableWidgetItem("" if palettes is None else str(palettes))
+            it_pal.setFlags(it_pal.flags() & ~Qt.ItemIsEditable)
+
+            it_poids = QTableWidgetItem("" if poids is None else str(poids))
+            it_poids.setFlags(it_poids.flags() & ~Qt.ItemIsEditable)
+
+            # delivered avec spinbox
+            spin = QSpinBox()
+            spin.setMinimum(0)
+            spin.setMaximum(999999)
+            spin.setValue(int(delivered) if delivered is not None else 0)
+
+            table.setItem(row, 0, it_vpe)
+            table.setItem(row, 1, it_pal)
+            table.setItem(row, 2, it_poids)
+            table.setCellWidget(row, 3, spin)
+
+    # ---------- Result ----------
+    def get_result(self) -> Dict[str, List[Dict[str, Any]]]:
+        out: Dict[str, List[Dict[str, Any]]] = {}
+
+        for tour_nr, table in self._tables.items():
+            items: List[Dict[str, Any]] = []
+            for row in range(table.rowCount()):
+                vpe = (table.item(row, 0).text() if table.item(row, 0) else "").strip()
+                palettes = (table.item(row, 1).text() if table.item(row, 1) else "").strip()
+                poids = (table.item(row, 2).text() if table.item(row, 2) else "").strip()
+
+                w = table.cellWidget(row, 3)
+                delivered = w.value() if isinstance(w, QSpinBox) else 0
+
+                if vpe:
+                    items.append({
+                        "vpe": vpe,
+                        "palettes": palettes,
+                        "poids": poids,
+                        "delivered": int(delivered),
+                    })
+            out[tour_nr] = items
+
+        return out

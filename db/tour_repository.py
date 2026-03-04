@@ -111,11 +111,26 @@ class TourRepository(BaseRepository):
             WHERE AufIntNr IN ({sub})
         """
 
+        q3 = f"""
+            UPDATE XXASLAufInfSym
+            SET InfoSymbol18 = ?
+            WHERE AufIntNr IN ({sub})
+        """
+
         with self._connection.connect() as conn:
             cur = conn.cursor()
             cur.execute(q1, (value, tour_nr))
             cur.execute(q2, (value, tour_nr))
             conn.commit()
+
+        sql = """
+            UPDATE sym
+            SET sym.InfoSymbol4 = ?
+            FROM XXATourInfSym sym
+            LEFT JOIN XXATour tour ON tour.TourIntNr = sym.TourIntNr
+            WHERE tour.TourNr = ?;
+        """
+        self.execute(sql, (value, tour_nr))
 
 
     def get_existing_tournrs_in_xxatour(self, tournrs: List[str]) -> Set[str]:
@@ -194,7 +209,7 @@ class TourRepository(BaseRepository):
 
 
     def get_palette_details_with_trajet_by_tournrs(self, tour_numbers: List[str]) -> List[Dict[str, Any]]:
-        """Retourne les lignes palettes/poids + trajet pour une liste de TourNr."""
+        """Retourne les lignes palettes/poids + trajet + AufNr pour une liste de TourNr."""
         tour_numbers = [str(t).strip() for t in (tour_numbers or []) if str(t).strip()]
         if not tour_numbers:
             return []
@@ -210,7 +225,8 @@ class TourRepository(BaseRepository):
                     MAX(tour.BELLKZ), '-', MAX(tour.BelPLZ), ' ', MAX(tour.BelOrt),
                     '-',
                     MAX(tour.EmgLKZ), '-', MAX(tour.EmgPLZ), ' ', MAX(tour.EmgOrt)
-                ) AS Trajet
+                ) AS Trajet,
+                auf.AufNr
             FROM XXAV_FR_MainAufIntNrByLegs leg
             LEFT JOIN xxaslauf auf ON auf.AufIntNr = leg.leg_AufIntNr
             LEFT JOIN xxaaufpos pos ON pos.aufintnr = leg.MAin_aufintnr
@@ -219,10 +235,45 @@ class TourRepository(BaseRepository):
             AND LTRIM(RTRIM(CAST(auf.TourNr AS VARCHAR(20)))) IN ({placeholders})
             GROUP BY
                 LTRIM(RTRIM(CAST(auf.TourNr AS VARCHAR(20)))),
-                pos.VPE
+                pos.VPE,
+                auf.AufNr
             ORDER BY
                 LTRIM(RTRIM(CAST(auf.TourNr AS VARCHAR(20)))),
+                auf.AufNr,
                 pos.VPE
         """
         return self.fetch_all(query, tuple(tour_numbers))
     
+    def set_block_status_for_tournr(self, tour_nr: str, is_blocked: bool, motif: str = ""):
+        """
+        Met à jour XXATourExt.isBloqued + MotifBlocage pour un TourNr.
+        Upsert si la ligne XXATourExt n'existe pas encore.
+        """
+        sql = """
+            DECLARE @TourIntNr INT;
+            SELECT TOP 1 @TourIntNr = TourIntNr
+            FROM XXATour
+            WHERE TourNr = ?;
+
+            IF @TourIntNr IS NULL
+                RETURN;
+
+            IF EXISTS (SELECT 1 FROM XXATourExt WHERE TourIntNr = @TourIntNr)
+            BEGIN
+                UPDATE XXATourExt
+                SET
+                    isBloqued = ?,
+                    MotifBlocage = ?
+                WHERE TourIntNr = @TourIntNr;
+            END
+            ELSE
+            BEGIN
+                INSERT INTO XXATourExt (TourIntNr, isBloqued, MotifBlocage)
+                VALUES (@TourIntNr, ?, ?);
+            END
+        """
+        # si pas bloqué -> motif NULL (plus propre)
+        motif_db = (motif or "").strip() if is_blocked else None
+        self.execute(sql, (tour_nr, 1 if is_blocked else 0, motif_db, 1 if is_blocked else 0, motif_db))
+
+

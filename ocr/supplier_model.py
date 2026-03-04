@@ -83,17 +83,35 @@ def _value_group_regex(field: str, value: str) -> str:
     v = (value or "").strip()
 
     if field == "invoice_date":
-        # tolérant (dd/mm/yyyy, dd-mm-yy, etc.)
         return r"\b\d{1,2}[./-]\d{1,2}[./-]\d{2,4}\b"
 
     vv = _norm_for_search(v)
+
+    # ✅ spécial invoice_number : si c'est du type LETTRES + CHIFFRES (ex: F2511326)
+    if field == "invoice_number":
+        m = re.fullmatch(r"([A-Z]{1,6})(\d{3,})", vv)
+        if m:
+            prefix, digits = m.groups()
+            n = len(digits)
+
+            # cas exact demandé : F + 7 chiffres
+            if prefix == "F" and n == 7:
+                return r"F\d{7}"
+
+            # sinon: même prefix, digits proche
+            lo = max(3, n - 1)
+            hi = min(20, n + 1)
+            return rf"{re.escape(prefix)}\d{{{lo},{hi}}}"
+
+        # fallback : au moins une lettre + au moins un chiffre
+        return r"[A-Z][A-Z0-9\-_/\.]*\d[A-Z0-9\-_/\.]*"
+
     if vv.isdigit():
         n = len(vv)
         lo = max(3, n - 2)
         hi = min(40, n + 2)
         return rf"\d{{{lo},{hi}}}"
 
-    # alphanum + séparateurs courants
     allowed = "A-Z0-9"
     if any(c in "-_/." for c in vv):
         allowed += r"\-_/\. "
@@ -204,19 +222,23 @@ def learn_supplier_patterns(
         line = _find_line_with_value(ocr_text, invoice_number)
         rx = _make_line_regex(line, "invoice_number", invoice_number) if line else None
         if rx:
+            # ✅ Invoice number : near_label basé sur le FORMAT de l'exemple
+            # (évite de capturer 30/11/2025)
+            group_re = _value_group_regex("invoice_number", invoice_number)  # ex: F\d{7}
             patterns["invoice_number"].append({
-                "mode": "line_regex",
-                "regex": rx,
+                "mode": "near_label",
+                "label_regex": r"\b(N[°O]\s*FACTURE|INVOICE\s*(NO\.?|NUMBER)|INV\.?\s*NO\.?)\b",
+                "value_regex": rf"(\b{group_re}\b)",
+                "window": 200,
                 "group": 1,
-                "example_line": line,
                 "hit_count": 0,
                 "created_at": _now_iso(),
             })
 
         patterns["invoice_number"].append({
             "mode": "near_label",
-            "label_regex": r"\b(INV\.?|INVOICE|FACTURE|FACT\.?|FA)\b",
-            "value_regex": r"([A-Z0-9\-_/\.]{3,})",
+            "label_regex": r"\b(N[°O]\s*FACTURE|INVOICE\s*(NO\.?|NUMBER)|INV\.?\s*NO\.?)\b",
+            "value_regex": r"([A-Z0-9][A-Z0-9\-_/\.]*\d[A-Z0-9\-_/\.]{1,})",
             "window": 120,
             "group": 1,
             "hit_count": 0,
@@ -353,6 +375,10 @@ def extract_fields_with_model(text: str, model: dict) -> Dict[str, str]:
                 continue
             if field == "bic" and not validate_bic(val):
                 continue
+            if field == "invoice_number":
+                # rejette les dates du style 30/11/2025
+                if re.fullmatch(r"\d{1,2}[./-]\d{1,2}[./-]\d{2,4}", val.strip()):
+                    continue
 
             out[field] = val
             break
