@@ -31,7 +31,7 @@ class PalletDetailsDialog(QDialog):
 
         main = QVBoxLayout(self)
 
-        info = QLabel("Saisis la colonne 'Livré' (delivered). Les autres colonnes viennent de la base.")
+        info = QLabel("Saisis la colonne 'Rendue'. Les autres colonnes viennent de la base.")
         info.setWordWrap(True)
         main.addWidget(info)
 
@@ -56,7 +56,7 @@ class PalletDetailsDialog(QDialog):
 
             table = QTableWidget()
             table.setColumnCount(4)
-            table.setHorizontalHeaderLabels(["VPE", "Palettes", "Poids", "Livré"])
+            table.setHorizontalHeaderLabels(["VPE", "Palettes", "Poids", "Rendues"])
             table.verticalHeader().setVisible(False)
             table.setAlternatingRowColors(True)
             table.setSelectionBehavior(QTableWidget.SelectRows)

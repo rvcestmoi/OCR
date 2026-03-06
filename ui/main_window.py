@@ -7,6 +7,8 @@ import json
 import fitz  # PyMuPDF
 import os, re, json
 import fitz
+class _DownloadCanceled(Exception):
+        pass
 from datetime import datetime
 from urllib.request import Request, urlopen
 from urllib.parse import urlparse
@@ -32,7 +34,7 @@ from PySide6.QtWidgets import (
     QApplication, QSplitter, QCompleter, QHeaderView
 )
 from webcolors import names
-##from matplotlib import text
+
 from PySide6.QtCore import QObject, QThread, Signal, Slot
 
 from ui.pdf_viewer import PdfViewer
@@ -3876,52 +3878,80 @@ class MainWindow(QMainWindow):
         self._links_worker.progress.connect(lambda v, txt: (self._links_prog.setValue(v), self._links_prog.setLabelText(txt)))
 
         def _done(downloaded_paths: list[str], errors: list[str], canceled: bool):
+            # stop thread download
             try:
-                self._links_prog.close()
+                self._links_thread.quit()
             except Exception:
                 pass
 
-            downloaded_names = []
-
-            # ✅ maintenant (dans le thread UI), on fait l’upsert SQL + json minimal
-            for p in downloaded_paths:
+            if canceled or not downloaded_paths:
                 try:
-                    new_name = os.path.basename(p)
-                    self._upsert_logmail_for_downloaded_file(
-                        nom_pdf=new_name,
-                        entry_id=entry_id,
-                        message_id=message_id,
-                        sujet=sujet,
-                        expediteur=expediteur
-                    )
-                    self._create_minimal_json_no_ocr(p, entry_id)
-                    downloaded_names.append(new_name)
-                except Exception as e:
-                    errors.append(f"{os.path.basename(p)} -> {e}")
+                    self._links_prog.close()
+                except Exception:
+                    pass
+                QMessageBox.information(self, "Liens", "Annulé." if canceled else "Aucun téléchargement.")
+                return
 
-            # refresh table
+            # ✅ maintenant on lance le post-process en thread (BDD + JSON)
+            self._post_thread = QThread(self)
+            self._post_worker = LinkPostProcessWorker(downloaded_paths, entry_id, message_id, sujet, expediteur)
+            self._post_worker.moveToThread(self._post_thread)
+
+            # progress dialog réutilisé
             try:
-                self.load_folder(dest_folder)
+                self._links_prog.setMaximum(len(downloaded_paths))
+                self._links_prog.setValue(0)
+                self._links_prog.setLabelText("Mise à jour BDD/JSON…")
             except Exception:
                 pass
 
-            msg = []
-            if downloaded_names:
-                msg.append("Téléchargés:\n- " + "\n- ".join(downloaded_names))
-            if canceled:
-                msg.append("\nAnnulé.")
-            if errors:
-                msg.append("\nErreurs:\n- " + "\n- ".join(errors[:8]) + ("\n(...)" if len(errors) > 8 else ""))
+            # cancel => post worker
+            try:
+                self._links_prog.canceled.disconnect(self._links_worker.cancel)
+            except Exception:
+                pass
+            self._links_prog.canceled.connect(self._post_worker.cancel)
 
-            QMessageBox.information(self, "Liens", "\n\n".join(msg) if msg else "Aucun téléchargement.")
+            self._post_thread.started.connect(self._post_worker.run)
+            self._post_worker.progress.connect(lambda v, txt: (self._links_prog.setValue(v), self._links_prog.setLabelText(txt)))
 
-            self._links_thread.quit()
+            def _post_done(downloaded_names: list[str], post_errors: list[str], post_canceled: bool):
+                try:
+                    self._links_prog.close()
+                except Exception:
+                    pass
 
-        self._links_worker.finished.connect(_done)
-        self._links_thread.finished.connect(self._links_thread.deleteLater)
-        self._links_worker.finished.connect(self._links_worker.deleteLater)
+                all_errors = (errors or []) + (post_errors or [])
 
-        self._links_thread.start()
+                # ⚠️ refresh folder : peut être lourd, donc on le fait après (et tu peux le désactiver si besoin)
+                try:
+                    self.load_folder(dest_folder)
+                except Exception:
+                    pass
+
+                msg = []
+                if downloaded_names:
+                    msg.append("Téléchargés + ajoutés en base:\n- " + "\n- ".join(downloaded_names))
+                if post_canceled:
+                    msg.append("\nPost-traitement annulé.")
+                if all_errors:
+                    msg.append("\nErreurs:\n- " + "\n- ".join(all_errors[:8]) + ("\n(...)" if len(all_errors) > 8 else ""))
+
+                QMessageBox.information(self, "Liens", "\n\n".join(msg) if msg else "Terminé.")
+
+                try:
+                    self._post_thread.quit()
+                except Exception:
+                    pass
+
+            self._post_worker.finished.connect(_post_done)
+            self._post_thread.start()
+
+            self._links_worker.finished.connect(_done)
+            self._links_thread.finished.connect(self._links_thread.deleteLater)
+            self._links_worker.finished.connect(self._links_worker.deleteLater)
+
+            self._links_thread.start()
 
 
     def _extract_urls_from_pdf(self, pdf_path: str) -> list[str]:
@@ -3957,102 +3987,7 @@ class MainWindow(QMainWindow):
             if u and u not in seen:
                 seen.add(u)
                 out.append(u)
-        return out
-
-
-    class _DownloadCanceled(Exception):
-        pass
-
-    def _download_linked_pdf(self, url: str, dest_folder: str, cancel_cb=None) -> str:
-        os.makedirs(dest_folder, exist_ok=True)
-
-        # nom par défaut basé sur l'URL
-        filename = self._guess_filename_from_url(url)
-        if not filename.lower().endswith(".pdf"):
-            filename = os.path.splitext(filename)[0] + ".pdf"
-
-        target = os.path.join(dest_folder, filename)
-
-        # éviter overwrite
-        if os.path.exists(target):
-            root, ext = os.path.splitext(target)
-            k = 2
-            while os.path.exists(f"{root}_{k}{ext}"):
-                k += 1
-            target = f"{root}_{k}{ext}"
-
-        tmp_target = target + ".part"
-
-        req = Request(url, headers={"User-Agent": "Mozilla/5.0"})
-
-        try:
-            with urlopen(req, timeout=30) as resp:
-                # Content-Disposition peut donner un nom => on ajuste target AVANT d’écrire
-                cd = resp.headers.get("Content-Disposition", "") or ""
-                m = re.search(r'filename="?([^"]+)"?', cd, re.IGNORECASE)
-                if m:
-                    fn = self._safe_filename(m.group(1))
-                    if not fn.lower().endswith(".pdf"):
-                        fn += ".pdf"
-                    target2 = os.path.join(dest_folder, fn)
-                    if not os.path.exists(target2):
-                        target = target2
-                        tmp_target = target + ".part"
-
-                # écriture en chunks (UI reste responsive)
-                with open(tmp_target, "wb") as f:
-                    # lire un petit début pour valider PDF
-                    head = resp.read(5)
-                    if cancel_cb and cancel_cb():
-                        raise _DownloadCanceled()
-
-                    if not head.startswith(b"%PDF"):
-                        raise ValueError("Le lien ne renvoie pas un PDF (%PDF manquant).")
-
-                    f.write(head)
-
-                    while True:
-                        if cancel_cb and cancel_cb():
-                            raise _DownloadCanceled()
-
-                        chunk = resp.read(256 * 1024)  # 256 KB
-                        if not chunk:
-                            break
-                        f.write(chunk)
-
-                        # ✅ laisse respirer l'UI (sinon freeze)
-                        QApplication.processEvents()
-
-            # commit atomique
-            if os.path.exists(target):
-                os.remove(target)
-            os.replace(tmp_target, target)
-            return target
-
-        except _DownloadCanceled:
-            # annulation propre
-            try:
-                if os.path.exists(tmp_target):
-                    os.remove(tmp_target)
-            except Exception:
-                pass
-            raise
-
-        except (HTTPError, URLError) as e:
-            try:
-                if os.path.exists(tmp_target):
-                    os.remove(tmp_target)
-            except Exception:
-                pass
-            raise ValueError(f"Erreur réseau: {e}")
-
-        except Exception:
-            try:
-                if os.path.exists(tmp_target):
-                    os.remove(tmp_target)
-            except Exception:
-                pass
-            raise
+        return out  
 
 
     def _guess_filename_from_url(self, url: str) -> str:
@@ -4455,3 +4390,93 @@ class LinkDownloadWorker(QObject):
         # finir la barre
         self.progress.emit(len(self.urls), f"{len(self.urls)}/{len(self.urls)}")
         self.finished.emit(downloaded, errors, canceled)
+
+class LinkPostProcessWorker(QObject):
+    progress = Signal(int, str)           # (index, label)
+    finished = Signal(list, list, bool)   # (downloaded_names, errors, canceled)
+
+    def __init__(self, pdf_paths: list[str], entry_id: str, message_id: str, sujet: str, expediteur: str):
+        super().__init__()
+        self.pdf_paths = pdf_paths or []
+        self.entry_id = entry_id
+        self.message_id = message_id
+        self.sujet = sujet or ""
+        self.expediteur = expediteur or ""
+        self._cancelled = False
+
+    @Slot()
+    def cancel(self):
+        self._cancelled = True
+
+    def _json_path_for_pdf(self, pdf_path: str) -> str:
+        base_name = os.path.splitext(os.path.basename(pdf_path))[0]
+        model_dir = r"C:\git\OCR\OCR\models"
+        return os.path.join(model_dir, f"{base_name}.json")
+
+    def _create_minimal_json_no_ocr(self, pdf_path: str):
+        json_path = self._json_path_for_pdf(pdf_path)
+        if os.path.exists(json_path):
+            return
+        data = {
+            "entry_id": self.entry_id,
+            "status": "draft",
+            "tags": ["cmr"],
+            "ocr_text": "",
+            "folders": [],
+            "vat_lines": [],
+            "fees": [],
+        }
+        os.makedirs(os.path.dirname(json_path), exist_ok=True)
+        with open(json_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+
+    @Slot()
+    def run(self):
+        downloaded_names = []
+        errors = []
+        canceled = False
+
+        # ✅ repo DB dans le worker (thread-safe car BaseRepository ouvre une connexion par appel)
+        from db.connection import SqlServerConnection
+        from db.config import DB_CONFIG
+        from db.logmail_repository import LogmailRepository
+
+        repo = LogmailRepository(SqlServerConnection(**DB_CONFIG))
+
+        total = len(self.pdf_paths)
+
+        for i, p in enumerate(self.pdf_paths, start=1):
+            if self._cancelled:
+                canceled = True
+                break
+
+            name = os.path.basename(p)
+            self.progress.emit(i - 1, f"BDD/JSON {i}/{total}\n{name}")
+
+            try:
+                # upsert logmail
+                repo.execute(
+                    """
+                    UPDATE XXA_LOGMAIL_228794
+                    SET entry_id = ?, message_id = ?
+                    WHERE nom_pdf = ?;
+
+                    IF @@ROWCOUNT = 0
+                    BEGIN
+                        INSERT INTO XXA_LOGMAIL_228794 (date_creation, message_id, entry_id, nom_pdf, sujet, expediteur)
+                        VALUES (SYSDATETIME(), ?, ?, ?, ?, ?)
+                    END
+                    """,
+                    (self.entry_id, self.message_id, name, self.message_id, self.entry_id, name, self.sujet, self.expediteur),
+                )
+
+                # json minimal
+                self._create_minimal_json_no_ocr(p)
+
+                downloaded_names.append(name)
+
+            except Exception as e:
+                errors.append(f"{name} -> {e}")
+
+        self.progress.emit(total, f"BDD/JSON {total}/{total}")
+        self.finished.emit(downloaded_names, errors, canceled)
