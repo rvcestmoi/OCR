@@ -107,13 +107,18 @@ def extract_text_from_pdf(pdf_path: str) -> str:
     full_text = ""
 
     with tempfile.TemporaryDirectory() as temp_dir:
-        images = convert_from_path(
-            pdf_path,
-            dpi=200,  # ⚡ plus rapide que 300
-            output_folder=temp_dir,
-            fmt="png",
-            poppler_path=POPPLER_PATH
-        )
+        convert_kwargs = {
+            "pdf_path": pdf_path,
+            "dpi": 200,
+            "output_folder": temp_dir,
+            "fmt": "png",
+            "poppler_path": POPPLER_PATH,
+        }
+        if max_pages is not None and max_pages >= 1:
+            convert_kwargs["first_page"] = 1
+            convert_kwargs["last_page"] = max_pages
+
+        images = convert_from_path(**convert_kwargs)
 
         for idx, image in enumerate(images):
 
@@ -156,11 +161,15 @@ def extract_text_from_pdf(pdf_path: str) -> str:
 
 
 
-def extract_text_fast(pdf_path: str) -> str:
+def extract_text_from_pdf(pdf_path: str, max_pages: int | None = None) -> str:
     doc = fitz.open(pdf_path)
     text = ""
 
-    for page in doc:
+    pages = list(doc)
+    if max_pages is not None:
+        pages = pages[:max_pages]
+
+    for page in pages:
         text += page.get_text()
 
     doc.close()

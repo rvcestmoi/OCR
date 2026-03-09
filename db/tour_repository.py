@@ -276,4 +276,37 @@ class TourRepository(BaseRepository):
         motif_db = (motif or "").strip() if is_blocked else None
         self.execute(sql, (tour_nr, 1 if is_blocked else 0, motif_db, 1 if is_blocked else 0, motif_db))
 
+    def get_tournrs_matching_ffnr(self, tournrs: List[str], kundennr: str) -> Set[str]:
+        tournrs = [str(t).strip() for t in (tournrs or []) if str(t).strip()]
+        kundennr = str(kundennr or "").strip()
 
+        if not tournrs or not kundennr:
+            return set()
+
+        placeholders = ",".join(["?"] * len(tournrs))
+        query = f"""
+            SELECT LTRIM(RTRIM(CAST(TourNr AS VARCHAR(20)))) AS TourNr
+            FROM xxatour
+            WHERE LTRIM(RTRIM(CAST(TourNr AS VARCHAR(20)))) IN ({placeholders})
+            AND LTRIM(RTRIM(CAST(FFNR AS VARCHAR(50)))) = ?
+        """
+        rows = self.fetch_all(query, tuple(tournrs) + (kundennr,))
+        return {
+            str(r.get("TourNr") or r.get("tournr") or "").strip()
+            for r in rows
+            if str(r.get("TourNr") or r.get("tournr") or "").strip()
+        }
+
+
+    def get_ffnr_for_tour(self, tournr: str) -> str:
+        tournr = str(tournr or "").strip()
+        if not tournr:
+            return ""
+
+        query = """
+            SELECT TOP 1 LTRIM(RTRIM(CAST(FFNR AS VARCHAR(50)))) AS FFNR
+            FROM xxatour
+            WHERE LTRIM(RTRIM(CAST(TourNr AS VARCHAR(20)))) = ?
+        """
+        row = self.fetch_one(query, (tournr,))
+        return str((row or {}).get("FFNR") or "").strip()

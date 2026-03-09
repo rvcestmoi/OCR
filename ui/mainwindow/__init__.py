@@ -1,0 +1,1 @@
+"""Refactored MainWindow building blocks."""
