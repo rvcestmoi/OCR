@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from .common import *
 from .workers import LinkDownloadWorker, LinkPostProcessWorker, _DownloadCanceled
+import fitz
 
 
 class MainWindowLinksMixin:
@@ -70,7 +71,7 @@ class MainWindowLinksMixin:
 
         # ✅ thread + worker
         self._links_thread = QThread(self)
-        self._links_worker = LinkDownloadWorker(urls, dest_folder)
+        self._links_worker = LinkDownloadWorker(urls, dest_folder, entry_id=entry_id)
         self._links_worker.moveToThread(self._links_thread)
 
         # cancel
@@ -175,6 +176,7 @@ class MainWindowLinksMixin:
                 # liens dans le texte
                 try:
                     txt = page.get_text() or ""
+                    _URL_RE = re.compile(r"(https?://[^\s<>\"]+)", re.IGNORECASE)
                     for m in _URL_RE.findall(txt):
                         urls.append(m)
                 except Exception:
@@ -248,8 +250,7 @@ class MainWindowLinksMixin:
             "tags": ["cmr"],
             "ocr_text": "",
             "folders": [],
-            "vat_lines": [],
-            "fees": [],
+            "vat_lines": []
         }
         os.makedirs(os.path.dirname(json_path), exist_ok=True)
         with open(json_path, "w", encoding="utf-8") as f:

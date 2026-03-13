@@ -15,6 +15,8 @@ class TransporterRepository(BaseRepository):
                 kun.Strasse,
                 kun.Ort,
                 kun.LKZ,
+                kun.PLZ,
+                kun.UstId,
                 bank.KundenNr
             FROM xxakunbank bank
             LEFT JOIN xxakun kun 

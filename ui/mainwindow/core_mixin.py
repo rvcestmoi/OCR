@@ -1,5 +1,5 @@
 from __future__ import annotations
-
+import fitz
 from .common import *
 from .workers import LinkDownloadWorker, LinkPostProcessWorker, _DownloadCanceled
 
@@ -135,12 +135,23 @@ class MainWindowCoreMixin:
         self.current_pdf_path = new_path
 
     def display_pdf(self):
-        pdf_path = self.view_pdf_path or self.current_pdf_path
-        if not pdf_path or not os.path.exists(pdf_path):
+        doc_path = self.view_pdf_path or self.current_pdf_path
+        if not doc_path or not os.path.exists(doc_path):
             return
 
         try:
-            doc = fitz.open(pdf_path)
+            if is_image_document(doc_path):
+                pix = QPixmap(doc_path)
+                if pix.isNull():
+                    raise RuntimeError(f"Impossible de charger l'image : {doc_path}")
+
+                self.pdf_viewer.set_pages([pix])
+                self.lbl_page_info.setText("Image")
+                self.btn_prev_page.setEnabled(False)
+                self.btn_next_page.setEnabled(False)
+                return
+
+            doc = fitz.open(doc_path)
             pixmaps = []
             for page in doc:
                 pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
@@ -148,8 +159,11 @@ class MainWindowCoreMixin:
                 pixmaps.append(QPixmap.fromImage(img))
             self.pdf_viewer.set_pages(pixmaps)
             doc.close()
+
         except Exception as e:
-            QMessageBox.critical(self, "Erreur PDF", str(e))
+            QMessageBox.critical(self, "Erreur document", str(e))
+
+
 
     def refresh_invoice_data(self):
         """Recharge les données pour le PDF sélectionné.
@@ -188,8 +202,6 @@ class MainWindowCoreMixin:
         self._ensure_empty_vat_row()
         self.update_vat_total()
 
-        self.fees_table.setRowCount(0)
-
         # OCR texte + recherche
         self.ocr_text_view.setPlainText("")
         self.search_selections = []
@@ -211,8 +223,12 @@ class MainWindowCoreMixin:
 
     def analyze_pdf(self, checked: bool = False, show_message: bool = False):
 
-        if not self.current_pdf_path:
-            QMessageBox.warning(self, "Erreur", "Aucun PDF sélectionné.")
+        if not is_ocr_allowed_document(self.current_pdf_path):
+            QMessageBox.information(
+                self,
+                "Analyse OCR",
+                "Ce document est une image. Il peut être affiché dans l'application, mais il n'est pas OCRisé."
+            )
             return
         try:
             # 1) prélecture rapide : première page uniquement
@@ -448,138 +464,133 @@ class MainWindowCoreMixin:
         editor.setExtraSelections(updated)
         self.search_counter_label.setText(f"{self.current_match_index + 1} / {len(self.search_selections)}")
 
-    def save_current_data(self, status: str | None = None, show_message: bool = True):
+
+
+    def save_current_data(self, status: str = "draft", show_message: bool = True):
         if not self.current_pdf_path:
-            QMessageBox.warning(self, "Erreur", "Aucun PDF sélectionné.")
-            return
-        self.compact_folder_rows()
-        json_path = self._get_saved_json_path(self.current_pdf_path)
+            if show_message:
+                QMessageBox.warning(self, "Sauvegarde", "Aucun document sélectionné.")
+            return False
 
-        # --- load existing (to preserve extra keys like pallet_details / block_options / etc.) ---
-        existing = {}
-        if os.path.exists(json_path):
-            try:
-                with open(json_path, "r", encoding="utf-8") as f:
-                    existing = json.load(f) or {}
-            except Exception:
-                existing = {}
+        pdf_path = str(self.current_pdf_path).strip()
+        if not pdf_path:
+            if show_message:
+                QMessageBox.warning(self, "Sauvegarde", "Chemin de document invalide.")
+            return False
 
-        existing_status = (existing.get("status") or "").strip()
-        existing_validated_at = (existing.get("validated_at") or "").strip()
+        json_path = self._get_saved_json_path(pdf_path)
 
-        final_status = (status or existing_status or "draft").strip()
-        validated_at = existing_validated_at
-        if status == "validated" and not validated_at:
-            validated_at = datetime.now().isoformat(timespec="seconds")
+        # retrouve l'entry_id même si selected_invoice_entry_id n'est pas rempli
+        current_entry_id = self._resolve_current_entry_id()
 
-        # --- folders + transporter ---
-        folders = self.get_folder_rows()
-
-        trans_kundennr = (self.selected_kundennr or "").strip()
-        # fallback si selected_kundennr n'est pas set mais que le champ contient "Nom (12345)"
-        if not trans_kundennr:
-            m = re.search(r"\((\d+)\)\s*$", self.transporter_input.text() or "")
-            if m:
-                trans_kundennr = m.group(1)
-
-        vat_lines = self.get_vat_rows()
-
-        base_total = 0.0
-        vat_total = 0.0
-        for ln in vat_lines:
-            b = self._parse_amount((ln.get("base") or "").strip())
-            v = self._parse_amount((ln.get("vat") or "").strip())
-            if b is not None:
-                base_total += b
-            if v is not None:
-                vat_total += v
-
-        ttc_total = base_total + vat_total
-
-
-        # --- build data payload ---
-        data = {
-            "iban": self.iban_input.text().strip(),
-            "bic": self.bic_input.text().strip(),
-            "invoice_date": self.date_input.text().strip(),
-            "invoice_number": self.invoice_number_input.text().strip(),
-            "folders": folders,
-            "folder_number": folders[0]["tour_nr"] if folders else "",
-            "fees": self.get_fee_rows(),  
-            "vat_lines": vat_lines,
-            "total_base_ht": round(base_total, 2),
-            "total_vat": round(vat_total, 2),
-            "total_ttc": round(ttc_total, 2),
-            "ocr_text": self.ocr_text_view.toPlainText(),
-            "transporter_kundennr": trans_kundennr,
-            "status": final_status,
-            "validated_at": validated_at,
-        }
-        # --- entry_id + récap CMR ---
-        data["entry_id"] = (self.selected_invoice_entry_id or "").strip()
-        data["cmr_attachments"] = self._collect_cmr_attachments_for_current_entry()
- # --- tags (ex: 'supprime') ---
-        existing_tags = existing.get("tags") or []
-        if isinstance(existing_tags, str):
-            existing_tags = [existing_tags]
-        if not isinstance(existing_tags, list):
-            existing_tags = []
-
-        tags_set = {str(t).strip() for t in existing_tags if str(t).strip()}
-        pending = getattr(self, "_pending_tags_to_add", set()) or set()
-        for t in pending:
-            tt = str(t).strip()
-            if tt:
-                tags_set.add(tt)
-
-        data["tags"] = sorted(tags_set)
-
-        # clear pending tags
+        # relit l'existant pour ne rien perdre
         try:
-            self._pending_tags_to_add.clear()
+            data = self._read_saved_invoice_json(pdf_path) or {}
+        except Exception:
+            data = {}
+
+        # préserve les tags existants
+        tags = data.get("tags") or []
+        if isinstance(tags, str):
+            tags = [tags]
+        if not isinstance(tags, list):
+            tags = []
+        tags = [str(t).strip() for t in tags if str(t).strip()]
+
+        # conserve éventuellement les options de blocage déjà présentes
+        doc_name = os.path.basename(pdf_path)
+        block_info = self.block_options.get(doc_name, {}) if hasattr(self, "block_options") else {}
+        blocked = bool((block_info or {}).get("blocked", False))
+        block_comment = str((block_info or {}).get("comment", "") or "").strip()
+
+        # met à jour uniquement les champs utiles
+        data["entry_id"] = current_entry_id
+        data["status"] = str(status or "draft").strip().lower()
+        data["iban"] = self.iban_input.text().strip()
+        data["bic"] = self.bic_input.text().strip()
+        data["invoice_date"] = self.date_input.text().strip()
+        data["invoice_number"] = self.invoice_number_input.text().strip()
+        data["transporter_text"] = self.transporter_input.text().strip()
+        data["transporter_vat"] = self.transporter_vat_input.text().strip()
+        data["selected_kundennr"] = str(getattr(self, "selected_kundennr", "") or "").strip()
+        data["folders"] = self.get_folder_rows() if hasattr(self, "get_folder_rows") else []
+        data["vat_lines"] = self.get_vat_rows() if hasattr(self, "get_vat_rows") else []
+        data["tags"] = sorted(set(tags))
+        data["blocked"] = blocked
+        data["block_comment"] = block_comment
+
+        # si tu stockes déjà les CMR agrégées sur la facture, on conserve la fonctionnalité
+        try:
+            if hasattr(self, "_collect_cmr_attachments_for_current_entry"):
+                data["cmr_attachments"] = self._collect_cmr_attachments_for_current_entry()
         except Exception:
             pass
 
-        os.makedirs(os.path.dirname(json_path), exist_ok=True)
-
+        # si tu as du texte OCR déjà chargé, on le garde
         try:
-            # merge: keep anything already stored
-            existing.update(data)
+            if hasattr(self, "ocr_text_view") and self.ocr_text_view is not None:
+                data["ocr_text"] = self.ocr_text_view.toPlainText()
+        except Exception:
+            pass
 
+        # écriture disque
+        try:
+            os.makedirs(os.path.dirname(json_path), exist_ok=True)
             with open(json_path, "w", encoding="utf-8") as f:
-                json.dump(existing, f, ensure_ascii=False, indent=2)
-
-            # update left table in real-time
-            self._update_left_table_date_iban_bic(
-                self.current_pdf_path,
-                self.date_input.text().strip(),
-                self.iban_input.text().strip(),
-                self.bic_input.text().strip(),
-)
-            # rafraîchit la couleur de la ligne courante
-            for row in range(self.pdf_table.rowCount()):
-                it0 = self.pdf_table.item(row, 0)
-                if it0 and it0.data(Qt.UserRole) == self.current_pdf_path:
-                    self.refresh_left_row_processing_state(row)
-                    break
-
-            self.apply_left_filter_to_table()
-            # ✅ mettre à jour le status stocké en table + re-filtrer
-            for row in range(self.pdf_table.rowCount()):
-                it0 = self.pdf_table.item(row, 0)
-                if it0 and it0.data(Qt.UserRole) == self.current_pdf_path:
-                    it0.setData(Qt.UserRole + 1, final_status)  # final_status existe dans save_current_data
-                    break
-
-            self.apply_left_filter_to_table()
-
-            if show_message:
-                QMessageBox.information(self, "Sauvegarde", "Données sauvegardées avec succès.")
-            else:
-                self.statusBar().showMessage("Données sauvegardées.", 2500)
-
+                json.dump(data, f, ensure_ascii=False, indent=2)
         except Exception as e:
-            QMessageBox.critical(self, "Erreur sauvegarde", str(e))
+            if show_message:
+                QMessageBox.warning(self, "Sauvegarde", f"Impossible d'écrire le JSON :\n{e}")
+            return False
+
+        # pousse aussi les métadonnées en BDD pour alimenter la liste gauche
+        try:
+            if current_entry_id:
+                self.logmail_repo.update_document_metadata_for_entry(
+                    current_entry_id,
+                    invoice_date=self.date_input.text().strip(),
+                    iban=self.iban_input.text().strip(),
+                    bic=self.bic_input.text().strip(),
+                    status=str(status or "").strip().lower() if status else None,
+                )
+        except Exception as e:
+            # on ne bloque pas la sauvegarde JSON si la synchro SQL échoue
+            if show_message:
+                QMessageBox.warning(
+                    self,
+                    "Sauvegarde",
+                    f"Le JSON a été sauvegardé, mais la mise à jour SQL a échoué :\n{e}"
+                )
+
+        # si on a retrouvé un entry_id, on le garde en mémoire pour la suite
+        if current_entry_id:
+            self.selected_invoice_entry_id = current_entry_id
+
+        # refresh léger de la ligne dans le tableau gauche
+        try:
+            if hasattr(self, "_update_left_table_date_iban_bic"):
+                self._update_left_table_date_iban_bic(
+                    pdf_path,
+                    self.date_input.text().strip(),
+                    self.iban_input.text().strip(),
+                    self.bic_input.text().strip(),
+                )
+        except Exception:
+            pass
+
+        # si un dossier courant est chargé, on peut recharger la liste pour garder les onglets cohérents
+        try:
+            current_folder = str(getattr(self, "current_folder_path", "") or "").strip()
+            if current_folder and os.path.isdir(current_folder):
+                self.load_folder(current_folder)
+        except Exception:
+            pass
+
+        if show_message:
+            self.statusBar().showMessage("Données sauvegardées.", 2500)
+
+        return True
+
 
     def load_saved_data(self):
         if not self.current_pdf_path:
@@ -647,7 +658,6 @@ class MainWindowCoreMixin:
             self._ensure_empty_vat_row()
             self.update_vat_total()
 
-            self.rebuild_fees_from_json(data)
 
             # ✅ dossiers -> table
             self.rebuild_folder_fields_from_json(data)
@@ -706,7 +716,8 @@ class MainWindowCoreMixin:
                 continue
 
             pdf_path = it0.data(Qt.UserRole)
-            if not pdf_path or not os.path.exists(pdf_path):
+            if not is_ocr_allowed_document(pdf_path):
+                skipped += 1
                 continue
 
             # ✅ On OCRise uniquement les non-sauvegardés (pas de JSON)
@@ -720,11 +731,11 @@ class MainWindowCoreMixin:
                 # OCR (sans popup)
                 self.analyze_pdf(show_message=False)
 
-                # ✅ sauvegarde pour créer le JSON + mettre à jour IBAN/BIC dans la table
-                self.save_current_data(status="draft", show_message=False)
+                # sauvegarde OCR, mais on reste en "pending" tant que ce n'est pas validé
+                self.save_current_data(status="pending", show_message=False)
 
-                # status en table (pour filtres)
-                self._set_left_row_status(pdf_path, "draft")
+                # statut en table (pour les filtres)
+                self._set_left_row_status(pdf_path, "pending")
 
                 processed += 1
 
@@ -944,3 +955,41 @@ class MainWindowCoreMixin:
 
         self._claimed_entry_id = None
         self.refresh_left_table_processing_claims()
+
+
+    def _resolve_current_entry_id(self) -> str:
+        """
+        Retrouve l'entry_id courant de façon robuste.
+        Priorité :
+        1) selected_invoice_entry_id
+        2) data déjà présent dans le JSON du document
+        3) lookup SQL via nom du fichier
+        """
+        entry_id = str(getattr(self, "selected_invoice_entry_id", "") or "").strip()
+        if entry_id:
+            return entry_id
+
+        pdf_path = str(getattr(self, "current_pdf_path", "") or "").strip()
+        if not pdf_path:
+            return ""
+
+        # 1) JSON existant
+        try:
+            data = self._read_saved_invoice_json(pdf_path) or {}
+            entry_id = str(data.get("entry_id") or "").strip()
+            if entry_id:
+                return entry_id
+        except Exception:
+            pass
+
+        # 2) BDD via nom du fichier physique
+        try:
+            entry_id = str(
+                self.logmail_repo.get_entry_id_for_file(os.path.basename(pdf_path)) or ""
+            ).strip()
+            if entry_id:
+                return entry_id
+        except Exception:
+            pass
+
+        return ""

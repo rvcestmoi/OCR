@@ -310,3 +310,46 @@ class TourRepository(BaseRepository):
         """
         row = self.fetch_one(query, (tournr,))
         return str((row or {}).get("FFNR") or "").strip()
+    
+
+    def get_aufintnr_by_aufnr(self, aufnr: str) -> str:
+        aufnr = str(aufnr or "").strip()
+        if not aufnr:
+            return ""
+
+        query = """
+            SELECT TOP 1 LTRIM(RTRIM(CAST(aufintnr AS VARCHAR(50)))) AS aufintnr
+            FROM xxaslauf
+            WHERE LTRIM(RTRIM(CAST(aufnr AS VARCHAR(50)))) = ?
+        """
+        row = self.fetch_one(query, (aufnr,))
+        return str((row or {}).get("aufintnr") or "").strip()
+
+    def get_aufnrs_with_cmr_in_ged(self, aufnrs: list[str]) -> set[str]:
+        aufnrs = [str(a).strip() for a in (aufnrs or []) if str(a).strip()]
+        if not aufnrs:
+            return set()
+
+        out: set[str] = set()
+        chunk_size = 200
+
+        for i in range(0, len(aufnrs), chunk_size):
+            chunk = aufnrs[i:i + chunk_size]
+            placeholders = ",".join(["?"] * len(chunk))
+
+            query = f"""
+                SELECT DISTINCT LTRIM(RTRIM(CAST(sw.SWort AS VARCHAR(100)))) AS aufnr
+                FROM XXAArcDoc doc
+                LEFT JOIN XXAArcSW sw ON doc.ArcDocINr = sw.ArcDocINr
+                WHERE doc.Archiv = 'CMR'
+                AND sw.ArcSBINr = 1
+                AND LTRIM(RTRIM(CAST(sw.SWort AS VARCHAR(100)))) IN ({placeholders})
+            """
+
+            rows = self.fetch_all(query, tuple(chunk)) or []
+            for r in rows:
+                aufnr = str(r.get("aufnr") or "").strip()
+                if aufnr:
+                    out.add(aufnr)
+
+        return out

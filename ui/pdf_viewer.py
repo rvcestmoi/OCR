@@ -148,3 +148,7 @@ class PdfViewer(QWidget):
 
     def highlight_field(self, *args, **kwargs) -> None:
         pass
+
+
+    def get_current_page_number(self) -> int:
+        return int(getattr(self, "_current_page", 0)) + 1

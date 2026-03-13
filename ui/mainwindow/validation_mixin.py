@@ -1,4 +1,5 @@
 from __future__ import annotations
+from csv import writer
 
 from .common import *
 from .workers import LinkDownloadWorker, LinkPostProcessWorker, _DownloadCanceled
@@ -19,6 +20,21 @@ class MainWindowValidationMixin:
         if not self._block_validate_if_ht_amounts_not_matching_tours():
             return
 
+        # Vérifie les tournées AVANT toute validation
+        tournrs = sorted({
+            (r.get("tour_nr") or "").strip()
+            for r in self.get_folder_rows()
+            if (r.get("tour_nr") or "").strip()
+        })
+
+        if not tournrs:
+            QMessageBox.warning(
+                self,
+                "Validation",
+                "Aucun dossier (TourNr) trouvé : validation impossible."
+            )
+            return
+
         resp = QMessageBox.question(
             self,
             "Validation facture",
@@ -31,31 +47,31 @@ class MainWindowValidationMixin:
 
         # 1) Toujours re-sauvegarder AVANT les updates SQL
         self.save_current_data(status="validated", show_message=False)
-    
-        # ✅ Met à jour le modèle transporteur (patterns) à la validation
+
+        entry_id = str(getattr(self, "selected_invoice_entry_id", "") or "").strip()
+        if entry_id:
+            try:
+                self.logmail_repo.set_processing_status_for_entry(entry_id, "validated")
+            except Exception as e:
+                QMessageBox.warning(
+                    self,
+                    "Validation",
+                    f"Facture sauvegardée, mais impossible de mettre à jour le statut SQL :\n{e}"
+                )
+
+        # 2) Met à jour le modèle transporteur (patterns)
         try:
             self.save_supplier_model(show_message=False)
         except Exception:
-            # ne bloque pas la validation si le modèle échoue
             pass
 
-        # 2) Déterminer la valeur à appliquer selon blocage
+        # 3) Déterminer la valeur à appliquer selon blocage
         doc_name = os.path.basename(self.current_pdf_path)
         blocked = bool((self.block_options.get(doc_name, {}) or {}).get("blocked", False))
         value = 601 if blocked else 600
         comment = str((self.block_options.get(doc_name, {}) or {}).get("comment", "") or "").strip()
 
-        # 3) Dossiers (TourNr) -> updates SQL
-        tournrs = sorted({
-            (r.get("tour_nr") or "").strip()
-            for r in self.get_folder_rows()
-            if (r.get("tour_nr") or "").strip()
-        })
-
-        if not tournrs:
-            QMessageBox.warning(self, "Validation", "Aucun dossier (TourNr) trouvé : pas de mise à jour SQL.")
-            return
-
+        # 4) Updates SQL
         errors = []
         for t in tournrs:
             try:
@@ -64,27 +80,59 @@ class MainWindowValidationMixin:
             except Exception as e:
                 errors.append(f"{t} : {e}")
 
+        # 5) Copie DMS
+        dms_path = ""
+        dms_error = ""
+        try:
+            dms_path = self._copy_validated_pdf_to_dms()
+        except Exception as e:
+            dms_error = str(e)
+
+        # 5 bis) Export CSV
+        csv_path = ""
+        csv_error = ""
+        try:
+            csv_path = self._export_validation_csv()
+        except Exception as e:
+            csv_error = str(e)
+
+        # 6) Message final unique
         if errors:
-            QMessageBox.warning(
-                self,
-                "Validation",
-                "Facture VALIDÉE et sauvegardée.\n\nErreurs SQL:\n" + "\n".join(errors)
-            )
+            msg = "Facture VALIDÉE et sauvegardée.\n\nErreurs SQL :\n" + "\n".join(errors)
+
+            if dms_path:
+                msg += f"\n\nPDF copié vers :\n{dms_path}"
+            elif dms_error:
+                msg += f"\n\nAttention : copie DMS échouée :\n{dms_error}"
+
+            if csv_path:
+                msg += f"\n\nCSV exporté vers :\n{csv_path}"
+            elif csv_error:
+                msg += f"\n\nAttention : export CSV échoué :\n{csv_error}"
+
+            QMessageBox.warning(self, "Validation", msg)
         else:
             suffix = " (document BLOQUÉ)" if blocked else ""
-            QMessageBox.information(
-                self,
-                "Validation",
-                f"Facture VALIDÉE et sauvegardée. Dossier(s){suffix}."
-            )
+            msg = f"Facture VALIDÉE et sauvegardée. Dossier(s){suffix}."
 
-        # Recharge le pool "En attente" pour faire entrer la suivante
+            if dms_path:
+                msg += f"\n\nPDF copié vers :\n{dms_path}"
+            elif dms_error:
+                msg += f"\n\nCopie DMS échouée :\n{dms_error}"
+
+            if csv_path:
+                msg += f"\n\nCSV exporté vers :\n{csv_path}"
+            elif csv_error:
+                msg += f"\n\nExport CSV échoué :\n{csv_error}"
+
+            QMessageBox.information(self, "Validation", msg)
+
+        # 7) Recharge le pool "En attente"
         try:
             current_folder = getattr(self, "current_folder_path", None)
             if current_folder and os.path.isdir(current_folder):
                 self.load_folder(current_folder)
 
-                # optionnel : sélectionne automatiquement la première ligne du nouveau pool
                 if self.pdf_table.rowCount() > 0:
                     self.pdf_table.selectRow(0)
                     self.on_pdf_selected(0, 0)
@@ -105,32 +153,36 @@ class MainWindowValidationMixin:
 
     def set_left_filter(self, mode: str):
         self.left_filter_mode = mode
-        self.apply_left_filter_to_table()
+
+        current_folder = str(getattr(self, "current_folder_path", "") or "").strip()
+        if current_folder and os.path.isdir(current_folder):
+            self.load_folder(current_folder)
+        else:
+            self.apply_left_table_search_filter()
+
 
     def apply_left_filter_to_table(self):
         if not hasattr(self, "pdf_table") or self.pdf_table is None:
             return
 
+        mode = str(getattr(self, "left_filter_mode", "pending") or "pending").strip().lower()
+
         for row in range(self.pdf_table.rowCount()):
             it0 = self.pdf_table.item(row, 0)
             if not it0:
+                self.pdf_table.setRowHidden(row, True)
                 continue
 
-            deleted = bool(it0.data(Qt.UserRole + 3))
-            if deleted:
-                visible = (self.left_filter_mode == "errors")
-                self.pdf_table.setRowHidden(row, not visible)
-                continue           
+            status = str(it0.data(Qt.UserRole + 1) or "pending").strip().lower()
 
-            status = (it0.data(Qt.UserRole + 1) or "draft").strip()
-
-            if self.left_filter_mode == "pending":
-                visible = (status != "validated")
-            elif self.left_filter_mode == "validated":
+            if mode == "pending":
+                visible = (status == "pending")
+            elif mode == "validated":
                 visible = (status == "validated")
-            elif self.left_filter_mode == "errors":
-                state = (it0.data(Qt.UserRole + 2) or "").strip()
-                visible = (state == "error")
+            elif mode == "errors":
+                visible = (status == "error")
+            else:
+                visible = True
 
             self.pdf_table.setRowHidden(row, not visible)
 
@@ -333,72 +385,7 @@ class MainWindowValidationMixin:
         if not hasattr(self, "pdf_table") or self.pdf_table is None:
             return
         for row in range(self.pdf_table.rowCount()):
-            self.refresh_left_row_processing_state(row)
-
-    def _add_fee_row(self, gebnr: str, bez: str, amount: str = ""):
-        row = self.fees_table.rowCount()
-        self.fees_table.insertRow(row)
-
-        it0 = QTableWidgetItem(str(gebnr))
-        it0.setFlags(it0.flags() & ~Qt.ItemIsEditable)
-        it1 = QTableWidgetItem(str(bez))
-        it1.setFlags(it1.flags() & ~Qt.ItemIsEditable)
-
-        self.fees_table.setItem(row, 0, it0)
-        self.fees_table.setItem(row, 1, it1)
-
-        le = QLineEdit()
-        le.setPlaceholderText("Montant")
-        le.setClearButtonEnabled(True)
-        le.setText("" if amount is None else str(amount))
-        le.mousePressEvent = lambda e, f=le: self.set_active_field(f)  # si tu veux le click->champ actif
-        self.fees_table.setCellWidget(row, 2, le)
-
-    def on_add_fee(self):
-        dlg = GebSearchDialog(self.geb_repo, self)
-
-        if dlg.exec() != QDialog.Accepted or not dlg.selected:
-            return
-
-        gebnr = dlg.selected["gebnr"]
-        bez = dlg.selected["bez"]
-
-        # éviter doublon
-        for r in range(self.fees_table.rowCount()):
-            it = self.fees_table.item(r, 0)
-            if it and it.text().strip() == gebnr:
-                return
-
-        self._add_fee_row(gebnr, bez, "")
-
-    def on_remove_fee(self):
-        rows = sorted({idx.row() for idx in self.fees_table.selectionModel().selectedRows()}, reverse=True)
-        for r in rows:
-            self.fees_table.removeRow(r)
-
-    def get_fee_rows(self):
-        out = []
-        for r in range(self.fees_table.rowCount()):
-            gebnr = (self.fees_table.item(r, 0).text().strip() if self.fees_table.item(r, 0) else "")
-            bez = (self.fees_table.item(r, 1).text().strip() if self.fees_table.item(r, 1) else "")
-            le = self.fees_table.cellWidget(r, 2)
-            amount = (le.text().strip() if le else "")
-            if gebnr or bez or amount:
-                out.append({"gebnr": gebnr, "bez": bez, "amount": amount})
-        return out
-
-    def rebuild_fees_from_json(self, data: dict):
-        self.fees_table.setRowCount(0)
-        fees = data.get("fees", [])
-        if isinstance(fees, list):
-            for f in fees:
-                if not isinstance(f, dict):
-                    continue
-                gebnr = str(f.get("gebnr", "") or "").strip()
-                bez = str(f.get("bez", "") or "").strip()
-                amount = str(f.get("amount", "") or "").strip()
-                if gebnr or bez or amount:
-                    self._add_fee_row(gebnr, bez, amount)
+            self.refresh_left_row_processing_state(row)    
 
     def on_ctrl_s_save(self):
         # Ctrl+S = pas de popup, juste statusbar
@@ -470,7 +457,7 @@ class MainWindowValidationMixin:
         msg.setWindowTitle("Supprimer")
         msg.setText(
             "Marquer ce fichier comme supprimé ?\n\n"
-            f"{filename or os.path.basename(pdf_path)}\n\n"
+            f"{filename or os.path.basename(strip_entry_prefix(os.path.basename(pdf_path)))}\n\n"
             "→ Ajoute le tag 'supprime' au JSON et apparaîtra dans le filtre 'Erreurs'."
         )
         msg.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
@@ -513,14 +500,42 @@ class MainWindowValidationMixin:
         with open(json_path, "w", encoding="utf-8") as f:
             json.dump(existing, f, ensure_ascii=False, indent=2)
 
-        # refresh la ligne dans la table gauche + refiltre
-        for r in range(self.pdf_table.rowCount()):
-            it0 = self.pdf_table.item(r, 0)
-            if it0 and it0.data(Qt.UserRole) == pdf_path:
-                self.refresh_left_row_processing_state(r)
-                break
 
-        self.apply_left_filter_to_table()
+        # met aussi le statut SQL à "error"
+        try:
+            entry_id = ""
+            for r in range(self.pdf_table.rowCount()):
+                it0 = self.pdf_table.item(r, 0)
+                if it0 and it0.data(Qt.UserRole) == pdf_path:
+                    entry_id = str(it0.data(Qt.UserRole + 4) or "").strip()
+                    break
+
+            if not entry_id:
+                entry_id = str(self.logmail_repo.get_entry_id_for_file(os.path.basename(pdf_path)) or "").strip()
+
+            if entry_id:
+                self.logmail_repo.set_processing_status_for_entry(entry_id, "error")
+        except Exception as e:
+            QMessageBox.warning(
+                self,
+                "Suppression",
+                f"Le tag 'supprime' a été enregistré, mais impossible de passer le statut SQL à 'error' :\n{e}"
+            )
+
+
+        # refresh la ligne dans la table gauche + refiltre
+        # recharge le dossier courant pour refléter le statut SQL
+        current_folder = str(getattr(self, "current_folder_path", "") or "").strip()
+        if current_folder and os.path.isdir(current_folder):
+            self.load_folder(current_folder)
+        else:
+            for r in range(self.pdf_table.rowCount()):
+                it0 = self.pdf_table.item(r, 0)
+                if it0 and it0.data(Qt.UserRole) == pdf_path:
+                    self.refresh_left_row_processing_state(r)
+                    break
+            self.apply_left_table_search_filter()
+
         self.statusBar().showMessage("Fichier marqué comme supprimé.", 2500)
 
     def _refresh_transporter_after_bank_autofill(self):
@@ -755,4 +770,120 @@ class MainWindowValidationMixin:
             return False
 
         return True
+    
+    def _copy_validated_pdf_to_dms(self):
+        pdf_path = str(getattr(self, "current_pdf_path", "") or "").strip()
+        if not pdf_path or not os.path.isfile(pdf_path):
+            raise FileNotFoundError("PDF courant introuvable.")
+
+        target_dir = str(DMS_EXPORT_FOLDER or "").strip()
+        if not target_dir:
+            raise RuntimeError("DMS_EXPORT_FOLDER n'est pas configuré.")
+
+        os.makedirs(target_dir, exist_ok=True)
+
+        filename = os.path.basename(pdf_path)
+        target_path = os.path.join(target_dir, filename)
+
+        # évite l’écrasement si le fichier existe déjà
+        if os.path.exists(target_path):
+            base, ext = os.path.splitext(filename)
+            i = 1
+            while True:
+                candidate = os.path.join(target_dir, f"{base}_{i}{ext}")
+                if not os.path.exists(candidate):
+                    target_path = candidate
+                    break
+                i += 1
+
+        shutil.copy2(pdf_path, target_path)
+        return target_path
+    
+    def _collect_validation_csv_rows(self) -> list[list[str]]:
+        """
+        Retourne les lignes CSV :
+        dossier ; aufintnr ; aufnr ; type ; chemin_document
+        """
+        rows: list[list[str]] = []
+
+        # 1) Lignes facture : une ligne par dossier
+        invoice_tours = sorted({
+            str(r.get("tour_nr") or "").strip()
+            for r in (self.get_folder_rows() or [])
+            if str(r.get("tour_nr") or "").strip()
+        })
+
+        invoice_path = str(getattr(self, "current_pdf_path", "") or "").strip()
+
+        for tour_nr in invoice_tours:
+            rows.append([tour_nr, "", "", "Facture", invoice_path])
+
+        # 2) Lignes CMR : une ligne par couple dossier / aufnr
+        seen = set()
+        for p in (self.entry_pdf_paths or []):
+            data = self._read_saved_invoice_json(p) or {}
+
+            # nouveau format page-aware
+            page_links = data.get("cmr_page_links")
+            if isinstance(page_links, list) and page_links:
+                for link in page_links:
+                    tour_nr = str(link.get("tour_nr") or "").strip()
+                    aufnr = str(link.get("auf_nr") or "").strip()
+                    if not tour_nr or not aufnr:
+                        continue
+
+                    key = (tour_nr, aufnr, "CMR", p)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+
+                    try:
+                        aufintnr = self.tour_repo.get_aufintnr_by_aufnr(aufnr)
+                    except Exception:
+                        aufintnr = ""
+
+                    rows.append([tour_nr, aufintnr, aufnr, "CMR", str(p or "").strip()])
+                continue
+
+            # ancien format legacy
+            tour_nr = str(data.get("cmr_tour_nr") or "").strip()
+            aufnr = str(data.get("cmr_auf_nr") or "").strip()
+            if tour_nr and aufnr:
+                key = (tour_nr, aufnr, "CMR", p)
+                if key not in seen:
+                    seen.add(key)
+                    try:
+                        aufintnr = self.tour_repo.get_aufintnr_by_aufnr(aufnr)
+                    except Exception:
+                        aufintnr = ""
+                    rows.append([tour_nr, aufintnr, aufnr, "CMR", str(p or "").strip()])
+
+        return rows
+
+
+    def _export_validation_csv(self) -> str:
+        """
+        Crée un CSV horodaté dans le dossier configurable.
+        Retourne le chemin du fichier créé.
+        """
+        target_dir = str(CSV_EXPORT_FOLDER or "").strip()
+        if not target_dir:
+            raise RuntimeError("CSV_EXPORT_FOLDER n'est pas configuré.")
+
+        os.makedirs(target_dir, exist_ok=True)
+
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        invoice_no = str(self.invoice_number_input.text() or "").strip()
+        safe_invoice_no = re.sub(r'[<>:"/\\\\|?*]+', "_", invoice_no) if invoice_no else "SANS_NUMERO"
+        filename = f"{ts}_{safe_invoice_no}.csv"
+        csv_path = os.path.join(target_dir, filename)
+
+        rows = self._collect_validation_csv_rows()
+
+        with open(csv_path, "w", encoding="utf-8-sig", newline="") as f:
+            writer = csv.writer(f, delimiter=";")
+            writer.writerow(["dossier", "aufintnr", "aufnr", "type", "chemin_document"])
+            writer.writerows(rows)
+
+        return csv_path
 

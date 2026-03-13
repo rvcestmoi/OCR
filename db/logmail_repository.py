@@ -272,3 +272,241 @@ class LogmailRepository(BaseRepository):
                     out[entry_id] = str(first_date or "")
 
         return out
+
+
+    def get_logmail_rows_for_folder(self, folder_path: str) -> list[dict]:
+        """
+        Comme XXA_LOGMAIL_228794 ne stocke pas le chemin dossier,
+        on charge les lignes logmail récentes puis on filtre côté Python
+        avec les fichiers réellement présents dans le dossier.
+        """
+        query = """
+            SELECT
+                entry_id,
+                nom_pdf,
+                processing_user,
+                processing_since,
+                date_creation,
+                message_id,
+                store_id
+            FROM dbo.XXA_LOGMAIL_228794
+            WHERE LTRIM(RTRIM(COALESCE(nom_pdf, ''))) <> ''
+            ORDER BY date_creation ASC, nom_pdf ASC
+        """
+        return self.fetch_all(query) or []
+    
+    def clone_logmail_row_for_split_file(self, source_nom_pdf: str, new_nom_pdf: str, entry_id: str | None = None):
+        """
+        Clone la ligne logmail du PDF source vers un nouveau nom de PDF scindé.
+        On garde message_id / sujet / expediteur / date_mail / store_id.
+        """
+        source_nom_pdf = str(source_nom_pdf or "").strip()
+        new_nom_pdf = str(new_nom_pdf or "").strip()
+        entry_id = str(entry_id or "").strip()
+
+        if not source_nom_pdf or not new_nom_pdf:
+            return
+
+        sql = """
+            ;WITH src AS (
+                SELECT TOP 1
+                    message_id,
+                    entry_id,
+                    sujet,
+                    expediteur,
+                    date_mail,
+                    store_id
+                FROM dbo.XXA_LOGMAIL_228794
+                WHERE nom_pdf = ?
+                ORDER BY date_creation DESC, id_log DESC
+            )
+            UPDATE dbo.XXA_LOGMAIL_228794
+            SET entry_id = COALESCE(NULLIF(?, ''), entry_id)
+            WHERE nom_pdf = ?;
+
+            IF @@ROWCOUNT = 0
+            BEGIN
+                INSERT INTO dbo.XXA_LOGMAIL_228794
+                (
+                    date_creation,
+                    message_id,
+                    entry_id,
+                    nom_pdf,
+                    sujet,
+                    expediteur,
+                    processing_user,
+                    processing_since,
+                    date_mail,
+                    store_id
+                )
+                SELECT
+                    SYSDATETIME(),
+                    src.message_id,
+                    COALESCE(NULLIF(?, ''), src.entry_id),
+                    ?,
+                    src.sujet,
+                    src.expediteur,
+                    NULL,
+                    NULL,
+                    src.date_mail,
+                    src.store_id
+                FROM src
+            END
+        """
+        self.execute(sql, (source_nom_pdf, entry_id, new_nom_pdf, entry_id, new_nom_pdf))
+
+
+    def get_processing_status_for_entry(self, entry_id: str) -> str:
+        entry_id = str(entry_id or "").strip()
+        if not entry_id:
+            return "pending"
+
+        query = """
+            SELECT TOP 1 LTRIM(RTRIM(COALESCE(processing_status, 'pending'))) AS processing_status
+            FROM dbo.XXA_LOGMAIL_228794
+            WHERE entry_id = ?
+        """
+        row = self.fetch_one(query, (entry_id,))
+        return str((row or {}).get("processing_status") or "pending").strip().lower()
+
+
+    def get_processing_status_map_for_entries(self, entry_ids: list[str]) -> dict[str, str]:
+        if not entry_ids:
+            return {}
+
+        out: dict[str, str] = {}
+        chunk_size = 200
+
+        for i in range(0, len(entry_ids), chunk_size):
+            chunk = [e for e in entry_ids[i:i + chunk_size] if e and not str(e).startswith("__NO_ENTRY__")]
+            if not chunk:
+                continue
+
+            placeholders = ",".join(["?"] * len(chunk))
+            query = f"""
+                SELECT entry_id, MAX(LTRIM(RTRIM(COALESCE(processing_status, 'pending')))) AS processing_status
+                FROM dbo.XXA_LOGMAIL_228794
+                WHERE entry_id IN ({placeholders})
+                GROUP BY entry_id
+            """
+            rows = self.fetch_all(query, tuple(chunk)) or []
+            for r in rows:
+                entry_id = str(r.get("entry_id") or "").strip()
+                status = str(r.get("processing_status") or "pending").strip().lower()
+                if entry_id:
+                    out[entry_id] = status or "pending"
+
+        return out
+
+
+    def set_processing_status_for_entry(self, entry_id: str, status: str) -> None:
+        entry_id = str(entry_id or "").strip()
+        status = str(status or "").strip().lower()
+
+        if not entry_id:
+            return
+        if status not in {"pending", "validated", "error"}:
+            raise ValueError(f"Statut invalide: {status}")
+
+        query = """
+            UPDATE dbo.XXA_LOGMAIL_228794
+            SET processing_status = ?
+            WHERE entry_id = ?
+        """
+        self.execute(query, (status, entry_id))
+
+
+    def get_document_rows_for_folder(self, folder_path: str, status: str, limit: int | None = None) -> list[dict]:
+        """
+        Retourne les lignes groupées par entry_id pour alimenter le tableau de gauche.
+        Le disque sert ensuite uniquement à vérifier que le fichier existe.
+        """
+        status = str(status or "pending").strip().lower()
+        if status not in {"pending", "validated", "error"}:
+            status = "pending"
+
+        top_clause = ""
+        if limit is not None and int(limit) > 0:
+            top_clause = f"TOP {int(limit)}"
+
+        query = f"""
+            ;WITH base AS (
+                SELECT
+                    entry_id,
+                    nom_pdf,
+                    processing_status,
+                    invoice_date,
+                    iban,
+                    bic,
+                    doc_type,
+                    date_creation,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY entry_id
+                        ORDER BY date_creation ASC, id_log ASC
+                    ) AS rn
+                FROM dbo.XXA_LOGMAIL_228794
+                WHERE LTRIM(RTRIM(COALESCE(nom_pdf, ''))) <> ''
+                AND LTRIM(RTRIM(COALESCE(processing_status, 'pending'))) = ?
+            )
+            SELECT {top_clause}
+                entry_id,
+                nom_pdf,
+                processing_status,
+                invoice_date,
+                iban,
+                bic,
+                doc_type,
+                date_creation
+            FROM base
+            WHERE rn = 1
+            ORDER BY date_creation ASC, nom_pdf ASC
+        """
+        return self.fetch_all(query, (status,)) or []
+    
+
+    def get_files_for_entry(self, entry_id: str) -> list[dict]:
+        entry_id = str(entry_id or "").strip()
+        if not entry_id:
+            return []
+
+        query = """
+            SELECT
+                nom_pdf,
+                entry_id,
+                processing_status,
+                invoice_date,
+                iban,
+                bic,
+                doc_type,
+                date_creation
+            FROM dbo.XXA_LOGMAIL_228794
+            WHERE entry_id = ?
+            ORDER BY date_creation ASC, id_log ASC
+        """
+        return self.fetch_all(query, (entry_id,)) or []
+    
+
+    def update_document_metadata_for_entry(self, entry_id: str, *, invoice_date: str = "", iban: str = "", bic: str = "", status: str | None = None):
+        entry_id = str(entry_id or "").strip()
+        if not entry_id:
+            return
+
+        params = [str(invoice_date or "").strip(), str(iban or "").strip(), str(bic or "").strip()]
+        set_parts = [
+            "invoice_date = ?",
+            "iban = ?",
+            "bic = ?",
+        ]
+
+        if status is not None:
+            set_parts.append("processing_status = ?")
+            params.append(str(status or "").strip().lower())
+
+        params.append(entry_id)
+
+        query = f"""
+            UPDATE dbo.XXA_LOGMAIL_228794
+            SET {", ".join(set_parts)}
+            WHERE entry_id = ?
+        """
+        self.execute(query, tuple(params))

@@ -36,9 +36,9 @@ class MainWindowDocumentsMixin:
             name = str(name).strip()
             if not name:
                 continue
-            if not name.lower().endswith(".pdf"):
-                continue
             full_path = os.path.join(current_dir, name)
+            if not is_supported_document(full_path):
+                continue
             if os.path.exists(full_path) and full_path not in paths:
                 paths.append(full_path)
 
@@ -376,126 +376,113 @@ class MainWindowDocumentsMixin:
                 "Vous pouvez en choisir un autre via : 'Analyser un dossier'."
             )
 
+
     def load_folder(self, folder: str):
-        """Remplit la liste de PDFs à partir d'un dossier (avec IBAN/BIC + status pour filtres)."""
+        if not folder or not os.path.isdir(folder):
+            return
+
         self.current_folder_path = folder
-        # --- Sécurité : si la table a été détruite, on évite le crash ---
-        if not hasattr(self, "pdf_table") or self.pdf_table is None or not isValid(self.pdf_table):
-            tbl = self.findChild(QTableWidget, "pdf_table")
-            if tbl is not None and isValid(tbl):
-                self.pdf_table = tbl
-            else:
-                return
-
         self.pdf_table.setRowCount(0)
 
+        mode = str(getattr(self, "left_filter_mode", "pending") or "pending").strip().lower()
+        sql_status = "error" if mode == "errors" else mode
+        limit = int(getattr(self, "pending_pool_size", 3) or 3) if sql_status == "pending" else None
+
         try:
-            pdf_files = [f for f in sorted(os.listdir(folder)) if f.lower().endswith(".pdf")]
+            rows = self.logmail_repo.get_document_rows_for_folder(folder, sql_status, limit=limit)
         except Exception as e:
-            QMessageBox.critical(self, "Erreur", f"Impossible de lire le dossier :\n{folder}\n\n{e}")
+            QMessageBox.warning(self, "Chargement dossier", f"Erreur lecture XXA_LOGMAIL_228794 :\n{e}")
             return
-
-        self.pdf_table.setRowCount(0)
-
-        try:
-            pdf_files = [f for f in sorted(os.listdir(folder)) if f.lower().endswith(".pdf")]
-        except Exception as e:
-            QMessageBox.critical(self, "Erreur", f"Impossible de lire le dossier :\n{folder}\n\n{e}")
-            return
-
-        # ✅ mapping nom_pdf -> entry_id (en batch)
-        try:
-            entry_map = self.logmail_repo.get_entry_ids_for_files(pdf_files) or {}
-        except Exception:
-            entry_map = {}
-
-        # ✅ group by entry_id
-        groups: dict[str, list[str]] = {}
-        for fn in pdf_files:
-            entry_id = entry_map.get(fn)
-            if not entry_id:
-                entry_id = f"__NO_ENTRY__::{fn}"
-            groups.setdefault(entry_id, []).append(fn)
-
-
-        # ✅ construire les lignes (1 ligne par entry_id)
 
         rows_to_add = []
-        for entry_id, files in groups.items():
-            group_paths = [os.path.join(folder, f) for f in files if os.path.exists(os.path.join(folder, f))]
-            if not group_paths:
+
+        for r in rows:
+            entry_id = str(r.get("entry_id") or "").strip()
+
+            stored_filename = str(r.get("nom_pdf") or "").strip()
+            if not stored_filename:
                 continue
 
-            rep_path = self._choose_representative_pdf(group_paths)
-            if not rep_path:
-                rep_path = group_paths[0]
-            rep_filename = os.path.basename(rep_path)
-            status = self._get_saved_status_for_pdf(rep_path)
+            rep_path = os.path.join(folder, stored_filename)
+            if not os.path.exists(rep_path):
+                continue
 
-            rows_to_add.append((rep_filename, rep_path, entry_id, group_paths, status))
+            display_filename = strip_entry_prefix(stored_filename)
 
-        # ordre métier depuis XXA_LOGMAIL pour les vrais entry_id
-        try:
-            entry_order_map = self.logmail_repo.get_entry_creation_order_map(
-                [entry_id for _, _, entry_id, _, _ in rows_to_add]
-            ) or {}
-        except Exception:
-            entry_order_map = {}
+            try:
+                if not is_supported_document(rep_path):
+                    continue
+            except Exception:
+                pass
 
-        def _sort_key(row):
-            rep_filename, rep_path, entry_id, group_paths, status = row
-            order_key = entry_order_map.get(entry_id, "9999-12-31 23:59:59")
-            return (order_key, rep_filename.lower())
+            try:
+                files = self.logmail_repo.get_files_for_entry(entry_id) or []
+            except Exception:
+                files = []
 
-        rows_to_add.sort(key=_sort_key)
+            group_paths = []
+            for f in files:
+                name = str(f.get("nom_pdf") or "").strip()
+                if not name:
+                    continue
+                p = os.path.join(folder, name)
+                if os.path.exists(p):
+                    group_paths.append(p)
 
-        # Pool uniquement pour les factures en attente
-        if getattr(self, "left_filter_mode", "pending") == "pending":
-            pool_size = int(getattr(self, "pending_pool_size", 3) or 3)
-            rows_to_add = [r for r in rows_to_add if str(r[4] or "").strip().lower() != "validated"][:pool_size]
+            if not group_paths:
+                group_paths = [rep_path]
 
-        for row, (rep_filename, rep_path, entry_id, group_paths, status) in enumerate(rows_to_add):
-            invoice_date, iban, bic = self._get_saved_date_iban_bic_for_pdf(rep_path)
+            rows_to_add.append(
+                (
+                    display_filename,
+                    rep_path,
+                    entry_id,
+                    group_paths,
+                    str(r.get("processing_status") or "pending").strip().lower(),
+                    str(r.get("invoice_date") or "").strip(),
+                    str(r.get("iban") or "").strip(),
+                    str(r.get("bic") or "").strip(),
+                )
+            )
 
-            self.pdf_table.insertRow(row)
+        self.pdf_table.setRowCount(len(rows_to_add))
 
-            extra = max(0, len(group_paths) - 1)
-            display_name = rep_filename if extra == 0 else f"{rep_filename} (+{extra})"
+        for row_index, (rep_filename, rep_path, entry_id, group_paths, status, invoice_date, iban, bic) in enumerate(rows_to_add):
+            it0 = QTableWidgetItem(rep_filename)
+            it0.setData(Qt.UserRole, rep_path)
+            it0.setData(Qt.UserRole + 1, status)
+            it0.setData(Qt.UserRole + 4, entry_id)
+            it0.setData(Qt.UserRole + 5, group_paths)
 
-            it0 = QTableWidgetItem(display_name)
+            self.pdf_table.setItem(row_index, 0, it0)
+            self.pdf_table.setItem(row_index, 1, QTableWidgetItem(invoice_date))
+            self.pdf_table.setItem(row_index, 2, QTableWidgetItem(iban))
+            self.pdf_table.setItem(row_index, 3, QTableWidgetItem(bic))
 
-            names = "\n".join([os.path.basename(p) for p in group_paths])
-            it0.setToolTip(f"entry_id: {entry_id}\nDocuments: {len(group_paths)}\n\n{names}")
-            it0.setData(Qt.UserRole, rep_path)           # chemin du PDF représentant
-            it0.setData(Qt.UserRole + 1, status)         # status pour filtres
-            it0.setData(Qt.UserRole + 4, entry_id)       # ✅ entry_id du groupe
-            it0.setData(Qt.UserRole + 5, group_paths)    # ✅ liste complète des PDFs du groupe
-
-           
-
-            self.pdf_table.setItem(row, 0, it0)
-            self.pdf_table.setItem(row, 1, QTableWidgetItem(invoice_date))
-            self.pdf_table.setItem(row, 2, QTableWidgetItem(iban))
-            self.pdf_table.setItem(row, 3, QTableWidgetItem(bic))
-
-        self.current_pdf_path = None
-        self.clear_fields()
-
-
-        # Appliquer le filtre courant (pending/validated/errors)
-        if hasattr(self, "apply_left_filter_to_table"):
-            self.apply_left_filter_to_table()
         self.refresh_left_table_processing_states()
-        self.apply_left_filter_to_table()
         self.refresh_left_table_processing_claims()
-
-        # reset panneau de droite
-        self.current_pdf_path = None
-        self.clear_fields()
         self.apply_left_table_search_filter()
 
+
+
     def _get_saved_json_path(self, pdf_path: str) -> str:
-        base_name = os.path.splitext(os.path.basename(pdf_path))[0]
+        file_name = os.path.basename(str(pdf_path or "").strip())
+        base_name, _ = os.path.splitext(file_name)
+
+        # sécurité supplémentaire : si le fichier n'a pas encore de préfixe
+        # mais qu'on sait retrouver l'entry_id, on le rajoute au nom JSON
+        if ENTRY_FILE_SEPARATOR not in file_name:
+            entry_id = ""
+            try:
+                entry_id = str(
+                    self.logmail_repo.get_entry_id_for_file(file_name) or ""
+                ).strip()
+            except Exception:
+                entry_id = ""
+
+            if entry_id:
+                base_name = f"{entry_id}{ENTRY_FILE_SEPARATOR}{base_name}"
+
         model_dir = r"C:\git\OCR\OCR\models"
         return os.path.join(model_dir, f"{base_name}.json")
 
@@ -595,18 +582,38 @@ class MainWindowDocumentsMixin:
         if not hasattr(self, "pdf_table") or self.pdf_table is None:
             return
 
+        mode = str(getattr(self, "left_filter_mode", "pending") or "pending").strip().lower()
+
         query = ""
         if hasattr(self, "left_search_input") and self.left_search_input is not None:
             query = (self.left_search_input.text() or "").strip().lower()
 
         for row in range(self.pdf_table.rowCount()):
-            values = []
+            it0 = self.pdf_table.item(row, 0)
+            if not it0:
+                self.pdf_table.setRowHidden(row, True)
+                continue
 
+            status = str(it0.data(Qt.UserRole + 1) or "pending").strip().lower()
+
+            # 1) filtre d'onglet
+            if mode == "pending":
+                status_visible = (status == "pending")
+            elif mode == "validated":
+                status_visible = (status == "validated")
+            elif mode == "errors":
+                status_visible = (status == "error")
+            else:
+                status_visible = True
+
+            # 2) filtre de recherche
+            values = []
             for col in range(min(self.pdf_table.columnCount(), 4)):
                 it = self.pdf_table.item(row, col)
                 values.append((it.text() if it else "").strip().lower())
 
             haystack = " | ".join(values)
+            search_visible = (not query) or (query in haystack)
 
-            visible = (not query) or (query in haystack)
-            self.pdf_table.setRowHidden(row, not visible)
+            # 3) combinaison des deux
+            self.pdf_table.setRowHidden(row, not (status_visible and search_visible))

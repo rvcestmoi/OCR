@@ -88,75 +88,117 @@ class MainWindowTransportTablesMixin:
             self.iban_input.setStyleSheet("background-color: #fff3cd;")
             self.bic_input.setStyleSheet("background-color: #fff3cd;")
 
+
     def load_transporter_information(self, force_by_kundennr: bool = False):
-        self.transporter_info.clear()
-        self.transporter_vat_input.setText("")
-
-        iban = self.iban_input.text().strip()
-        bic = self.bic_input.text().strip()
-        # si on est en mode transporteur sélectionné, on privilégie KundenNr
-        if self.transporter_selected_mode and self.selected_kundennr:
-            force_by_kundennr = True
-
-
         try:
-            record = None
+            self.transporter_info.clear()
 
-            # 1) si on force KundenNr (sélection transporteur) OU si IBAN/BIC absents mais KundenNr connu
-            if force_by_kundennr or ((not iban or not bic) and self.selected_kundennr):
-                record = self.transporter_repo.find_transporter_by_kundennr(self.selected_kundennr)
+            kundennr = ""
+            transporter = None
 
-            # 2) sinon comportement existant : chercher par banque
-            elif iban and bic:
-                record = self.transporter_repo.find_transporter_by_bank(iban, bic)
+            if force_by_kundennr:
+                kundennr = str(getattr(self, "selected_kundennr", "") or "").strip()
+                if not kundennr:
+                    self.transporter_info.setPlainText("ℹ️ Aucun transporteur sélectionné.")
+                    return
 
-            if not record:
-                self.transporter_info.setPlainText("❌ Transporteur non trouvé en base.")
-                self.transporter_vat_input.setText("")
-                self._set_transporter_match_color(False)
+                transporter = self.transporter_repo.find_transporter_by_kundennr(kundennr)
+
+            else:
+                iban = self.iban_input.text().strip()
+                bic = self.bic_input.text().strip()
+
+                if not iban or not bic:
+                    self.transporter_info.setPlainText("ℹ️ Aucun IBAN/BIC renseigné.")
+                    return
+
+                transporter = self.transporter_repo.find_transporter_by_bank(iban, bic)
+                if transporter:
+                    kundennr = str(transporter.get("KundenNr") or "").strip()
+                    self.selected_kundennr = kundennr
+                else:
+                    self.selected_kundennr = None
+
+            if not transporter:
+                if force_by_kundennr and kundennr:
+                    self.transporter_info.setPlainText(f"❌ Transporteur introuvable : {kundennr}")
+                else:
+                    self.transporter_info.setPlainText("❌ Aucun transporteur trouvé pour cet IBAN / SWIFT.")
                 return
 
-            kundennr = record.get("KundenNr") or record.get("kundennr") or ""
+            if not kundennr:
+                kundennr = str(transporter.get("KundenNr") or "").strip()
 
-            # ✅ Charger le N° TVA (UstId) du transporteur
-            try:
-                vat_row = self.transporter_repo.get_ustid_by_kundennr(str(kundennr))
-                ustid = ""
-                if vat_row:
-                    ustid = vat_row.get("UstId") or vat_row.get("ustid") or ""
-                self.transporter_vat_input.setText(str(ustid).strip())
-            except Exception:
-                # on laisse vide si erreur SQL
-                self.transporter_vat_input.setText("")
-            name = record.get("name1", "")
+            self.selected_kundennr = kundennr
 
-            self.selected_kundennr = str(kundennr) if kundennr is not None else None
+            transporter_name = str(transporter.get("name1", "") or "").strip()
+            vat_no = str(transporter.get("USTIDNR", "") or "").strip()
 
-            # ⚠️ Important : ne pas déclencher search_transporters quand on set le texte
-            self.transporter_input.blockSignals(True)
-            self.transporter_input.setText(f"{name} ({kundennr})")
-            self.transporter_input.blockSignals(False)
+            if transporter_name and kundennr:
+                self.transporter_input.setText(f"{transporter_name} ({kundennr})")
+            elif transporter_name:
+                self.transporter_input.setText(transporter_name)
+            elif kundennr:
+                self.transporter_input.setText(kundennr)
 
-            self.current_db_iban = record.get("IBAN", "") or ""
-            self.current_db_bic = record.get("SWIFT", "") or ""
+            self.transporter_vat_input.setText(vat_no)
 
-            text = (
-                f"🏦 Banque : {record.get('BankName', '')}\n"
-                f"IBAN : {record.get('IBAN', '')}\n"
-                f"SWIFT : {record.get('SWIFT', '')}\n\n"
-                f"🚚 Transporteur : {record.get('name1', '')}\n"
-                f"Adresse : {record.get('Strasse', '')}\n"
-                f"Ville : {record.get('Ort', '')+record.get('PLZ', '')}\n"
-                f"Pays : {record.get('LKZ', '')}"
-            )
-            self.transporter_info.setPlainText(text)
+            banks = self.bank_repo.get_all_bank_infos_by_kundennr(kundennr)
 
-            self.enable_transporter_update()
-            self.update_transporter_vs_dossiers_status()
+            lines = []
+            lines.append(f"Transporteur : {str(transporter.get('name1', '') or '').strip()}")
+
+            address_line = [
+                str(transporter.get("Strasse", "") or "").strip(),
+                str(transporter.get("PLZ", "") or "").strip(),
+                str(transporter.get("Ort", "") or "").strip(),
+                str(transporter.get("LKZ", "") or "").strip(),
+            ]
+            address_line = [p for p in address_line if p]
+
+            ustid = str(transporter.get("UstId", "") or "").strip()
+
+            if address_line:
+                lines.append("Adresse : " + ", ".join(address_line))
+
+            if ustid:
+                lines.append(f"N°TVA : {ustid}")
+
+            if banks:
+                lines.append("")
+                lines.append("IBAN / SWIFT :")
+                seen = set()
+
+                for b in banks:
+                    iban = str(b.get("iban", "") or "").strip()
+                    bic = str(b.get("bic", "") or "").strip()
+
+                    key = (iban, bic)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+
+                    if iban or bic:
+                        lines.append(f"  - {iban} | {bic}")
+            else:
+                lines.append("")
+                lines.append("IBAN / SWIFT : aucun trouvé")
+
+            self.transporter_info.setPlainText("\n".join(lines))
+
+            # mémorise la banque actuellement affichée pour le bouton de mise à jour
+            if force_by_kundennr:
+                first_bank = banks[0] if banks else {}
+                self.current_db_iban = str(first_bank.get("iban", "") or "").strip()
+                self.current_db_bic = str(first_bank.get("bic", "") or "").strip()
+            else:
+                self.current_db_iban = str(transporter.get("IBAN", "") or "").strip()
+                self.current_db_bic = str(transporter.get("SWIFT", "") or "").strip()
 
         except Exception as e:
             self.transporter_info.setPlainText(f"Erreur chargement transporteur :\n{e}")
-            self._set_transporter_match_color(False)
+
+
 
     def on_bank_fields_changed(self):
         self.check_bank_information()
@@ -292,7 +334,7 @@ class MainWindowTransportTablesMixin:
                 f"Total MPL : {info.get('Total_MPL', '')}"
             )
 
-            self.transporter_info.setPlainText(txt)
+            self.tour_info.setPlainText(txt)
 
         except Exception as e:
             self.tour_info.setPlainText(f"Erreur chargement tour :\n{e}")

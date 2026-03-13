@@ -18,7 +18,7 @@ class BlockOptionsDialog(QDialog):
         root.addWidget(QLabel(f"Document : {document_name}"))
 
         self.chk_block = QCheckBox("Bloquer ce document")
-        self.chk_block.setChecked(bool(blocked))
+        self.chk_block.setChecked(True)
         root.addWidget(self.chk_block)
 
         root.addWidget(QLabel("Commentaire :"))

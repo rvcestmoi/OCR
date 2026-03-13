@@ -18,10 +18,11 @@ class LinkDownloadWorker(QObject):
         progress = Signal(int, str)          # (index, label)
         finished = Signal(list, list, bool)  # (downloaded_paths, errors, canceled)
 
-        def __init__(self, urls: list[str], dest_folder: str, parent=None):
-            super().__init__(parent)
+        def __init__(self, urls, dest_folder, entry_id=""):
+            super().__init__()
             self.urls = urls
             self.dest_folder = dest_folder
+            self.entry_id = entry_id           
             self._cancelled = False
             self._current_resp = None
 
@@ -93,7 +94,9 @@ class LinkDownloadWorker(QObject):
                                 fn += ".pdf"
                             filename = fn
 
-                        target = self._unique_path(os.path.join(self.dest_folder, filename))
+                        stored_filename = self.build_storage_filename(getattr(self, "entry_id", ""), filename)
+                        target = self._unique_path(os.path.join(self.dest_folder, stored_filename))
+
                         tmp = target + ".part"
 
                         with open(tmp, "wb") as f:
@@ -173,8 +176,7 @@ class LinkPostProcessWorker(QObject):
                 "tags": ["cmr"],
                 "ocr_text": "",
                 "folders": [],
-                "vat_lines": [],
-                "fees": [],
+                "vat_lines": []
             }
             os.makedirs(os.path.dirname(json_path), exist_ok=True)
             with open(json_path, "w", encoding="utf-8") as f:

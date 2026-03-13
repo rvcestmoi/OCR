@@ -33,7 +33,6 @@ class MainWindow(
         from db.tour_repository import TourRepository
         from ui.ocr_text_view import OcrTextView
         from db.tour_repository import TourRepository
-        from db.geb_repository import GebRepository
         from ocr.folder_patterns import DOSSIER_PATTERN, is_valid_folder_number
         self.current_folder_path: str | None = None
         self.pending_pool_size = 300
@@ -47,7 +46,6 @@ class MainWindow(
         self.transporter_repo = TransporterRepository(self.db_conn)
         self.bank_repo = BankRepository(self.db_conn)
         self.tour_repo = TourRepository(self.db_conn)
-        self.geb_repo = GebRepository(self.db_conn)
         self.DOSSIER_PATTERN = DOSSIER_PATTERN
         # --- State ---
         self.current_pdf_path: str | None = None
@@ -92,11 +90,8 @@ class MainWindow(
         # =========================
         # Panneau gauche (splitter)
         # =========================
-        # =========================
-        # Panneau gauche (sans partie basse)
-        # =========================
         left_widget = QWidget()
-        left_layout = QVBoxLayout(left_widget)
+        left_root_layout = QVBoxLayout(left_widget)
 
         self.btn_scan_folder = QPushButton("📂 Analyser un dossier")
         self.btn_scan_folder.clicked.connect(self.select_folder)
@@ -104,10 +99,16 @@ class MainWindow(
         self.btn_ocr_all = QPushButton("⚙️ OCRiser")
         self.btn_ocr_all.clicked.connect(self.ocr_all_pdfs)
 
-        left_layout.addWidget(self.btn_ocr_all)
-        #left_layout.addWidget(self.btn_scan_folder)
+        # Splitter vertical : tableau en haut / infos transporteur en bas
+        left_splitter = QSplitter(Qt.Vertical)
 
-        self.pdf_table = QTableWidget(left_widget)
+        # --- Haut gauche : filtres + recherche + tableau ---
+        left_top_widget = QWidget()
+        left_layout = QVBoxLayout(left_top_widget)
+
+        left_layout.addWidget(self.btn_ocr_all)
+
+        self.pdf_table = QTableWidget(left_top_widget)
         self.pdf_table.setObjectName("pdf_table")
         self.pdf_table.setColumnCount(4)
         self.pdf_table.setHorizontalHeaderLabels(["Nom du fichier", "Date", "IBAN", "BIC"])
@@ -127,7 +128,6 @@ class MainWindow(
         self.pdf_table.customContextMenuRequested.connect(self.on_pdf_table_context_menu)
         self.pdf_table.currentCellChanged.connect(self._on_pdf_current_cell_changed)
 
-        # --- filtres (en haut du tableau gauche) ---
         self.left_filter_mode = "pending"
 
         filter_bar = QHBoxLayout()
@@ -142,7 +142,6 @@ class MainWindow(
         self.btn_filter_errors = QPushButton("⚠️ Erreurs")
         self.btn_filter_errors.setCheckable(True)
 
-        # exclusif
         self._filter_group = QButtonGroup(self)
         self._filter_group.setExclusive(True)
         self._filter_group.addButton(self.btn_filter_pending)
@@ -160,15 +159,38 @@ class MainWindow(
         self.btn_filter_validated.clicked.connect(lambda: self.set_left_filter("validated"))
         self.btn_filter_errors.clicked.connect(lambda: self.set_left_filter("errors"))
 
-
         self.left_search_input = QLineEdit()
-        self.left_search_input.setPlaceholderText("🔎 Rechercher")
+        self.left_search_input.setPlaceholderText("🔎 Rechercher fichier / date / IBAN / BIC…")
         self.left_search_input.textChanged.connect(self.apply_left_table_search_filter)
         left_layout.addWidget(self.left_search_input)
 
         left_layout.addWidget(self.pdf_table)
 
-        main_layout.addWidget(left_widget, 2)        
+        # --- Bas gauche : infos transporteur ---
+        left_bottom_widget = QWidget()
+        left_bottom_layout = QVBoxLayout(left_bottom_widget)
+        left_bottom_layout.addWidget(QLabel("🚚 Informations transporteur"))
+
+        self.transporter_info = QPlainTextEdit()
+        self.transporter_info.setReadOnly(True)
+        self.transporter_info.setPlaceholderText("Informations transporteur / banque…")
+        self.transporter_info.setMinimumHeight(140)
+        font = self.transporter_info.font()
+        font.setPointSize(max(8, font.pointSize() - 1))
+        self.transporter_info.setFont(font)
+        
+        left_bottom_layout.addWidget(self.transporter_info)
+
+
+
+        left_splitter.addWidget(left_top_widget)
+        left_splitter.addWidget(left_bottom_widget)
+        left_splitter.setStretchFactor(0, 4)
+        left_splitter.setStretchFactor(1, 2)
+
+        left_root_layout.addWidget(left_splitter)
+        main_layout.addWidget(left_widget, 2)    
+
 
         left_bottom_widget = QWidget()
         left_bottom_layout = QVBoxLayout(left_bottom_widget)
@@ -263,13 +285,12 @@ class MainWindow(
         self.block_options = {}   # { "nom_fichier.pdf": {"blocked": bool, "comment": str} }
 
 
-        # --- Volet info (transporteur/tour) ---
-        self.transporter_info = QPlainTextEdit()
-        self.transporter_info.setReadOnly(True)
-        self.transporter_info.setMaximumHeight(120)
-        self.transporter_info.setPlaceholderText("Informations transporteur (BDD)…")
-        center_panel.addWidget(self.transporter_info)
-
+        # --- Volet info dossier / tournée ---
+        self.tour_info = QPlainTextEdit()
+        self.tour_info.setReadOnly(True)
+        self.tour_info.setMaximumHeight(140)
+        self.tour_info.setPlaceholderText("Informations dossier / tournée…")
+        center_panel.addWidget(self.tour_info)
         # =========================
         # Panneau droit (form)
         # =========================
@@ -356,40 +377,11 @@ class MainWindow(
         self.lbl_vat_total.setStyleSheet("padding:4px;")
 
         # =========================
-        # Frais (table au-dessus de TVA)
-        # =========================
-        self.fees_table = QTableWidget(0, 3)
-        self.fees_table.setHorizontalHeaderLabels(["GebNr", "Désignation", "Montant"])
-        self.fees_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
-        self.fees_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
-        self.fees_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
-        self.fees_table.setAlternatingRowColors(True)
-        self.fees_table.setSelectionBehavior(QTableWidget.SelectRows)
-        self.fees_table.setEditTriggers(QTableWidget.NoEditTriggers)
-        self.fees_table.setMinimumHeight(50)
-        self.fees_table.setMaximumHeight(50)
-
-        self.btn_add_fee = QPushButton("➕ Ajouter un frais")
-        self.btn_add_fee.clicked.connect(self.on_add_fee)
-
-        self.btn_remove_fee = QPushButton("🗑 Supprimer")
-        self.btn_remove_fee.clicked.connect(self.on_remove_fee)
-
-        # =========================
         # Conteneur vertical (dossiers + totaux + TVA)
         # =========================
         folders_box = QWidget()
         self.folders_layout = QVBoxLayout(folders_box)
         self.folders_layout.setContentsMargins(0, 0, 0, 0)
-
-
-        self.folders_layout.addWidget(QLabel("Frais :"))
-        fees_bar = QHBoxLayout()
-        fees_bar.addWidget(self.btn_add_fee)
-        fees_bar.addWidget(self.btn_remove_fee)
-        fees_bar.addStretch(1)
-        self.folders_layout.addLayout(fees_bar)
-        self.folders_layout.addWidget(self.fees_table)
 
         self.folders_layout.addWidget(self.folder_table)
         self.folders_layout.addWidget(self.lbl_folder_totals)
