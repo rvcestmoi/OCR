@@ -3,6 +3,7 @@ __pycache__/
 *.pyc
 *.pyo
 *.pyd
+*.venv*
 
 # Si tu veux ignorer spécifiquement tes dossiers
 db/config.py

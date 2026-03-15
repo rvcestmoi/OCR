@@ -141,7 +141,7 @@ class MainWindowTransportTablesMixin:
             elif kundennr:
                 self.transporter_input.setText(kundennr)
 
-            self.transporter_vat_input.setText(vat_no)
+            #self.transporter_vat_input.setText(vat_no)
 
             banks = self.bank_repo.get_all_bank_infos_by_kundennr(kundennr)
 
@@ -234,6 +234,11 @@ class MainWindowTransportTablesMixin:
         self.load_transporter_information(force_by_kundennr=True)
 
         self.enable_transporter_update()
+        # ✅ si un n° de facture est déjà saisi, on vérifie tout de suite le doublon
+        try:
+            self._maybe_prompt_duplicate_invoice()
+        except Exception:
+            pass
 
     def on_transporter_action(self):
         if not self.selected_kundennr:
@@ -637,6 +642,16 @@ class MainWindowTransportTablesMixin:
         cmr_lbl.setAlignment(Qt.AlignCenter)
         cmr_lbl.setToolTip("CMR OK ?")
         self.folder_table.setCellWidget(row, 3, cmr_lbl)
+        
+        ab_lbl = QLabel("")
+        ab_lbl.setAlignment(Qt.AlignCenter)
+        ab_lbl.setToolTip("Achat.Bloqué")
+        self.folder_table.setCellWidget(row, 4, ab_lbl)
+
+        reserved_lbl = QLabel("")
+        reserved_lbl.setAlignment(Qt.AlignCenter)
+        ab_lbl.setToolTip("EP")
+        self.folder_table.setCellWidget(row, 5, reserved_lbl)
 
         dossier_le.setText("" if dossier is None else str(dossier))
         amount_le.setText("" if amount is None else str(amount))
@@ -700,6 +715,61 @@ class MainWindowTransportTablesMixin:
         tour_nr = dossier_le.text().strip()
 
         cmr_lbl = self._get_row_cmr_widget(row)
+
+        ab_lbl = self._get_row_ab_widget(row)
+        if ab_lbl is not None:
+            if not tour_nr:
+                ab_lbl.setText("")
+                ab_lbl.setStyleSheet("")
+                ab_lbl.setToolTip("")
+            else:
+                try:
+                    if tour_nr in getattr(self, "_ab_cache", {}):
+                        has_ab = self._ab_cache[tour_nr]
+                    else:
+                        has_ab = bool(self.tour_repo.has_infosymbol19_311_for_tournr(tour_nr))
+                        self._ab_cache[tour_nr] = has_ab
+
+                    if has_ab:
+                        ab_lbl.setText("❌")
+                        ab_lbl.setStyleSheet("color:#dc3545; font-weight:bold;")
+                        ab_lbl.setToolTip("AB détecté : au moins une commande avec InfoSymbol19=311")
+                    else:
+                        ab_lbl.setText("")
+                        ab_lbl.setStyleSheet("")
+                        ab_lbl.setToolTip("AB non détecté (InfoSymbol19=311 absent)")
+                except Exception as e:
+                    ab_lbl.setText("❓")
+                    ab_lbl.setStyleSheet("color:#b58900; font-weight:bold;")
+                    ab_lbl.setToolTip(f"Erreur contrôle AB: {e}")
+
+
+        eu_lbl = self._get_row_europal_widget(row)
+        if eu_lbl is not None:
+            if not tour_nr:
+                eu_lbl.setText("")
+                eu_lbl.setStyleSheet("")
+                eu_lbl.setToolTip("")
+            else:
+                try:
+                    if tour_nr in getattr(self, "_europal_cache", {}):
+                        has_eu = self._europal_cache[tour_nr]
+                    else:
+                        has_eu = bool(self.tour_repo.has_europal_for_tournr(tour_nr))
+                        self._europal_cache[tour_nr] = has_eu
+
+                    if has_eu:
+                        eu_lbl.setText("✅")  # symbole V
+                        eu_lbl.setStyleSheet("color:#28a745; font-weight:bold;")
+                        eu_lbl.setToolTip("EUROPAL trouvé (xxav_LIS_SUMTOUR_228794)")
+                    else:
+                        eu_lbl.setText("❌")  # symbole X
+                        eu_lbl.setStyleSheet("color:#dc3545; font-weight:bold;")
+                        eu_lbl.setToolTip("EUROPAL absent (xxav_LIS_SUMTOUR_228794)")
+                except Exception as e:
+                    eu_lbl.setText("❓")
+                    eu_lbl.setStyleSheet("color:#b58900; font-weight:bold;")
+                    eu_lbl.setToolTip(f"Erreur contrôle EUROPAL: {e}")
 
         # CMR icon
         if cmr_lbl is not None:
@@ -917,4 +987,10 @@ class MainWindowTransportTablesMixin:
 
         # vert (info) : total calculé
         self.lbl_vat_total.setStyleSheet("padding:4px; background-color:#e6ffe6;")
+        
+    def _get_row_ab_widget(self, row: int):
+        return self.folder_table.cellWidget(row, 4)
+    
+    def _get_row_europal_widget(self, row: int):
+        return self.folder_table.cellWidget(row, 5)
 

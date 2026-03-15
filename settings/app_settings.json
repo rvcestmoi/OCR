@@ -1,0 +1,26 @@
+{
+  "paths": {
+    "pdf_inbox_dir": "C:\\Users\\hrouillard\\Documents\\clients\\ED trans\\OCR\\modeles2",
+    "models_dir": "C:\\git\\OCR\\OCR\\models",
+    "supplier_models_dir": "C:\\git\\OCR\\OCR\\models\\suppliers",
+    "dms_export_dir": "C:\\konverter\\DMS",
+    "csv_export_dir": "C:\\konverter\\CSV",
+    "tesseract_path": "C:\\Users\\hrouillard\\AppData\\Local\\Programs\\Tesseract-OCR\\tesseract.exe",
+    "poppler_path": "C:\\poppler\\Library\\bin"
+  },
+  "ocr": {
+    "dpi": 150,
+    "languages": "fra+eng+deu+spa+ita+nld"
+  },
+    "db": {
+    "server": "THINKPAD-HRO1",
+    "database": "DB228794",
+
+    "trusted_connection": true,
+
+    "username": "",
+    "password": "",
+
+    "driver": "ODBC Driver 17 for SQL Server"
+  }
+}

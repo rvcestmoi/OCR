@@ -353,3 +353,32 @@ class TourRepository(BaseRepository):
                     out.add(aufnr)
 
         return out
+
+    def has_infosymbol19_311_for_tournr(self, tour_nr: str) -> bool:
+        tour_nr = (tour_nr or "").strip()
+        if not tour_nr:
+            return False
+
+        query = """
+            SELECT TOP 1 1
+            FROM XXASLAufInfSym sym
+            LEFT JOIN XXASLAuf auf ON auf.AufIntNr = sym.AufIntNr
+            WHERE sym.InfoSymbol19 = 311
+            AND LTRIM(RTRIM(CAST(auf.TourNr AS VARCHAR(20)))) = ?
+        """
+        row = self.fetch_one(query, (tour_nr,))
+        return bool(row)
+
+    def has_europal_for_tournr(self, tour_nr: str) -> bool:
+        tour_nr = (tour_nr or "").strip()
+        if not tour_nr:
+            return False
+
+        query = """
+            SELECT TOP 1 1
+            FROM xxav_LIS_SUMTOUR_228794
+            WHERE VPE = 'EUROPAL'
+            AND LTRIM(RTRIM(CAST(TourNr AS VARCHAR(20)))) = ?
+        """
+        row = self.fetch_one(query, (tour_nr,))
+        return bool(row)

@@ -34,6 +34,34 @@ class MainWindowValidationMixin:
                 "Aucun dossier (TourNr) trouvé : validation impossible."
             )
             return
+        
+        
+        # --- Anti-doublon facture (XXARe) + proposition mise en erreur ---
+        invoice_nr, kundennr = self._get_invoice_number_and_kundennr_for_dupecheck()
+
+        if invoice_nr and kundennr:
+            try:
+                exists = bool(self.xxare_repo.invoice_exists(invoice_nr, kundennr, aufdk="D"))
+            except Exception as e:
+                QMessageBox.warning(
+                    self,
+                    "Validation impossible",
+                    "Erreur lors du contrôle anti-doublon (XXARe).\n\n"
+                    f"Détail: {e}"
+                )
+                return
+
+            if exists:
+                resp_dup = QMessageBox.question(
+                    self,
+                    "Facture déjà existante",
+                    "Cette facture existe déjà, voulez-vous la mettre en erreur ?",
+                    QMessageBox.Yes | QMessageBox.No,
+                    QMessageBox.No,
+                )
+                if resp_dup == QMessageBox.Yes:
+                    self._mark_current_entry_as_error(reason="duplicate_invoice")
+                return
 
         resp = QMessageBox.question(
             self,
@@ -202,26 +230,20 @@ class MainWindowValidationMixin:
                 break
 
     def _set_transporter_match_color(self, ok: bool | None):
-        """
-        ok=True  => vert
-        ok=False => rouge
-        ok=None  => neutre
-        """
         if ok is None:
             self.transporter_info.setStyleSheet("")
-            # si tu veux aussi colorer le champ TVA transporteur :
-            self.transporter_vat_input.setStyleSheet("background-color: #f3f3f3;")
+            self.transporter_aux_input.setStyleSheet("background-color: #f3f3f3;")
             return
 
         if ok:
-            bg = "#d4edda"  # vert clair
+            bg = "#d4edda"
             border = "#28a745"
         else:
-            bg = "#f8d7da"  # rouge clair
+            bg = "#f8d7da"
             border = "#dc3545"
 
         self.transporter_info.setStyleSheet(f"background-color: {bg}; border: 2px solid {border};")
-        self.transporter_vat_input.setStyleSheet(f"background-color: {bg}; border: 2px solid {border};")
+        self.transporter_aux_input.setStyleSheet(f"background-color: {bg}; border: 2px solid {border};")
 
     def update_transporter_vs_dossiers_status(self):
         """
@@ -866,9 +888,9 @@ class MainWindowValidationMixin:
         Crée un CSV horodaté dans le dossier configurable.
         Retourne le chemin du fichier créé.
         """
-        target_dir = str(CSV_EXPORT_FOLDER or "").strip()
+        target_dir = str(CSV_EXPORT_DIR or "").strip()
         if not target_dir:
-            raise RuntimeError("CSV_EXPORT_FOLDER n'est pas configuré.")
+            raise RuntimeError("CSV_EXPORT_DIR n'est pas configuré.")
 
         os.makedirs(target_dir, exist_ok=True)
 
@@ -886,4 +908,120 @@ class MainWindowValidationMixin:
             writer.writerows(rows)
 
         return csv_path
+    
+
+    def _get_invoice_number_and_kundennr_for_dupecheck(self) -> tuple[str, str]:
+        """Retourne (NrBuch, FakAdr) pour la vérification XXARe."""
+        invoice_nr = (self.invoice_number_input.text() or "").strip()
+        kundennr = (self.selected_kundennr or "").strip()
+
+        # fallback si selected_kundennr vide mais champ "Nom (12345)"
+        if not kundennr:
+            m = re.search(r"\((\d+)\)\s*$", self.transporter_input.text() or "")
+            if m:
+                kundennr = m.group(1)
+
+        return invoice_nr, kundennr
+
+
+    def _add_tag_to_current_json(self, tag: str, extra: dict | None = None) -> None:
+        """Ajoute un tag dans le JSON du document courant (sans écraser le reste)."""
+        if not self.current_pdf_path:
+            return
+        try:
+            json_path = self._get_saved_json_path(self.current_pdf_path)
+            if not os.path.exists(json_path):
+                return
+            with open(json_path, "r", encoding="utf-8") as f:
+                data = json.load(f) or {}
+
+            tags = data.get("tags") or []
+            if isinstance(tags, str):
+                tags = [tags]
+            if not isinstance(tags, list):
+                tags = []
+            tags_set = {str(t).strip() for t in tags if str(t).strip()}
+            if tag:
+                tags_set.add(tag)
+            data["tags"] = sorted(tags_set)
+
+            if extra:
+                data.update(extra)
+
+            with open(json_path, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+        except Exception:
+            return
+
+
+    def _mark_current_entry_as_error(self, reason: str = "duplicate_invoice") -> None:
+        """Met l'entrée en ERROR (listing erreurs) + trace dans le JSON."""
+        try:
+            # status=error => update SQL (processing_status) + JSON
+            self.save_current_data(status="error", show_message=False)
+        except Exception:
+            pass
+
+        self._add_tag_to_current_json("duplicate_invoice", extra={"error_reason": reason} if reason else None)
+
+        # refresh + se placer sur l'onglet erreurs
+        try:
+            self.set_left_filter("errors")
+        except Exception:
+            try:
+                self.load_folder(self.current_folder_path)
+            except Exception:
+                pass
+
+
+    def _maybe_prompt_duplicate_invoice(self) -> bool:
+        """Vérifie XXARe et propose de mettre en erreur si doublon.
+
+        Retourne True si pas de doublon, sinon False.
+        """
+        invoice_nr, kundennr = self._get_invoice_number_and_kundennr_for_dupecheck()
+        if not invoice_nr or not kundennr:
+            return True
+
+        key = f"{invoice_nr}::{kundennr}"
+        if getattr(self, "_last_dupe_prompt_key", None) == key:
+            return False
+
+        try:
+            exists = bool(self.xxare_repo.invoice_exists(invoice_nr, kundennr, aufdk="D"))
+        except Exception:
+            return True
+
+        if not exists:
+            try:
+                self.invoice_number_input.setStyleSheet("")
+            except Exception:
+                pass
+            return True
+
+        self._last_dupe_prompt_key = key
+        try:
+            self.invoice_number_input.setStyleSheet("background-color:#fff3cd;")
+        except Exception:
+            pass
+
+        resp = QMessageBox.question(
+            self,
+            "Facture déjà existante",
+            "Cette facture existe déjà, voulez-vous la mettre en erreur ?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+
+        if resp == QMessageBox.Yes:
+            self._mark_current_entry_as_error(reason="duplicate_invoice")
+        return False
+
+
+    def on_invoice_number_editing_finished(self):
+        """Contrôle doublon dès qu'on quitte le champ N° facture."""
+        try:
+            self._maybe_prompt_duplicate_invoice()
+        except Exception:
+            pass
 

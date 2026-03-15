@@ -9,7 +9,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 import csv
-from app.paths import CSV_EXPORT_FOLDER
+from app.paths import CSV_EXPORT_DIR
 
 
 from PySide6.QtCore import QObject, QThread, Qt, QTimer, Signal, Slot, QStringListModel

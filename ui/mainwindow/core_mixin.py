@@ -511,8 +511,26 @@ class MainWindowCoreMixin:
         data["invoice_date"] = self.date_input.text().strip()
         data["invoice_number"] = self.invoice_number_input.text().strip()
         data["transporter_text"] = self.transporter_input.text().strip()
-        data["transporter_vat"] = self.transporter_vat_input.text().strip()
-        data["selected_kundennr"] = str(getattr(self, "selected_kundennr", "") or "").strip()
+        data["transporter_aux_account"] = (self.transporter_aux_input.text() or "").strip()
+
+        # --- Transporteur : clé canonique + compat ---
+        kundennr = str(getattr(self, "selected_kundennr", "") or "").strip()
+
+        # fallback si le champ contient "Nom (12345)"
+        if not kundennr:
+            try:
+                m = re.search(r"\((\d+)\)\s*$", self.transporter_input.text() or "")
+                if m:
+                    kundennr = m.group(1)
+            except Exception:
+                pass
+
+        # clé canonique (utilisée par load_saved_data)
+        data["transporter_kundennr"] = kundennr
+        # compat (anciens JSON)
+        data["selected_kundennr"] = kundennr
+
+
         data["folders"] = self.get_folder_rows() if hasattr(self, "get_folder_rows") else []
         data["vat_lines"] = self.get_vat_rows() if hasattr(self, "get_vat_rows") else []
         data["tags"] = sorted(set(tags))
@@ -592,46 +610,35 @@ class MainWindowCoreMixin:
         return True
 
 
-    def load_saved_data(self):
+
+    def load_saved_data(self) -> bool:
+        """Recharge les données JSON du PDF courant.
+
+        Important : on restaure d'abord les champs facture (IBAN/BIC/Date/N°),
+        puis le transporteur. Avant, on rechargeait le transporteur alors que
+        l'IBAN/BIC n'étaient pas encore remis, ce qui donnait l'impression que
+        la sauvegarde n'avait pas fonctionné.
+        """
         if not self.current_pdf_path:
-            return
+            return False
 
         json_path = self._get_saved_json_path(self.current_pdf_path)
         if not os.path.exists(json_path):
-            return
+            return False
 
         try:
             with open(json_path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            # --- Transporteur (KundenNr sauvegardé) ---
-            self.selected_kundennr = (data.get("transporter_kundennr") or "").strip() or None
-            self.transporter_selected_mode = bool(self.selected_kundennr)
+                data = json.load(f) or {}
 
-            # reset visuel (évite de garder un ancien transporteur affiché)
-            self.transporter_input.blockSignals(True)
-            self.transporter_input.setText("")
-            self.transporter_input.blockSignals(False)
-
-            # si on a un KundenNr -> on recharge depuis la BDD sans passer par IBAN/BIC
-            if self.selected_kundennr:
-                self.load_transporter_information(force_by_kundennr=True)
-            else:
-                # sinon on retombe sur la logique existante (IBAN/BIC)
-                self.load_transporter_information(force_by_kundennr=False)
+            # --- Mémoire annexes ---
             self.pallet_details = data.get("pallet_details", {}) or {}
             self.block_options = data.get("block_options", {}) or {}
 
+            # --- Champs facture ---
             invoice_date = str(data.get("invoice_date", "") or "").strip()
             iban = str(data.get("iban", "") or "").strip()
             bic = str(data.get("bic", "") or "").strip()
             invoice_number = str(data.get("invoice_number", "") or "").strip()
-
-            if not self.date_input.text().strip():
-                row = self.pdf_table.currentRow()
-                if row >= 0:
-                    it_date = self.pdf_table.item(row, 1)
-                    if it_date:
-                        self.date_input.setText((it_date.text() or "").strip())
 
             self.iban_input.setText(iban)
             self.bic_input.setText(bic)
@@ -639,33 +646,51 @@ class MainWindowCoreMixin:
             self.invoice_number_input.setText(invoice_number)
 
             # synchro tableau de gauche
-            self._update_left_table_date_iban_bic(
-                self.current_pdf_path,
-                invoice_date,
-                iban,
-                bic,
-            )
-            vat_lines = data.get("vat_lines", [])
+            self._update_left_table_date_iban_bic(self.current_pdf_path, invoice_date, iban, bic)
+
+            # --- Transporteur ---
+            saved_text = str(data.get("transporter_text") or "").strip()
+
+
+            saved_aux = str(data.get("transporter_aux_account") or "").strip()
+            if saved_aux and not self.transporter_aux_input.text().strip():
+                self.transporter_aux_input.setText(saved_aux)
+
+
+            kundennr = str(
+                data.get("transporter_kundennr")
+                or data.get("selected_kundennr")
+                or ""
+            ).strip()
+
+            self.selected_kundennr = kundennr or None
+            self.transporter_selected_mode = bool(self.selected_kundennr)
+
+            # restaurer l'affichage tel quel (même si la BDD ne répond pas)
+            self.transporter_input.blockSignals(True)
+            self.transporter_input.setText(saved_text)
+            self.transporter_input.blockSignals(False)
+            #self.transporter_vat_input.setText(saved_vat)
+
+            # puis, si possible, rafraîchir depuis la BDD
+            if self.selected_kundennr:
+                self.load_transporter_information(force_by_kundennr=True)
+            elif iban and bic:
+                self.load_transporter_information(force_by_kundennr=False)
+
+            # --- OCR texte ---
             ocr_text = data.get("ocr_text", "")
-            if isinstance(ocr_text, str):
-                self.ocr_text_view.setPlainText(ocr_text)
-            else:
-                self.ocr_text_view.setPlainText("")
-            if isinstance(vat_lines, list):
-                for r in vat_lines:
-                    self._add_vat_row(r.get("rate", ""), r.get("base", ""), r.get("vat", ""))
+            self.ocr_text_view.setPlainText(ocr_text if isinstance(ocr_text, str) else "")
 
-            self._ensure_empty_vat_row()
-            self.update_vat_total()
-
-
-            # ✅ dossiers -> table
+            # ✅ dossiers + TVA (ta fonction rebuild gère déjà tout proprement)
             self.rebuild_folder_fields_from_json(data)
             return True
 
         except Exception as e:
             QMessageBox.warning(self, "Erreur chargement", str(e))
             return False
+
+
 
     def rebuild_folder_fields_from_json(self, data: dict):
         # reset table
@@ -764,7 +789,7 @@ class MainWindowCoreMixin:
 
     def _save_data_for_pdf(self, pdf_path, data):
         base_name = os.path.splitext(os.path.basename(pdf_path))[0]
-        model_dir = r"C:\git\OCR\OCR\models"
+        model_dir = MODELS_DIR
         os.makedirs(model_dir, exist_ok=True)
         json_path = os.path.join(model_dir, f"{base_name}.json")
 
@@ -787,7 +812,7 @@ class MainWindowCoreMixin:
 
     def _model_exists_for_pdf(self, pdf_path):
         base_name = os.path.splitext(os.path.basename(pdf_path))[0]
-        model_dir = r"C:\git\OCR\OCR\models"
+        model_dir = MODELS_DIR
         json_path = os.path.join(model_dir, f"{base_name}.json")
         return os.path.exists(json_path)
 

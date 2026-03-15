@@ -8,6 +8,7 @@ from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
 from PySide6.QtCore import QObject, Signal, Slot
+from .common import *
 
 
 class _DownloadCanceled(Exception):
@@ -163,7 +164,7 @@ class LinkPostProcessWorker(QObject):
 
         def _json_path_for_pdf(self, pdf_path: str) -> str:
             base_name = os.path.splitext(os.path.basename(pdf_path))[0]
-            model_dir = r"C:\git\OCR\OCR\models"
+            model_dir = MODELS_DIR
             return os.path.join(model_dir, f"{base_name}.json")
 
         def _create_minimal_json_no_ocr(self, pdf_path: str):

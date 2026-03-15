@@ -32,13 +32,26 @@ class TransporterRepository(BaseRepository):
         return result
 
     def search_transporters_by_name(self, name_part: str):
+        name_part = (name_part or "").strip()
+        if not name_part:
+            return []
+
         query = """
-            SELECT TOP 10 kundennr, name1
+            SELECT TOP 10
+                kundennr,
+                name1
             FROM xxakun
-            WHERE UPPER(name1) LIKE UPPER(?)
+            WHERE
+                GsDruck = 'J'
+                AND (
+                    UPPER(name1) LIKE UPPER(?)
+                    OR UPPER(CAST(kundennr AS VARCHAR(50))) LIKE UPPER(?)
+                )
             ORDER BY name1
         """
-        return self.fetch_all(query, (f"%{name_part}%",))
+
+        like = f"%{name_part}%"
+        return self.fetch_all(query, (like, like))
     
     def get_bank_by_kundennr(self, kundennr: str):
         query = """
@@ -106,5 +119,22 @@ class TransporterRepository(BaseRepository):
             WHERE KundenNr = ?
         """
         return self.fetch_one(query, (kundennr,))
+
+    def get_ktoKreA_by_kundennr(self, kundennr: str):
+        query = """
+            SELECT KtoKreA
+            FROM XXAKun
+            WHERE KundenNr = ?
+        """
+        return self.fetch_one(query, (kundennr,))
+
+
+    def update_ktoKreA(self, kundennr: str, konto_aux: str):
+        query = """
+            UPDATE XXAKun
+            SET KtoKreA = ?, KtoKre = 4
+            WHERE KundenNr = ?
+        """
+        self.execute(query, (konto_aux, kundennr))
 
 

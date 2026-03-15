@@ -130,7 +130,7 @@ class MainWindowDocumentsMixin:
         if not self.current_pdf_path:
             return None
         base_name = os.path.splitext(os.path.basename(self.current_pdf_path))[0]
-        model_dir = r"C:\git\OCR\OCR\models"
+        model_dir = MODELS_DIR
         os.makedirs(model_dir, exist_ok=True)
         return os.path.join(model_dir, f"{base_name}.json")
 
@@ -483,12 +483,12 @@ class MainWindowDocumentsMixin:
             if entry_id:
                 base_name = f"{entry_id}{ENTRY_FILE_SEPARATOR}{base_name}"
 
-        model_dir = r"C:\git\OCR\OCR\models"
+        model_dir = MODELS_DIR
         return os.path.join(model_dir, f"{base_name}.json")
 
     def _get_saved_json_path_for_pdf(self, pdf_path: str) -> str:
         base_name = os.path.splitext(os.path.basename(pdf_path))[0]
-        model_dir = r"C:\git\OCR\OCR\models"
+        model_dir = MODELS_DIR
         return os.path.join(model_dir, f"{base_name}.json")
 
     def _get_saved_date_iban_bic_for_pdf(self, pdf_path: str) -> tuple[str, str, str]:

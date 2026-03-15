@@ -9,6 +9,8 @@ from .mainwindow.documents_mixin import MainWindowDocumentsMixin
 from .mainwindow.validation_mixin import MainWindowValidationMixin
 from .mainwindow.cmr_mixin import MainWindowCmrMixin
 from .mainwindow.links_mixin import MainWindowLinksMixin
+from app.paths import PDF_INBOX_DIR
+from db.xxare_repository import XXAReRepository
 
 
 class MainWindow(
@@ -19,9 +21,9 @@ class MainWindow(
     MainWindowCmrMixin,
     MainWindowLinksMixin,
     QMainWindow,
-):
-
-    DEFAULT_PDF_FOLDER = DEFAULT_PDF_FOLDER
+):    
+    
+    DEFAULT_PDF_FOLDER = PDF_INBOX_DIR
 
     def __init__(self):
         super().__init__()
@@ -34,6 +36,7 @@ class MainWindow(
         from ui.ocr_text_view import OcrTextView
         from db.tour_repository import TourRepository
         from ocr.folder_patterns import DOSSIER_PATTERN, is_valid_folder_number
+        
         self.current_folder_path: str | None = None
         self.pending_pool_size = 300
    
@@ -46,6 +49,7 @@ class MainWindow(
         self.transporter_repo = TransporterRepository(self.db_conn)
         self.bank_repo = BankRepository(self.db_conn)
         self.tour_repo = TourRepository(self.db_conn)
+        self.xxare_repo = XXAReRepository(self.db_conn)
         self.DOSSIER_PATTERN = DOSSIER_PATTERN
         # --- State ---
         self.current_pdf_path: str | None = None
@@ -65,6 +69,8 @@ class MainWindow(
         self._did_autoload_default_folder = False
 
         self._vat_theo_cache: dict[str, float | None] = {}
+        self._ab_cache: dict[str, bool] = {}
+        self._europal_cache: dict[str, bool] = {}
         self._pending_tags_to_add: set[str] = set()
 
         
@@ -304,6 +310,8 @@ class MainWindow(
 
         self.date_input = QLineEdit()
         self.invoice_number_input = QLineEdit()
+        # ✅ contrôle anti-doublon (XXARe) dès qu'on quitte le champ
+        self.invoice_number_input.editingFinished.connect(self.on_invoice_number_editing_finished)
 
         form_layout.addRow("IBAN :", self.iban_input)
         form_layout.addRow("BIC :", self.bic_input)
@@ -333,13 +341,17 @@ class MainWindow(
         transporter_layout.addWidget(self.btn_transporter_action)
         transporter_layout.addStretch()
         form_layout.addRow("Transporteur :", transporter_layout)
-        self.transporter_vat_input = QLineEdit()
-        self.transporter_vat_input.setReadOnly(True)
-        self.transporter_vat_input.setPlaceholderText("N° TVA (BDD)…")
-        self.transporter_vat_input.setFocusPolicy(Qt.NoFocus)
-        self.transporter_vat_input.setStyleSheet("background-color: #f3f3f3;")
+        
+        self.transporter_aux_input = QLineEdit()
+        self.transporter_aux_input.setPlaceholderText("Compte auxiliaire")
+        self.transporter_aux_input.setClearButtonEnabled(True)
 
-        form_layout.addRow("N° TVA transporteur :", self.transporter_vat_input)
+        # par défaut : non modifiable (sera rendu modifiable si vide en base)
+        self.transporter_aux_input.setReadOnly(True)
+        self.transporter_aux_input.setFocusPolicy(Qt.NoFocus)
+        self.transporter_aux_input.setStyleSheet("background-color: #f3f3f3;")
+
+        form_layout.addRow("Compte auxiliaire :", self.transporter_aux_input)
 
         form_layout.addRow("Date facture :", self.date_input)
         form_layout.addRow("N° facture :", self.invoice_number_input)
@@ -347,12 +359,22 @@ class MainWindow(
         # =========================
         # Table dossiers (N° dossier / Montant HT)
         # =========================
-        self.folder_table = QTableWidget(0, 4)
-        self.folder_table.setHorizontalHeaderLabels(["N° Tournée", "Montant HT (OCR)", "TVA théorique (%)", "CMR"])
+        self.folder_table = QTableWidget(0, 6)
+        self.folder_table.setHorizontalHeaderLabels([
+            "N° Tournée",
+            "Montant HT (OCR)",
+            "TVA théorique (%)",
+            "CMR",
+            "AB",
+            ""  # colonne 2 "après", réservée
+        ])
+
         self.folder_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
         self.folder_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
         self.folder_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
         self.folder_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeToContents)
+        self.folder_table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeToContents)
+        self.folder_table.horizontalHeader().setSectionResizeMode(5, QHeaderView.ResizeToContents)
 
 
         # Totaux dossiers

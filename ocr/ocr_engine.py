@@ -12,11 +12,21 @@ try:
 except Exception:
     cv2 = None
 
-pytesseract.pytesseract.tesseract_cmd = (
-    r"C:\Users\hrouillard\AppData\Local\Programs\Tesseract-OCR\tesseract.exe"
+from app.settings import load_settings, get_path, get_ocr_value
+
+_SETTINGS = load_settings()
+
+pytesseract.pytesseract.tesseract_cmd = get_path(
+    _SETTINGS,
+    "tesseract_path",
+    r"C:\Users\hrouillard\AppData\Local\Programs\Tesseract-OCR\tesseract.exe",
 )
 
-POPPLER_PATH = r"C:\poppler\Library\bin"
+POPPLER_PATH = get_path(
+    _SETTINGS,
+    "poppler_path",
+    r"C:\poppler\Library\bin",
+)
 
 _BAD_OCR_CHARS = set("□■▪▫█▌▐▎▍▏|¦│┃┆┇")
 _BAD_OCR_RE = re.compile(r"[□■▪▫█▌▐▎▍▏|¦│┃┆┇]+")

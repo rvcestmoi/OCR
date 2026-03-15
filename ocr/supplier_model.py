@@ -5,8 +5,22 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 from collections import Counter
 
+# --- Où sont stockés les modèles fournisseurs ---
+try:
+    # nouveau nom (refacto)
+    from app.paths import SUPPLIER_MODELS_DIR
+    MODEL_DIR = SUPPLIER_MODELS_DIR
+except Exception:
+    # fallback anciens noms si tu as encore du code legacy
+    try:
+        from app.paths import SUPPLIERS_DIR  # type: ignore
+        MODEL_DIR = SUPPLIERS_DIR
+    except Exception:
+        # fallback ultime: dossier local du projet
+        import os
+        MODEL_DIR = os.path.join(os.path.dirname(__file__), "..", "models", "suppliers")
 
-MODEL_DIR = r"C:\git\OCR\OCR\models\suppliers"
+
 
 
 def build_supplier_key(iban: str, bic: str) -> Optional[str]:
