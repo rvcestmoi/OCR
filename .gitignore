@@ -8,7 +8,8 @@ __pycache__/
 # Si tu veux ignorer spécifiquement tes dossiers
 db/config.py
 db/__pycache__/
-ui/__pycache__/
+ui/__pycache__/*
 ocr/__pycache__/
 PJ/
 models/
+__pycache__

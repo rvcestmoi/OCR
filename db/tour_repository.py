@@ -209,7 +209,14 @@ class TourRepository(BaseRepository):
 
 
     def get_palette_details_with_trajet_by_tournrs(self, tour_numbers: List[str]) -> List[Dict[str, Any]]:
-        """Retourne les lignes palettes/poids + trajet + AufNr pour une liste de TourNr."""
+        """
+        Retourne les lignes palettes/poids + trajet CMR + AufNr pour une liste de TourNr.
+
+        Important :
+        - le trajet doit être récupéré au niveau COMMANDE (XXASLAuf), pas au niveau tournée
+        - le champ Trajet renvoyé est donc propre à chaque AufNr
+        - en secours, on retombe sur les champs de tournée si les champs commande sont vides
+        """
         tour_numbers = [str(t).strip() for t in (tour_numbers or []) if str(t).strip()]
         if not tour_numbers:
             return []
@@ -218,28 +225,36 @@ class TourRepository(BaseRepository):
         query = f"""
             SELECT
                 LTRIM(RTRIM(CAST(auf.TourNr AS VARCHAR(20)))) AS Dossier,
+                LTRIM(RTRIM(CAST(auf.AufNr AS VARCHAR(50)))) AS AufNr,
                 pos.VPE,
                 SUM(pos.VPEAnz) AS Palettes,
                 SUM(pos.TatsGew) AS Poids,
                 CONCAT(
-                    MAX(tour.BELLKZ), '-', MAX(tour.BelPLZ), ' ', MAX(tour.BelOrt),
+                    COALESCE(NULLIF(MAX(LTRIM(RTRIM(CAST(auf.BELLKZ AS VARCHAR(20))))), ''), NULLIF(MAX(LTRIM(RTRIM(CAST(tour.BELLKZ AS VARCHAR(20))))), ''), ''),
                     '-',
-                    MAX(tour.EmgLKZ), '-', MAX(tour.EmgPLZ), ' ', MAX(tour.EmgOrt)
-                ) AS Trajet,
-                auf.AufNr
+                    COALESCE(NULLIF(MAX(LTRIM(RTRIM(CAST(auf.BelPLZ AS VARCHAR(20))))), ''), NULLIF(MAX(LTRIM(RTRIM(CAST(tour.BelPLZ AS VARCHAR(20))))), ''), ''),
+                    ' ',
+                    COALESCE(NULLIF(MAX(LTRIM(RTRIM(CAST(auf.BelOrt AS VARCHAR(100))))), ''), NULLIF(MAX(LTRIM(RTRIM(CAST(tour.BelOrt AS VARCHAR(100))))), ''), ''),
+                    '-',
+                    COALESCE(NULLIF(MAX(LTRIM(RTRIM(CAST(auf.EmgLKZ AS VARCHAR(20))))), ''), NULLIF(MAX(LTRIM(RTRIM(CAST(tour.EmgLKZ AS VARCHAR(20))))), ''), ''),
+                    '-',
+                    COALESCE(NULLIF(MAX(LTRIM(RTRIM(CAST(auf.EmgPLZ AS VARCHAR(20))))), ''), NULLIF(MAX(LTRIM(RTRIM(CAST(tour.EmgPLZ AS VARCHAR(20))))), ''), ''),
+                    ' ',
+                    COALESCE(NULLIF(MAX(LTRIM(RTRIM(CAST(auf.EmgOrt AS VARCHAR(100))))), ''), NULLIF(MAX(LTRIM(RTRIM(CAST(tour.EmgOrt AS VARCHAR(100))))), ''), '')
+                ) AS Trajet
             FROM XXAV_FR_MainAufIntNrByLegs leg
             LEFT JOIN xxaslauf auf ON auf.AufIntNr = leg.leg_AufIntNr
             LEFT JOIN xxaaufpos pos ON pos.aufintnr = leg.MAin_aufintnr
             LEFT JOIN XXATour tour ON tour.TourNr = auf.TourNr
             WHERE pos.VPE IS NOT NULL
-            AND LTRIM(RTRIM(CAST(auf.TourNr AS VARCHAR(20)))) IN ({placeholders})
+              AND LTRIM(RTRIM(CAST(auf.TourNr AS VARCHAR(20)))) IN ({placeholders})
             GROUP BY
                 LTRIM(RTRIM(CAST(auf.TourNr AS VARCHAR(20)))),
-                pos.VPE,
-                auf.AufNr
+                LTRIM(RTRIM(CAST(auf.AufNr AS VARCHAR(50)))),
+                pos.VPE
             ORDER BY
                 LTRIM(RTRIM(CAST(auf.TourNr AS VARCHAR(20)))),
-                auf.AufNr,
+                LTRIM(RTRIM(CAST(auf.AufNr AS VARCHAR(50)))),
                 pos.VPE
         """
         return self.fetch_all(query, tuple(tour_numbers))

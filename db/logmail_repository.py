@@ -139,7 +139,7 @@ class LogmailRepository(BaseRepository):
 
             cursor.execute(
                 """
-                SELECT COUNT(*) 
+                SELECT COUNT(*)
                 FROM dbo.XXA_LOGMAIL_228794
                 WHERE entry_id = ?
                 """,
@@ -147,6 +147,8 @@ class LogmailRepository(BaseRepository):
             )
             before_count = cursor.fetchone()[0]
             print(f"[CLAIM] nb lignes trouvées pour entry_id avant update = {before_count}")
+            if int(before_count or 0) <= 0:
+                return False
 
             cursor.execute(
                 """
@@ -158,7 +160,8 @@ class LogmailRepository(BaseRepository):
                 """,
                 (username, entry_id),
             )
-            print(f"[CLAIM] release autres lignes user -> rowcount={cursor.rowcount}")
+            released_rows = int(cursor.rowcount or 0)
+            print(f"[CLAIM] release autres lignes user -> rowcount={released_rows}")
 
             cursor.execute(
                 """
@@ -174,7 +177,8 @@ class LogmailRepository(BaseRepository):
                 """,
                 (username, entry_id, username),
             )
-            print(f"[CLAIM] claim ligne -> rowcount={cursor.rowcount}")
+            claimed_rows = int(cursor.rowcount or 0)
+            print(f"[CLAIM] claim ligne -> rowcount={claimed_rows}")
 
             conn.commit()
 
@@ -191,7 +195,19 @@ class LogmailRepository(BaseRepository):
             for r in rows:
                 print("   ", tuple(r))
 
-            return cursor.rowcount > 0
+            if claimed_rows > 0:
+                return True
+
+            owner = ""
+            for r in rows:
+                try:
+                    owner = str(r[1] or "").strip()
+                except Exception:
+                    owner = ""
+                if owner:
+                    break
+
+            return owner == username
 
 
 

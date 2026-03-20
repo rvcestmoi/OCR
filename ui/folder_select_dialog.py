@@ -57,18 +57,17 @@ class FolderSelectDialog(QDialog):
         tour_numbers = [str(t).strip() for t in (tour_numbers or []) if str(t).strip()]
 
         by_tour_auf = defaultdict(list)          # (tour, auf) -> rows
-        trajet_by_tour = {}                      # tour -> trajet
+        trajet_by_tour_auf = {}                 # (tour, auf) -> trajet CMR
 
         for r in details_rows:
             tour = str(r.get("Dossier") or "").strip()
             auf  = str(r.get("AufNr") or "").strip()
             if not tour:
                 continue
-            if tour not in trajet_by_tour:
-                tr = str(r.get("Trajet") or "").strip()
-                if tr:
-                    trajet_by_tour[tour] = tr
+            tr = str(r.get("Trajet") or "").strip()
             if auf:
+                if tr and (tour, auf) not in trajet_by_tour_auf:
+                    trajet_by_tour_auf[(tour, auf)] = tr
                 by_tour_auf[(tour, auf)].append(r)
 
         bold = QFont()
@@ -77,10 +76,8 @@ class FolderSelectDialog(QDialog):
         first_item = None
 
         for tour in tour_numbers:
-            trajet = trajet_by_tour.get(tour, "")
-
             # noeud Dossier
-            tour_item = QTreeWidgetItem([tour, "", trajet, "TOTAL", "", ""])
+            tour_item = QTreeWidgetItem([tour, "", "", "TOTAL", "", ""])
             tour_item.setData(0, ROLE_TOUR, tour)
             tour_item.setData(0, ROLE_AUF, "")
             for c in range(6):
@@ -111,7 +108,8 @@ class FolderSelectDialog(QDialog):
                     try: total_poids += float(rr.get("Poids") or 0)
                     except Exception: pass
 
-                auf_item = QTreeWidgetItem(["", auf, "", "TOTAL", self._fmt_num(total_pal), self._fmt_num(total_poids)])
+                trajet = trajet_by_tour_auf.get((tour, auf), "")
+                auf_item = QTreeWidgetItem(["", auf, trajet, "TOTAL", self._fmt_num(total_pal), self._fmt_num(total_poids)])
                 auf_item.setData(0, ROLE_TOUR, tour)
                 auf_item.setData(0, ROLE_AUF, auf)
                 for c in range(6):

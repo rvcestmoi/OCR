@@ -631,6 +631,14 @@ class MainWindowValidationMixin:
         if not hasattr(self, "pdf_table") or self.pdf_table is None:
             return
 
+        def _state_background_for_item(item0):
+            state = str(item0.data(Qt.UserRole + 2) or "unknown").strip().lower()
+            if state == "ok":
+                return QColor(212, 237, 218)
+            if state == "error":
+                return QColor(248, 215, 218)
+            return None
+
         entry_ids = []
         row_entry_map: dict[int, str] = {}
 
@@ -655,10 +663,26 @@ class MainWindowValidationMixin:
                 continue
 
             entry_id = row_entry_map.get(row, "")
-            processing_user = processing_map.get(entry_id, "") if entry_id else ""
+            processing_user = str(processing_map.get(entry_id, "") if entry_id else "").strip()
+            current_user = str(getattr(self, "current_username", "") or "").strip()
 
             locked = bool(processing_user)
-            locked_by_other = locked and processing_user != getattr(self, "current_username", "")
+            locked_by_other = locked and processing_user.casefold() != current_user.casefold()
+            locked_by_self = locked and not locked_by_other
+            base_bg = _state_background_for_item(it0)
+
+            if locked_by_other:
+                bg = QColor(255, 199, 206)
+                fg = QBrush(QColor(156, 0, 6))
+                tooltip_suffix = f"En cours de traitement par {processing_user}."
+            elif locked_by_self:
+                bg = base_bg
+                fg = QBrush()
+                tooltip_suffix = "Document en cours de traitement par vous."
+            else:
+                bg = base_bg
+                fg = QBrush()
+                tooltip_suffix = ""
 
             for col in range(self.pdf_table.columnCount()):
                 it = self.pdf_table.item(row, col)
@@ -669,13 +693,28 @@ class MainWindowValidationMixin:
                 font = it.font()
                 font.setBold(locked)
                 it.setFont(font)
+                it.setForeground(fg)
 
-                if locked_by_other:
-                    it.setForeground(QBrush(QColor(200, 0, 0)))
-                elif locked:
-                    it.setForeground(QBrush(QColor(140, 0, 0)))
+                if bg is None:
+                    it.setBackground(QBrush())
                 else:
-                    it.setForeground(QBrush())
+                    it.setBackground(bg)
+
+                current_tt = str(it.toolTip() or "").strip()
+                tt_lines = [
+                    line.strip()
+                    for line in current_tt.splitlines()
+                    if line.strip()
+                    and not line.strip().startswith("En cours de traitement par ")
+                    and line.strip() != "Document en cours de traitement par vous."
+                ]
+                base_tt = "\n".join(tt_lines).strip()
+
+                if tooltip_suffix:
+                    it.setToolTip(f"{base_tt}\n{tooltip_suffix}".strip() if base_tt else tooltip_suffix)
+                else:
+                    it.setToolTip(base_tt)
+
 
     def _block_validate_if_transporter_not_matching_tours(self) -> bool:
         tournrs = sorted({

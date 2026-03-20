@@ -112,6 +112,8 @@ class MainWindowCoreMixin:
 
         if new_entry_id:
             self._claim_selected_entry(new_entry_id)
+        else:
+            self._release_claimed_entry()
 
         group_paths = item.data(Qt.UserRole + 5)
         if isinstance(group_paths, list) and group_paths:
@@ -997,14 +999,38 @@ class MainWindowCoreMixin:
         print(f"[UI CLAIM] entry_id={entry_id!r}, username={username!r}")
 
         if not entry_id or entry_id.startswith("__NO_ENTRY__"):
-            QMessageBox.warning(self, "DEBUG", f"entry_id invalide: {entry_id!r}")
             return
 
         if not username:
-            QMessageBox.warning(self, "DEBUG", "username vide")
             return
 
-        self._claimed_entry_id = entry_id
+        try:
+            claimed = bool(self.logmail_repo.claim_entry_for_user(entry_id, username))
+        except Exception as e:
+            print(f"[UI CLAIM] erreur claim_entry_for_user: {e}")
+            claimed = False
+
+        if claimed:
+            self._claimed_entry_id = entry_id
+        else:
+            try:
+                processing_user = str(self.logmail_repo.get_processing_user_for_entry(entry_id) or "").strip()
+            except Exception:
+                processing_user = ""
+
+            if processing_user and processing_user != username:
+                self.statusBar().showMessage(
+                    f"Document déjà en cours de traitement par {processing_user}.",
+                    5000,
+                )
+            elif not processing_user:
+                self.statusBar().showMessage(
+                    f"Impossible de réserver la ligne SQL pour entry_id={entry_id}.",
+                    5000,
+                )
+
+            self._claimed_entry_id = None
+
         self.refresh_left_table_processing_claims()
 
 
