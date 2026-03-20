@@ -1,5 +1,6 @@
 from __future__ import annotations
 from csv import writer
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 
 from .common import *
 from .workers import LinkDownloadWorker, LinkPostProcessWorker, _DownloadCanceled
@@ -87,12 +88,6 @@ class MainWindowValidationMixin:
                     f"Facture sauvegardée, mais impossible de mettre à jour le statut SQL :\n{e}"
                 )
 
-        # 2) Met à jour le modèle transporteur (patterns)
-        try:
-            self.save_supplier_model(show_message=False)
-        except Exception:
-            pass
-
         # 3) Déterminer la valeur à appliquer selon blocage
         doc_name = os.path.basename(self.current_pdf_path)
         blocked = bool((self.block_options.get(doc_name, {}) or {}).get("blocked", False))
@@ -107,6 +102,15 @@ class MainWindowValidationMixin:
                 self.tour_repo.set_block_status_for_tournr(t, is_blocked=blocked, motif=comment)
             except Exception as e:
                 errors.append(f"{t} : {e}")
+
+
+        # 4 bis) Alimentation LISINVOICE_EDTRANS
+        lisinvoice_errors = []
+        try:
+            lisinvoice_errors = self._push_lisinvoice_rows()
+        except Exception as e:
+            lisinvoice_errors = [str(e)]
+
 
         # 5) Copie DMS
         dms_path = ""
@@ -124,9 +128,20 @@ class MainWindowValidationMixin:
         except Exception as e:
             csv_error = str(e)
 
+
         # 6) Message final unique
+        all_error_parts = []
+
         if errors:
-            msg = "Facture VALIDÉE et sauvegardée.\n\nErreurs SQL :\n" + "\n".join(errors)
+            all_error_parts.append("Erreurs SQL tournées :\n" + "\n".join(errors))
+
+        if lisinvoice_errors:
+            all_error_parts.append(
+                "Erreurs LISINVOICE_EDTRANS :\n" + "\n".join(lisinvoice_errors)
+            )
+
+        if all_error_parts:
+            msg = "Facture VALIDÉE et sauvegardée.\n\n" + "\n\n".join(all_error_parts)
 
             if dms_path:
                 msg += f"\n\nPDF copié vers :\n{dms_path}"
@@ -154,6 +169,8 @@ class MainWindowValidationMixin:
                 msg += f"\n\nExport CSV échoué :\n{csv_error}"
 
             QMessageBox.information(self, "Validation", msg)
+
+
 
         # 7) Recharge le pool "En attente"
         try:
@@ -189,30 +206,12 @@ class MainWindowValidationMixin:
             self.apply_left_table_search_filter()
 
 
+
     def apply_left_filter_to_table(self):
-        if not hasattr(self, "pdf_table") or self.pdf_table is None:
-            return
+        """Applique les filtres (statut + recherche + pays) sur le tableau de gauche."""
+        if hasattr(self, "apply_left_table_search_filter"):
+            self.apply_left_table_search_filter()
 
-        mode = str(getattr(self, "left_filter_mode", "pending") or "pending").strip().lower()
-
-        for row in range(self.pdf_table.rowCount()):
-            it0 = self.pdf_table.item(row, 0)
-            if not it0:
-                self.pdf_table.setRowHidden(row, True)
-                continue
-
-            status = str(it0.data(Qt.UserRole + 1) or "pending").strip().lower()
-
-            if mode == "pending":
-                visible = (status == "pending")
-            elif mode == "validated":
-                visible = (status == "validated")
-            elif mode == "errors":
-                visible = (status == "error")
-            else:
-                visible = True
-
-            self.pdf_table.setRowHidden(row, not visible)
 
     def _has_saved_json_for_pdf(self, pdf_path: str) -> bool:
         if not pdf_path:
@@ -409,15 +408,28 @@ class MainWindowValidationMixin:
         for row in range(self.pdf_table.rowCount()):
             self.refresh_left_row_processing_state(row)    
 
+
+
     def on_ctrl_s_save(self):
-        # Ctrl+S = pas de popup, juste statusbar
         self.save_current_data(show_message=False)
 
-        # MAJ modèle supplier en silencieux
-        try:
-            self.save_supplier_model(show_message=False)
-        except Exception:
-            pass
+        # ✅ MAJ table de gauche (ligne groupe entry_id)
+        entry_id = str(self.selected_invoice_entry_id or "").strip()
+        if entry_id:
+            iban = self.iban_input.text().strip()
+            bic = self.bic_input.text().strip()
+            invoice_date = self.date_input.text().strip()
+
+            # pays: si tu as déjà current_transporter_country ou helper
+            country = ""
+            try:
+                if getattr(self, "selected_kundennr", None):
+                    country = str(self.transporter_repo.get_lkz_by_kundennr(str(self.selected_kundennr)) or "").strip()
+            except Exception:
+                country = ""
+
+            self._update_left_row_for_entry(entry_id, invoice_date, iban, bic, country)
+
 
     def _format_percent(self, v: float | None) -> str:
         if v is None:
@@ -1024,4 +1036,167 @@ class MainWindowValidationMixin:
             self._maybe_prompt_duplicate_invoice()
         except Exception:
             pass
+
+    def _to_sql_decimal_2(self, value) -> Decimal | None:
+        if value is None:
+            return None
+
+        s = str(value).strip()
+        if not s:
+            return None
+
+        s = s.replace("\u00A0", "").replace(" ", "")
+        s = s.replace(",", ".")
+
+        try:
+            return Decimal(s).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        except (InvalidOperation, ValueError):
+            return None
+
+    def _parse_invoice_date_for_sql(self, text: str):
+        s = str(text or "").strip()
+        if not s:
+            raise ValueError("Date de facture vide.")
+
+        formats = (
+            "%d/%m/%Y",
+            "%d.%m.%Y",
+            "%d-%m-%Y",
+            "%Y-%m-%d",
+            "%Y/%m/%d",
+            "%Y.%m.%d",
+            "%d/%m/%y",
+            "%d.%m.%y",
+            "%d-%m-%y",
+        )
+
+        for fmt in formats:
+            try:
+                return datetime.strptime(s, fmt).date()
+            except ValueError:
+                pass
+
+        raise ValueError(f"Format de date non reconnu pour RechDat : {s}")
+
+    def _resolve_lisinvoice_taux(self, tour_nrs: list[str]) -> Decimal:
+        """
+        1) on préfère le taux saisi/extrait dans la zone TVA
+        2) sinon fallback sur la TVA théorique BDD des tournées
+        3) on refuse s'il y a plusieurs taux distincts
+        """
+        rates: set[Decimal] = set()
+
+        for row in (self.get_vat_rows() or []):
+            rate = self._to_sql_decimal_2(row.get("rate"))
+            base = self._to_sql_decimal_2(row.get("base"))
+            vat = self._to_sql_decimal_2(row.get("vat"))
+
+            if rate is None and base is None and vat is None:
+                continue
+
+            if rate is not None:
+                rates.add(rate)
+
+        if len(rates) == 1:
+            return next(iter(rates))
+
+        if len(rates) > 1:
+            raise ValueError(
+                "Plusieurs taux TVA détectés dans la facture : impossible d'alimenter "
+                "LISINVOICE_EDTRANS car la colonne Taux est unique."
+            )
+
+        theo_rates: set[Decimal] = set()
+
+        for tour_nr in tour_nrs:
+            try:
+                val = self.tour_repo.get_theoretical_vat_percent_by_tournr(tour_nr)
+            except Exception:
+                val = None
+
+            dec = self._to_sql_decimal_2(val)
+            if dec is not None:
+                theo_rates.add(dec)
+
+        if len(theo_rates) == 1:
+            return next(iter(theo_rates))
+
+        if len(theo_rates) > 1:
+            raise ValueError(
+                "Plusieurs taux TVA théoriques trouvés sur les tournées : impossible "
+                "d'alimenter LISINVOICE_EDTRANS car la colonne Taux est unique."
+            )
+
+        raise ValueError("Aucun taux TVA exploitable trouvé pour LISINVOICE_EDTRANS.")
+
+    def _build_lisinvoice_rows(self) -> list[dict]:
+        invoice_nr, kundennr = self._get_invoice_number_and_kundennr_for_dupecheck()
+
+        if not invoice_nr:
+            raise ValueError("Numéro de facture vide.")
+        if not kundennr:
+            raise ValueError("KundenNr transporteur vide.")
+
+        rech_dat = self._parse_invoice_date_for_sql(self.date_input.text())
+
+        # une ligne LISINVOICE par tournée
+        pairs_by_tour: dict[str, Decimal] = {}
+
+        for row in self.get_folder_rows():
+            tour_nr = str(row.get("tour_nr") or "").strip()
+            ht = self._to_sql_decimal_2(row.get("amount_ht_ocr"))
+
+            if tour_nr and ht is not None:
+                pairs_by_tour[tour_nr] = ht
+
+        if not pairs_by_tour:
+            raise ValueError("Aucune tournée avec montant HT exploitable.")
+
+        taux = self._resolve_lisinvoice_taux(list(pairs_by_tour.keys()))
+        factor = (Decimal("100.00") + taux) / Decimal("100.00")
+
+        try:
+            kunden_value = int(str(kundennr).strip())
+        except Exception:
+            kunden_value = str(kundennr).strip()
+
+        rows: list[dict] = []
+
+        for tour_nr, ht in pairs_by_tour.items():
+            ttc = (ht * factor).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
+            rows.append({
+                "rech_nr": str(invoice_nr).strip(),
+                "rech_dat": rech_dat,
+                "ht": ht,
+                "ttc": ttc,
+                "taux": taux,
+                "kunden_nr": kunden_value,
+                "tour_nr": str(tour_nr).strip(),
+                "import_value": "NON",
+            })
+
+        return rows
+
+    def _push_lisinvoice_rows(self) -> list[str]:
+        errors: list[str] = []
+
+        rows = self._build_lisinvoice_rows()
+
+        for row in rows:
+            try:
+                self.lisinvoice_repo.upsert_invoice_row(
+                    rech_nr=row["rech_nr"],
+                    rech_dat=row["rech_dat"],
+                    ht=row["ht"],
+                    ttc=row["ttc"],
+                    taux=row["taux"],
+                    kunden_nr=row["kunden_nr"],
+                    tour_nr=row["tour_nr"],
+                    import_value=row["import_value"],
+                )
+            except Exception as e:
+                errors.append(f'{row["tour_nr"]} : {e}')
+
+        return errors
 

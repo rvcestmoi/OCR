@@ -186,6 +186,18 @@ class MainWindowTransportTablesMixin:
 
             self.transporter_info.setPlainText("\n".join(lines))
 
+            # MAJ colonne 'Pays' (LKZ) dans la liste de gauche dès qu'un transporteur est trouvé
+            try:
+                if getattr(self, "current_pdf_path", None):
+                    self._update_left_table_date_iban_bic(
+                        self.current_pdf_path,
+                        (self.date_input.text() if hasattr(self, "date_input") else ""),
+                        (self.iban_input.text() if hasattr(self, "iban_input") else ""),
+                        (self.bic_input.text() if hasattr(self, "bic_input") else ""),
+                    )
+            except Exception:
+                pass
+
             # mémorise la banque actuellement affichée pour le bouton de mise à jour
             if force_by_kundennr:
                 first_bank = banks[0] if banks else {}

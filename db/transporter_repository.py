@@ -138,3 +138,14 @@ class TransporterRepository(BaseRepository):
         self.execute(query, (konto_aux, kundennr))
 
 
+    def get_lkz_by_kundennr(self, kundennr: str) -> str:
+        query = """
+            SELECT LKZ
+            FROM XXAKun
+            WHERE KundenNr = ?
+        """
+        row = self.fetch_one(query, (kundennr,))
+        if not row:
+            return ""
+        return str(row.get("LKZ") or "").strip()
+

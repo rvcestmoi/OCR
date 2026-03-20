@@ -5,10 +5,6 @@ Supporte les variables d'environnement pour les données sensibles
 import os
 from dotenv import load_dotenv
 
-from app.settings import load_settings, get_path, get_ocr_value
-
-_SETTINGS = load_settings()
-
 # Charger les variables d'environnement depuis .env
 load_dotenv()
 
@@ -70,18 +66,15 @@ def get_connection_string_windows_auth():
 # Configuration OCR
 # =========================
 
-
 OCR_CONFIG = {
-    "tesseract_path": get_path(
-        _SETTINGS,
-        "tesseract_path",
-        r"C:\Users\hrouillard\AppData\Local\Programs\Tesseract-OCR\tesseract.exe",
+    "tesseract_path": os.getenv(
+        "TESSERACT_PATH",
+        r"C:\Users\hrouillard\AppData\Local\Programs\Tesseract-OCR\tesseract.exe"
     ),
-    "poppler_path": get_path(
-        _SETTINGS,
-        "poppler_path",
-        r"C:\poppler\Library\bin",
+    "poppler_path": os.getenv(
+        "POPPLER_PATH",
+        r"C:\poppler\Library\bin"
     ),
-    "ocr_dpi": int(get_ocr_value(_SETTINGS, "dpi", 150)),
-    "ocr_languages": str(get_ocr_value(_SETTINGS, "languages", "fra+eng+deu+spa+ita+nld")).split("+"),
+    "ocr_dpi": int(os.getenv("OCR_DPI", "150")),
+    "ocr_languages": os.getenv("OCR_LANGUAGES", "fra+eng+deu+spa+ita+nld").split("+"),
 }

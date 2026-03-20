@@ -457,7 +457,45 @@ class MainWindowDocumentsMixin:
             self.pdf_table.setItem(row_index, 0, it0)
             self.pdf_table.setItem(row_index, 1, QTableWidgetItem(invoice_date))
             self.pdf_table.setItem(row_index, 2, QTableWidgetItem(iban))
-            self.pdf_table.setItem(row_index, 3, QTableWidgetItem(bic))
+            self.pdf_table.setItem(row_index, 3, QTableWidgetItem(bic))            
+
+            # ✅ Fallback JSON (si la table XXA_LOGMAIL ne stocke pas encore IBAN/BIC/date)
+            # -> On affiche immédiatement ces valeurs dans la liste de gauche
+            # -> Et on les "rattrape" en BDD pour ne plus dépendre du JSON au prochain démarrage.
+            if not invoice_date or not iban or not bic:
+                j_date, j_iban, j_bic = self._get_saved_date_iban_bic_for_pdf(rep_path)
+
+                new_date = invoice_date or j_date
+                new_iban = iban or j_iban
+                new_bic  = bic or j_bic
+
+                # mise à jour UI (sinon tu ne vois rien tant que tu ne cliques pas la ligne)
+                if new_date and not invoice_date:
+                    self.pdf_table.item(row_index, 1).setText(new_date)
+                if new_iban and not iban:
+                    self.pdf_table.item(row_index, 2).setText(new_iban)
+                if new_bic and not bic:
+                    self.pdf_table.item(row_index, 3).setText(new_bic)
+
+                # rattrapage BDD (sans changer le status)
+                try:
+                    if entry_id and (new_date or new_iban or new_bic):
+                        self.logmail_repo.update_document_metadata_for_entry(
+                            entry_id,
+                            invoice_date=new_date,
+                            iban=new_iban,
+                            bic=new_bic,
+                            status=None,
+                        )
+                except Exception:
+                    pass
+
+                invoice_date, iban, bic = new_date, new_iban, new_bic
+
+            # Pays (dépend souvent du transporteur trouvé via IBAN/BIC)
+            lkz = self._get_country_for_document(rep_path, iban, bic)
+            self.pdf_table.setItem(row_index, 4, QTableWidgetItem(lkz))
+
 
         self.refresh_left_table_processing_states()
         self.refresh_left_table_processing_claims()
@@ -486,15 +524,25 @@ class MainWindowDocumentsMixin:
         model_dir = MODELS_DIR
         return os.path.join(model_dir, f"{base_name}.json")
 
+
     def _get_saved_json_path_for_pdf(self, pdf_path: str) -> str:
-        base_name = os.path.splitext(os.path.basename(pdf_path))[0]
-        model_dir = MODELS_DIR
-        return os.path.join(model_dir, f"{base_name}.json")
+        """Compat.
+
+        Avant la refacto, certains appels utilisaient une version "simple" du nom
+        (sans préfixe entry_id). Or les JSON sont maintenant nommés avec
+        `entry_id__<nom_fichier>.json`.
+
+        👉 On délègue donc à _get_saved_json_path() qui gère le préfixe.
+        """
+        return self._get_saved_json_path(pdf_path)
+
 
     def _get_saved_date_iban_bic_for_pdf(self, pdf_path: str) -> tuple[str, str, str]:
-        json_path = self._get_saved_json_path_for_pdf(pdf_path)
+        # IMPORTANT: utiliser la version "préfixée" (entry_id__) si nécessaire.
+        json_path = self._get_saved_json_path(pdf_path)
         if not os.path.exists(json_path):
             return ("", "", "")
+
         try:
             with open(json_path, "r", encoding="utf-8") as f:
                 data = json.load(f) or {}
@@ -506,18 +554,30 @@ class MainWindowDocumentsMixin:
         except Exception:
             return ("", "", "")
 
+    
+
     def _update_left_table_date_iban_bic(self, pdf_path: str, invoice_date: str, iban: str, bic: str):
-        """Met à jour en temps réel les colonnes Date / IBAN / BIC du tableau de gauche pour un PDF."""
+        """Met à jour en temps réel Date / IBAN / BIC / Pays du tableau de gauche pour un PDF."""
         if not pdf_path:
             return
-        if not hasattr(self, "pdf_table"):
+        if not hasattr(self, "pdf_table") or self.pdf_table is None:
             return
-        if self.pdf_table.columnCount() < 4:
+        if self.pdf_table.columnCount() < 5:
             return
 
         invoice_date = (invoice_date or "").strip()
         iban = (iban or "").strip()
         bic = (bic or "").strip()
+
+        # Pays (LKZ) : priorité au transporteur sélectionné, sinon déduction via IBAN/BIC
+        lkz = ""
+        try:
+            if getattr(self, "selected_kundennr", None):
+                lkz = str(self.transporter_repo.get_lkz_by_kundennr(str(self.selected_kundennr)) or "").strip()
+        except Exception:
+            lkz = ""
+        if not lkz:
+            lkz = self._get_country_for_bank(iban, bic)
 
         for row in range(self.pdf_table.rowCount()):
             it0 = self.pdf_table.item(row, 0)
@@ -528,7 +588,9 @@ class MainWindowDocumentsMixin:
                 self.pdf_table.setItem(row, 1, QTableWidgetItem(invoice_date))
                 self.pdf_table.setItem(row, 2, QTableWidgetItem(iban))
                 self.pdf_table.setItem(row, 3, QTableWidgetItem(bic))
+                self.pdf_table.setItem(row, 4, QTableWidgetItem(lkz))
                 return
+
 
     def showEvent(self, event):
         super().showEvent(event)
@@ -571,22 +633,62 @@ class MainWindowDocumentsMixin:
                 self.pdf_table.setItem(row, 3, QTableWidgetItem(bic))
             else:
                 it3.setText(bic)
+
+            lkz = self._get_country_for_document(pdf_path, iban, bic)
+            it4 = self.pdf_table.item(row, 4)
+            if it4 is None:
+                self.pdf_table.setItem(row, 4, QTableWidgetItem(lkz))
+            else:
+                it4.setText(lkz)
         self.apply_left_table_search_filter()
 
     def _is_typing_in_input(self) -> bool:
         w = QApplication.focusWidget()
         return isinstance(w, (QLineEdit, QTextEdit, QPlainTextEdit))
+
+
+
+    def _get_country_for_bank(self, iban: str | None, bic: str | None) -> str:
+        """Retourne le LKZ du transporteur à partir d'un couple IBAN/BIC (avec cache)."""
+        iban = str(iban or "").strip()
+        bic = str(bic or "").strip()
+        if not iban or not bic:
+            return ""
+
+        cache = getattr(self, "_lkz_cache", None)
+        if cache is None:
+            cache = {}
+            self._lkz_cache = cache
+
+        key = (iban, bic)
+        if key in cache:
+            return cache.get(key) or ""
+
+        lkz = ""
+        try:
+            rec = self.transporter_repo.find_transporter_by_bank(iban, bic)
+            if rec:
+                lkz = str(rec.get("LKZ") or rec.get("lkz") or "").strip()
+        except Exception:
+            lkz = ""
+
+        cache[key] = lkz
+        return lkz
     
 
     def apply_left_table_search_filter(self):
+        """Filtre combiné (statut + recherche globale + filtre pays)."""
         if not hasattr(self, "pdf_table") or self.pdf_table is None:
             return
 
         mode = str(getattr(self, "left_filter_mode", "pending") or "pending").strip().lower()
+        query = (getattr(self, "left_search_input", None).text() if getattr(self, "left_search_input", None) else "")
+        query = (query or "").strip().lower()
 
-        query = ""
-        if hasattr(self, "left_search_input") and self.left_search_input is not None:
-            query = (self.left_search_input.text() or "").strip().lower()
+        country_q = (getattr(self, "left_country_filter_input", None).text() if getattr(self, "left_country_filter_input", None) else "")
+        country_q = (country_q or "").strip().lower()
+
+        cols_count = self.pdf_table.columnCount()
 
         for row in range(self.pdf_table.rowCount()):
             it0 = self.pdf_table.item(row, 0)
@@ -596,7 +698,7 @@ class MainWindowDocumentsMixin:
 
             status = str(it0.data(Qt.UserRole + 1) or "pending").strip().lower()
 
-            # 1) filtre d'onglet
+            # 1) filtre statut
             if mode == "pending":
                 status_visible = (status == "pending")
             elif mode == "validated":
@@ -606,14 +708,68 @@ class MainWindowDocumentsMixin:
             else:
                 status_visible = True
 
-            # 2) filtre de recherche
+            # 2) filtre recherche globale
             values = []
-            for col in range(min(self.pdf_table.columnCount(), 4)):
+            for col in range(cols_count):
                 it = self.pdf_table.item(row, col)
-                values.append((it.text() if it else "").strip().lower())
-
+                if it:
+                    values.append((it.text() or "").strip().lower())
             haystack = " | ".join(values)
             search_visible = (not query) or (query in haystack)
 
-            # 3) combinaison des deux
-            self.pdf_table.setRowHidden(row, not (status_visible and search_visible))
+            # 3) filtre pays (col 4)
+            if country_q and cols_count >= 5:
+                it = self.pdf_table.item(row, 4)
+                lkz_txt = str(it.text() if it else "").strip().lower()
+                country_visible = lkz_txt.startswith(country_q)
+            else:
+                country_visible = True
+
+            self.pdf_table.setRowHidden(row, not (status_visible and search_visible and country_visible))
+
+
+    def _get_country_for_document(self, pdf_path: str, iban: str | None, bic: str | None) -> str:
+        """Pays (LKZ) affiché dans la liste de gauche.
+
+        Priorité :
+        1) si le JSON sauvegardé contient transporter_kundennr => on lit LKZ dans XXAKun
+        2) sinon fallback sur la recherche par banque (IBAN/BIC)
+        """
+        try:
+            data = self._read_saved_invoice_json(pdf_path) or {}
+            kundennr = str(data.get("transporter_kundennr") or "").strip()
+            if kundennr:
+                lkz = str(self.transporter_repo.get_lkz_by_kundennr(kundennr) or "").strip()
+                if lkz:
+                    return lkz
+        except Exception:
+            pass
+
+        return self._get_country_for_bank(iban, bic)
+
+    def _update_left_row_for_entry(self, entry_id: str, invoice_date: str, iban: str, bic: str, country: str = ""):
+        """Met à jour la ligne 'groupe' (1 ligne par entry_id) dans la table de gauche."""
+        if not entry_id or not hasattr(self, "pdf_table") or self.pdf_table is None:
+            return
+        entry_id = str(entry_id).strip()
+
+        for row in range(self.pdf_table.rowCount()):
+            it0 = self.pdf_table.item(row, 0)
+            if not it0:
+                continue
+
+            row_entry_id = str(it0.data(Qt.UserRole + 4) or "").strip()  # ✅ entry_id stocké dans la table
+            if row_entry_id != entry_id:
+                continue
+
+            # Cols existantes: 0 Nom | 1 Date | 2 IBAN | 3 BIC | (4 Pays si tu l'as)
+            if self.pdf_table.columnCount() >= 2:
+                self.pdf_table.setItem(row, 1, QTableWidgetItem((invoice_date or "").strip()))
+            if self.pdf_table.columnCount() >= 3:
+                self.pdf_table.setItem(row, 2, QTableWidgetItem((iban or "").strip()))
+            if self.pdf_table.columnCount() >= 4:
+                self.pdf_table.setItem(row, 3, QTableWidgetItem((bic or "").strip()))
+            if self.pdf_table.columnCount() >= 5:
+                self.pdf_table.setItem(row, 4, QTableWidgetItem((country or "").strip()))
+
+            return

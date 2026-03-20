@@ -11,6 +11,7 @@ from .mainwindow.cmr_mixin import MainWindowCmrMixin
 from .mainwindow.links_mixin import MainWindowLinksMixin
 from app.paths import PDF_INBOX_DIR
 from db.xxare_repository import XXAReRepository
+from db.lisinvoice_repository import LISInvoiceRepository
 
 
 class MainWindow(
@@ -27,6 +28,7 @@ class MainWindow(
 
     def __init__(self):
         super().__init__()
+        
         from db.connection import SqlServerConnection
         from db.config import DB_CONFIG
         from db.logmail_repository import LogmailRepository
@@ -50,6 +52,7 @@ class MainWindow(
         self.bank_repo = BankRepository(self.db_conn)
         self.tour_repo = TourRepository(self.db_conn)
         self.xxare_repo = XXAReRepository(self.db_conn)
+        self.lisinvoice_repo = LISInvoiceRepository(self.db_conn)
         self.DOSSIER_PATTERN = DOSSIER_PATTERN
         # --- State ---
         self.current_pdf_path: str | None = None
@@ -72,6 +75,7 @@ class MainWindow(
         self._ab_cache: dict[str, bool] = {}
         self._europal_cache: dict[str, bool] = {}
         self._pending_tags_to_add: set[str] = set()
+        self._lkz_cache: dict[tuple[str, str], str] = {}
 
         
 
@@ -116,14 +120,16 @@ class MainWindow(
 
         self.pdf_table = QTableWidget(left_top_widget)
         self.pdf_table.setObjectName("pdf_table")
-        self.pdf_table.setColumnCount(4)
-        self.pdf_table.setHorizontalHeaderLabels(["Nom du fichier", "Date", "IBAN", "BIC"])
+        # Cols: 0 Nom | 1 Date | 2 IBAN | 3 BIC | 4 Pays (LKZ)
+        self.pdf_table.setColumnCount(5)
+        self.pdf_table.setHorizontalHeaderLabels(["Nom du fichier", "Date", "IBAN", "BIC", "Pays"])
 
         hdr = self.pdf_table.horizontalHeader()
         hdr.setSectionResizeMode(0, QHeaderView.Stretch)
         hdr.setSectionResizeMode(1, QHeaderView.ResizeToContents)
         hdr.setSectionResizeMode(2, QHeaderView.ResizeToContents)
         hdr.setSectionResizeMode(3, QHeaderView.ResizeToContents)
+        hdr.setSectionResizeMode(4, QHeaderView.ResizeToContents)
 
         self.pdf_table.setSelectionBehavior(QTableWidget.SelectRows)
         self.pdf_table.setEditTriggers(QTableWidget.NoEditTriggers)
@@ -147,6 +153,17 @@ class MainWindow(
 
         self.btn_filter_errors = QPushButton("⚠️ Erreurs")
         self.btn_filter_errors.setCheckable(True)
+
+        # Filtre pays (LKZ) – ne filtre que sur la colonne "Pays"
+        self.left_country_filter_input = QLineEdit()
+        self.left_country_filter_input.setPlaceholderText("Pays (ex: FR)")
+        self.left_country_filter_input.setClearButtonEnabled(True)
+        self.left_country_filter_input.setMaximumWidth(110)
+        self.left_country_filter_input.textChanged.connect(self.apply_left_table_search_filter)
+
+        filter_bar.addStretch(1)
+        filter_bar.addWidget(QLabel("Pays:"))
+        filter_bar.addWidget(self.left_country_filter_input)
 
         self._filter_group = QButtonGroup(self)
         self._filter_group.setExclusive(True)

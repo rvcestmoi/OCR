@@ -257,12 +257,21 @@ class MainWindowLinksMixin:
             json.dump(data, f, ensure_ascii=False, indent=2)
 
     def on_save_clicked(self):
-        # sauvegarde normale (avec popup)
-        self.save_current_data(show_message=True)
+        self.save_current_data(show_message=False)
 
-        # MAJ modèle supplier en silencieux
-        try:
-            self.save_supplier_model(show_message=False)
-        except Exception:
-            pass
+        # ✅ MAJ table de gauche (ligne groupe entry_id)
+        entry_id = str(self.selected_invoice_entry_id or "").strip()
+        if entry_id:
+            iban = self.iban_input.text().strip()
+            bic = self.bic_input.text().strip()
+            invoice_date = self.date_input.text().strip()
 
+            # pays: si tu as déjà current_transporter_country ou helper
+            country = ""
+            try:
+                if getattr(self, "selected_kundennr", None):
+                    country = str(self.transporter_repo.get_lkz_by_kundennr(str(self.selected_kundennr)) or "").strip()
+            except Exception:
+                country = ""
+
+            self._update_left_row_for_entry(entry_id, invoice_date, iban, bic, country)

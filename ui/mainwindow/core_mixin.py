@@ -99,7 +99,7 @@ class MainWindowCoreMixin:
             return
 
         self.selected_invoice_filename = os.path.basename(self.current_pdf_path)
-        print(f"PDF sélectionné: {self.selected_invoice_filename} ({self.current_pdf_path})")
+
 
         entry_id = item.data(Qt.UserRole + 4)
         new_entry_id = str(entry_id or "").strip()
@@ -208,18 +208,28 @@ class MainWindowCoreMixin:
         self.current_match_index = -1
         self.search_counter_label.setText("0 / 0")
 
-        # 1) Si un JSON existe -> on recharge et on NE FAIT PAS d'OCR (même si le load échoue)
-        json_path = self._get_saved_json_path(self.current_pdf_path)
-        if os.path.exists(json_path):
-            ok = self.load_saved_data()
-            if ok:
-                self.check_bank_information()
-                self.load_transporter_information()
-                self.highlight_missing_fields()
-            else:
-                # pas d'OCR automatique : on évite d'écraser les champs
-                self.statusBar().showMessage("Données sauvegardées trouvées mais chargement impossible (pas d'OCR auto).", 5000)
-            return
+        # ✅ Pré-remplir depuis la BDD (liste de gauche) quand dispo
+        # Objectif : les champs "légers" (date/iban/bic) viennent prioritairement de SQL,
+        # et le JSON reste pour les champs lourds (OCR, dossiers, TVA, etc.).
+        try:
+            row = self.pdf_table.currentRow() if hasattr(self, "pdf_table") else -1
+            if row is not None and row >= 0 and getattr(self, "pdf_table", None) is not None:
+                it_date = self.pdf_table.item(row, 1)  # Date (col 1)
+                it_iban = self.pdf_table.item(row, 2)  # IBAN (col 2)
+                it_bic  = self.pdf_table.item(row, 3)  # BIC  (col 3)
+
+                db_date = (it_date.text() if it_date else "").strip()
+                db_iban = (it_iban.text() if it_iban else "").strip()
+                db_bic  = (it_bic.text() if it_bic else "").strip()
+
+                if db_date:
+                    self.date_input.setText(db_date)
+                if db_iban:
+                    self.iban_input.setText(db_iban)
+                if db_bic:
+                    self.bic_input.setText(db_bic)
+        except Exception:
+            pass
 
     def analyze_pdf(self, checked: bool = False, show_message: bool = False):
 
@@ -551,17 +561,9 @@ class MainWindowCoreMixin:
         except Exception:
             pass
 
-        # écriture disque
-        try:
-            os.makedirs(os.path.dirname(json_path), exist_ok=True)
-            with open(json_path, "w", encoding="utf-8") as f:
-                json.dump(data, f, ensure_ascii=False, indent=2)
-        except Exception as e:
-            if show_message:
-                QMessageBox.warning(self, "Sauvegarde", f"Impossible d'écrire le JSON :\n{e}")
-            return False
 
-        # pousse aussi les métadonnées en BDD pour alimenter la liste gauche
+        # ✅ 1) pousse d'abord les métadonnées en BDD (liste gauche)
+        sql_error = None
         try:
             if current_entry_id:
                 self.logmail_repo.update_document_metadata_for_entry(
@@ -572,13 +574,28 @@ class MainWindowCoreMixin:
                     status=str(status or "").strip().lower() if status else None,
                 )
         except Exception as e:
-            # on ne bloque pas la sauvegarde JSON si la synchro SQL échoue
+            # on garde l'erreur mais on continue (les champs lourds restent en fichier)
+            sql_error = e
+
+        # ✅ 2) écriture disque (champs lourds)
+        try:
+            os.makedirs(os.path.dirname(json_path), exist_ok=True)
+            with open(json_path, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            # si le SQL est passé mais pas le fichier, on le dit clairement
             if show_message:
-                QMessageBox.warning(
-                    self,
-                    "Sauvegarde",
-                    f"Le JSON a été sauvegardé, mais la mise à jour SQL a échoué :\n{e}"
-                )
+                extra = "" if not sql_error else f"\n\nNote: la mise à jour SQL a été tentée et a échoué: {sql_error}"
+                QMessageBox.warning(self, "Sauvegarde", f"Impossible d'écrire le JSON :\n{e}{extra}")
+            return False
+
+        # si la synchro SQL a échoué, on prévient sans bloquer
+        if sql_error is not None and show_message:
+            QMessageBox.warning(
+                self,
+                "Sauvegarde",
+                f"Le fichier a été sauvegardé, mais la mise à jour SQL a échoué :\n{sql_error}"
+            )
 
         # si on a retrouvé un entry_id, on le garde en mémoire pour la suite
         if current_entry_id:
@@ -604,11 +621,23 @@ class MainWindowCoreMixin:
         except Exception:
             pass
 
+        # ✅ met aussi à jour le modèle transporteur après une sauvegarde réussie
+        supplier_model_error = None
+        try:
+            self.save_supplier_model(show_message=False)
+        except Exception as e:
+            supplier_model_error = e
+
         if show_message:
-            self.statusBar().showMessage("Données sauvegardées.", 2500)
+            if supplier_model_error is None:
+                self.statusBar().showMessage("Données sauvegardées.", 2500)
+            else:
+                self.statusBar().showMessage(
+                    f"Données sauvegardées, mais modèle transporteur non mis à jour : {supplier_model_error}",
+                    5000
+                )
 
         return True
-
 
 
     def load_saved_data(self) -> bool:
@@ -640,13 +669,25 @@ class MainWindowCoreMixin:
             bic = str(data.get("bic", "") or "").strip()
             invoice_number = str(data.get("invoice_number", "") or "").strip()
 
-            self.iban_input.setText(iban)
-            self.bic_input.setText(bic)
-            self.date_input.setText(invoice_date)
+            # ✅ Ne pas écraser les champs SQL (pré-remplis) par du vide JSON
+            if iban:
+                self.iban_input.setText(iban)
+            if bic:
+                self.bic_input.setText(bic)
+            if invoice_date:
+                self.date_input.setText(invoice_date)
+
+
             self.invoice_number_input.setText(invoice_number)
 
-            # synchro tableau de gauche
-            self._update_left_table_date_iban_bic(self.current_pdf_path, invoice_date, iban, bic)
+
+            self._update_left_table_date_iban_bic(
+                self.current_pdf_path,
+                (invoice_date or self.date_input.text().strip()),
+                (iban or self.iban_input.text().strip()),
+                (bic or self.bic_input.text().strip()),
+            )
+
 
             # --- Transporteur ---
             saved_text = str(data.get("transporter_text") or "").strip()
