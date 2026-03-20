@@ -3,7 +3,7 @@ from dataclasses import dataclass, field
 from typing import List, Dict, Optional
 from collections import Counter
 
-from .supplier_model import validate_iban
+from .supplier_model import extract_iban_candidates, validate_iban, validate_bic
 from .folder_patterns import (
     DOSSIER_PATTERN,
     DOSSIER_CANDIDATE,
@@ -38,8 +38,8 @@ IBAN_CANDIDATE_REGEX = re.compile(
 BIC_REGEX = re.compile(r"\b[A-Z]{4}[A-Z]{2}[A-Z0-9]{2}(?:[A-Z0-9]{3})?\b")
 
 BIC_BLACKLIST = {
-    "LOGISTIK", "TRANSPORT", "MODE", "REGLEMENT",
-    "PAYMENT", "INVOICE", "FACTURE", "BANK", "IBAN", "BIC"
+    "LOGISTIK", "TRANSPORT", "MODE", "REGLEMENT", "PAYMENT", "INVOICE", "FACTURE",
+    "BANK", "IBAN", "BIC", "SWIFT", "DETAILDE", "DETAILDU", "VIREMENT", "ECHEANCE"
 }
 
 BASE_LABEL_RE = re.compile(r"(BASE\s*HT|TOTAL\s*HT|TOTAL\s*HT\s*NET)", re.IGNORECASE)
@@ -140,42 +140,10 @@ def _fix_iban_ocr(iban: str) -> str:
 
 
 def extract_iban(text: str) -> str:
-    # Ne pas remplacer les \n par des espaces ici
-    src = (text or "").upper().replace("\u00A0", " ")
-
-    def _norm_iban(s: str) -> str:
-        return re.sub(r"[ \u00A0-]", "", s or "").upper().strip()
-
-    # 1) priorité : proche du label IBAN
-    for m in re.finditer(r"\bIBAN\b", src, flags=re.IGNORECASE):
-        chunk = src[m.end(): m.end() + 260].replace(":", " ").replace("=", " ")
-        for mm in IBAN_CANDIDATE_REGEX.finditer(chunk):
-            iban = _norm_iban(mm.group(0))
-            if 15 <= len(iban) <= 34:
-                if validate_iban(iban):
-                    return iban
-                fixed = _fix_iban_ocr(iban)
-                if fixed and validate_iban(fixed):
-                    return fixed
-
-    # 2) fallback global
-    candidates = []
-    for mm in IBAN_CANDIDATE_REGEX.finditer(src):
-        iban = _norm_iban(mm.group(0))
-        if 15 <= len(iban) <= 34:
-            if validate_iban(iban):
-                candidates.append(iban)
-                continue
-
-            fixed = _fix_iban_ocr(iban)
-            if fixed and validate_iban(fixed):
-                candidates.append(fixed)
-
-    if not candidates:
+    counts = extract_iban_candidates(text or "", prefer_labels=True)
+    if not counts:
         return ""
-
-    counts = Counter(candidates)
-    return sorted(counts.items(), key=lambda kv: (kv[1], len(kv[0])), reverse=True)[0][0]
+    return counts.most_common(1)[0][0]
 
 
 def extract_bic(text: str) -> str:
@@ -187,6 +155,9 @@ def extract_bic(text: str) -> str:
             r"\bBIC\b",
             r"\bSWIFT\b",
             r"\bB\.?I\.?C\.?\b",
+            r"\bCODE\s+SWIFT\b",
+            r"\bCOD[EF]\s+SWIFT\b",
+            r"\bCONF\s+SWIFT\b",
         ],
         value_regex=BIC_REGEX,
         window=120,
@@ -195,15 +166,10 @@ def extract_bic(text: str) -> str:
     if not bic:
         return ""
 
-    bic = bic.strip()
-
-    if len(bic) not in (8, 11):
-        return ""
-
+    bic = bic.strip().replace(" ", "")
     if bic in BIC_BLACKLIST:
         return ""
-
-    if not bic[:4].isalpha():
+    if not validate_bic(bic):
         return ""
 
     return bic

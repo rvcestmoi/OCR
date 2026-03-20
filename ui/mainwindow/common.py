@@ -25,12 +25,13 @@ from PySide6.QtWidgets import (QApplication, QButtonGroup, QCompleter, QDialog,
 
 from app.paths import DEFAULT_PDF_FOLDER, MODELS_DIR, SUPPLIERS_DIR
 from ocr.invoice_parser import parse_invoice
-from ocr.ocr_engine import extract_text_from_pdf
+from ocr.field_detector import detect_fields_multilingual
+from ocr.ocr_engine import extract_text_from_pdf, extract_text_with_tesseract
 from ocr.document_classifier import classify_document_text
 from ocr.supplier_model import (build_supplier_key, extract_best_bank_ids,
                                 extract_fields_with_model, learn_supplier_patterns,
                                 load_supplier_model, merge_patterns,
-                                save_supplier_model)
+                                save_supplier_model, validate_bic, validate_iban)
 from ui.block_options_dialog import BlockOptionsDialog
 from ui.folder_select_dialog import FolderSelectDialog
 from ui.pdf_viewer import PdfViewer

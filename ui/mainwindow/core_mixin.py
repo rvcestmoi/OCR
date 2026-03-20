@@ -1,5 +1,6 @@
 from __future__ import annotations
 import fitz
+import pytesseract
 from .common import *
 from .workers import LinkDownloadWorker, LinkPostProcessWorker, _DownloadCanceled
 
@@ -279,9 +280,18 @@ class MainWindowCoreMixin:
                 prefer_bic=self.bic_input.text().strip(),
             )
 
-            if best["iban"] and not self.iban_input.text().strip():
+            current_iban = self.iban_input.text().strip()
+            current_bic = self.bic_input.text().strip()
+            bic_scores = dict(best.get("bic_candidates") or [])
+            best_bic_score = int(bic_scores.get(best.get("bic") or "", 0) or 0)
+            current_bic_score = int(bic_scores.get(current_bic.replace(" ", "").upper(), 0) or 0)
+            if best["iban"] and (not current_iban or not validate_iban(current_iban)):
                 self.iban_input.setText(best["iban"])
-            if best["bic"] and not self.bic_input.text().strip():
+            if best["bic"] and (
+                not current_bic
+                or not validate_bic(current_bic)
+                or (best["bic"] != current_bic.replace(" ", "").upper() and best_bic_score > current_bic_score)
+            ):
                 self.bic_input.setText(best["bic"])
 
             supplier_key = build_supplier_key(
@@ -299,6 +309,230 @@ class MainWindowCoreMixin:
             QMessageBox.critical(self, "Erreur OCR", str(e))
         if show_message:
             QMessageBox.information(...)
+
+    def _build_progress_dialog(self, title: str, label: str, maximum: int) -> QProgressDialog:
+        dlg = QProgressDialog(label, "Annuler", 0, max(0, int(maximum)), self)
+        dlg.setWindowTitle(title)
+        dlg.setWindowModality(Qt.WindowModal)
+        dlg.setMinimumDuration(0)
+        dlg.setAutoClose(False)
+        dlg.setAutoReset(False)
+        dlg.setValue(0)
+        return dlg
+    def analyze_pdf_deep(self, checked: bool = False):
+        if not self.current_pdf_path:
+            QMessageBox.warning(self, "OCR profond", "Aucun document sélectionné.")
+            return
+
+        progress = None
+        try:
+            progress = self._build_progress_dialog("OCR profond", "Préparation OCR profond…", 1)
+            progress.show()
+            QApplication.processEvents()
+
+            def _on_progress(current: int, total: int, label: str):
+                if progress is None:
+                    return
+                total = max(1, int(total or 1))
+                current = max(0, min(int(current or 0), total))
+                if progress.maximum() != total:
+                    progress.setMaximum(total)
+                progress.setLabelText(label)
+                progress.setValue(current)
+                QApplication.processEvents()
+                if progress.wasCanceled():
+                    raise _DownloadCanceled()
+
+            deep_text = (extract_text_with_tesseract(self.current_pdf_path, progress_callback=_on_progress) or "").strip()
+            if progress is not None:
+                progress.setValue(progress.maximum())
+                QApplication.processEvents()
+
+            if not deep_text:
+                QMessageBox.information(self, "OCR profond", "Aucun texte exploitable n'a été trouvé par Tesseract.")
+                return
+
+            current_text = (self.ocr_text_view.toPlainText() or "").strip()
+            if current_text:
+                norm_current = re.sub(r"\s+", " ", current_text).strip()
+                norm_deep = re.sub(r"\s+", " ", deep_text).strip()
+                if norm_deep and norm_deep not in norm_current:
+                    merged_text = current_text + "\n\n===== OCR PROFOND (TESSERACT) =====\n" + deep_text
+                else:
+                    merged_text = current_text
+            else:
+                merged_text = deep_text
+
+            self.ocr_text_view.setPlainText(merged_text)
+
+            data = parse_invoice(merged_text)
+            self._merge_invoice_data_without_overwrite(data)
+
+            detected_fields = detect_fields_multilingual(merged_text)
+            if detected_fields:
+                self._merge_detected_fields_without_overwrite(detected_fields)
+
+            self.autofill_folder_amounts_from_ocr(merged_text)
+            self.update_folder_totals()
+            self.check_bank_information()
+            self.load_transporter_information()
+
+            best = extract_best_bank_ids(
+                merged_text,
+                prefer_iban=self.iban_input.text().strip(),
+                prefer_bic=self.bic_input.text().strip(),
+            )
+            current_iban = self.iban_input.text().strip()
+            current_bic = self.bic_input.text().strip()
+            bic_scores = dict(best.get("bic_candidates") or [])
+            best_bic_score = int(bic_scores.get(best.get("bic") or "", 0) or 0)
+            current_bic_score = int(bic_scores.get(current_bic.replace(" ", "").upper(), 0) or 0)
+            if best["iban"] and (not current_iban or not validate_iban(current_iban)):
+                self.iban_input.setText(best["iban"])
+            if best["bic"] and (
+                not current_bic
+                or not validate_bic(current_bic)
+                or (best["bic"] != current_bic.replace(" ", "").upper() and best_bic_score > current_bic_score)
+            ):
+                self.bic_input.setText(best["bic"])
+
+            supplier_key = build_supplier_key(
+                self.iban_input.text().strip(),
+                self.bic_input.text().strip(),
+            )
+            if supplier_key:
+                model = load_supplier_model(supplier_key)
+                if model:
+                    self.apply_supplier_model(model)
+
+            self.highlight_missing_fields()
+            self.statusBar().showMessage("OCR profond terminé.", 4000)
+        except _DownloadCanceled:
+            self.statusBar().showMessage("OCR profond annulé.", 4000)
+        except pytesseract.TesseractNotFoundError:
+            QMessageBox.critical(
+                self,
+                "OCR profond",
+                "Tesseract est introuvable. Vérifie le chemin 'tesseract_path' dans settings/app_settings.json.",
+            )
+        except Exception as e:
+            QMessageBox.critical(self, "OCR profond", str(e))
+        finally:
+            if progress is not None:
+                progress.close()
+
+    def _merge_invoice_data_without_overwrite(self, data):
+        current_iban = self.iban_input.text().strip()
+        current_bic = self.bic_input.text().strip()
+
+        if getattr(data, "iban", "") and (not current_iban or not validate_iban(current_iban)):
+            if validate_iban(str(data.iban or "")):
+                self.iban_input.setText(data.iban)
+
+        if getattr(data, "bic", "") and (not current_bic or not validate_bic(current_bic)):
+            if validate_bic(str(data.bic or "")):
+                self.bic_input.setText(data.bic)
+
+        if getattr(data, "invoice_date", "") and not self.date_input.text().strip():
+            self.date_input.setText(data.invoice_date)
+
+        current_invoice_number = (self.invoice_number_input.text() or "").strip()
+        if getattr(data, "invoice_number", "") and not current_invoice_number:
+            self.invoice_number_input.setText(data.invoice_number)
+
+        existing_folders = {
+            str(row.get("tour_nr") or "").strip()
+            for row in (self.get_folder_rows() if hasattr(self, "get_folder_rows") else [])
+            if str(row.get("tour_nr") or "").strip()
+        }
+        for folder_number in list(getattr(data, "folder_numbers", None) or []):
+            folder_number = str(folder_number or "").strip()
+            if not folder_number or folder_number in existing_folders:
+                continue
+            if not self._fill_first_empty_folder_row(folder_number):
+                self._add_folder_row(folder_number, "")
+            existing_folders.add(folder_number)
+        self._ensure_empty_folder_row()
+
+        existing_vat = {
+            (
+                str(row.get("rate") or "").strip(),
+                str(row.get("base") or "").strip(),
+                str(row.get("vat") or "").strip(),
+            )
+            for row in (self.get_vat_rows() if hasattr(self, "get_vat_rows") else [])
+        }
+        for vat_row in list(getattr(data, "vat_lines", None) or []):
+            candidate = (
+                str(vat_row.get("rate") or "").strip(),
+                str(vat_row.get("base") or "").strip(),
+                str(vat_row.get("vat") or "").strip(),
+            )
+            if candidate in existing_vat or not any(candidate):
+                continue
+            if not self._fill_first_empty_vat_row(*candidate):
+                self._add_vat_row(*candidate)
+            existing_vat.add(candidate)
+        self._ensure_empty_vat_row()
+        self.update_vat_total()
+
+    def _fill_first_empty_folder_row(self, dossier: str) -> bool:
+        for row in range(self.folder_table.rowCount()):
+            dossier_le, amount_le, _ = self._get_row_widgets(row)
+            dossier_txt = (dossier_le.text() if dossier_le else "").strip()
+            amount_txt = (amount_le.text() if amount_le else "").strip()
+            if dossier_le and not dossier_txt and not amount_txt:
+                dossier_le.setText(dossier)
+                return True
+        return False
+
+    def _fill_first_empty_vat_row(self, rate: str, base: str, vat: str) -> bool:
+        for row in range(self.vat_table.rowCount()):
+            rate_le, base_le, vat_le = self._get_vat_row_widgets(row)
+            rate_txt = (rate_le.text() if rate_le else "").strip()
+            base_txt = (base_le.text() if base_le else "").strip()
+            vat_txt = (vat_le.text() if vat_le else "").strip()
+            if rate_le and base_le and vat_le and not rate_txt and not base_txt and not vat_txt:
+                rate_le.setText(rate)
+                base_le.setText(base)
+                vat_le.setText(vat)
+                return True
+        return False
+
+    def _merge_detected_fields_without_overwrite(self, detected: dict):
+        if not isinstance(detected, dict) or not detected:
+            return
+
+        iban = str(detected.get("iban") or "").replace(" ", "").upper().strip()
+        current_iban = self.iban_input.text().strip()
+        if iban and validate_iban(iban) and (not current_iban or not validate_iban(current_iban)):
+            self.iban_input.setText(iban)
+
+        bic = str(detected.get("bic") or "").replace(" ", "").upper().strip()
+        current_bic = self.bic_input.text().strip()
+        if bic and validate_bic(bic) and (not current_bic or not validate_bic(current_bic)):
+            self.bic_input.setText(bic)
+
+        date_value = str(detected.get("date") or "").strip()
+        if date_value and not self.date_input.text().strip():
+            self.date_input.setText(date_value)
+
+        invoice_number = str(detected.get("invoice_number") or "").strip()
+        if invoice_number and not self.invoice_number_input.text().strip():
+            self.invoice_number_input.setText(invoice_number)
+
+        folder_number = str(detected.get("folder_number") or "").strip()
+        if folder_number:
+            existing_folders = {
+                str(row.get("tour_nr") or "").strip()
+                for row in (self.get_folder_rows() if hasattr(self, "get_folder_rows") else [])
+                if str(row.get("tour_nr") or "").strip()
+            }
+            if folder_number not in existing_folders:
+                if not self._fill_first_empty_folder_row(folder_number):
+                    self._add_folder_row(folder_number, "")
+                self._ensure_empty_folder_row()
+
 
     def fill_fields(self, data):
         # Champs simples
@@ -771,51 +1005,70 @@ class MainWindowCoreMixin:
             QMessageBox.information(self, "OCR", "Aucun PDF à traiter.")
             return
 
+        total_rows = self.pdf_table.rowCount()
+
         # sauvegarde l'état courant
         previous_pdf = self.current_pdf_path
 
         processed = 0
         skipped = 0
         errors = 0
+        canceled = False
+        progress = self._build_progress_dialog("OCR de masse", f"OCR 0/{total_rows}", total_rows)
+        progress.show()
+        QApplication.processEvents()
 
-        for row in range(self.pdf_table.rowCount()):
-            it0 = self.pdf_table.item(row, 0)
-            if not it0:
-                continue
+        try:
+            for row in range(total_rows):
+                if progress.wasCanceled():
+                    canceled = True
+                    break
 
-            pdf_path = it0.data(Qt.UserRole)
-            if not is_ocr_allowed_document(pdf_path):
-                skipped += 1
-                continue
+                it0 = self.pdf_table.item(row, 0)
+                progress.setValue(row)
+                progress.setLabelText(f"OCR {row + 1}/{total_rows}\n{it0.text() if it0 else ''}")
+                QApplication.processEvents()
 
-            # ✅ On OCRise uniquement les non-sauvegardés (pas de JSON)
-            if self._has_saved_json_for_pdf(pdf_path):
-                skipped += 1
-                continue
+                if not it0:
+                    continue
 
-            try:
-                self.current_pdf_path = pdf_path
+                pdf_path = it0.data(Qt.UserRole)
+                if not is_ocr_allowed_document(pdf_path):
+                    skipped += 1
+                    continue
 
-                # OCR (sans popup)
-                self.analyze_pdf(show_message=False)
+                # ✅ On OCRise uniquement les non-sauvegardés (pas de JSON)
+                if self._has_saved_json_for_pdf(pdf_path):
+                    skipped += 1
+                    continue
 
-                # sauvegarde OCR, mais on reste en "pending" tant que ce n'est pas validé
-                self.save_current_data(status="pending", show_message=False)
+                try:
+                    self.current_pdf_path = pdf_path
 
-                # statut en table (pour les filtres)
-                self._set_left_row_status(pdf_path, "pending")
+                    # OCR (sans popup)
+                    self.analyze_pdf(show_message=False)
 
-                processed += 1
+                    # sauvegarde OCR, mais on reste en "pending" tant que ce n'est pas validé
+                    self.save_current_data(status="pending", show_message=False)
 
-            except Exception as e:
-                errors += 1
-                # (optionnel) marquer en erreur pour ton futur onglet “Erreurs”
-                self._set_left_row_status(pdf_path, "error")
-                # on continue sur les autres
-                print(f"OCR error on {pdf_path}: {e}")
+                    # statut en table (pour les filtres)
+                    self._set_left_row_status(pdf_path, "pending")
 
-        # restore
-        self.current_pdf_path = previous_pdf
+                    processed += 1
+
+                except Exception as e:
+                    errors += 1
+                    # (optionnel) marquer en erreur pour ton futur onglet “Erreurs”
+                    self._set_left_row_status(pdf_path, "error")
+                    # on continue sur les autres
+                    print(f"OCR error on {pdf_path}: {e}")
+
+            progress.setValue(total_rows)
+            QApplication.processEvents()
+        finally:
+            # restore
+            self.current_pdf_path = previous_pdf
+            progress.close()
 
         self.refresh_left_table_processing_states()
         self.apply_left_filter_to_table()
@@ -824,10 +1077,12 @@ class MainWindowCoreMixin:
         if hasattr(self, "apply_left_filter_to_table"):
             self.apply_left_filter_to_table()
 
+        title = "OCR annulé" if canceled else "OCR terminé"
+        suffix = "\nTraitement interrompu par l'utilisateur." if canceled else ""
         QMessageBox.information(
             self,
-            "OCR terminé",
-            f"Traités : {processed}\nDéjà sauvegardés (skip) : {skipped}\nErreurs : {errors}"
+            title,
+            f"Traités : {processed}\nDéjà sauvegardés (skip) : {skipped}\nErreurs : {errors}{suffix}"
         )
 
     def _save_data_for_pdf(self, pdf_path, data):

@@ -5,30 +5,70 @@ from db.repository import BaseRepository
 
 class TransporterRepository(BaseRepository):
 
+    @staticmethod
+    def _normalize_bank_value(value: str) -> str:
+        return (
+            str(value or "")
+            .replace(" ", "")
+            .replace(" ", "")
+            .replace("-", "")
+            .upper()
+            .strip()
+        )
+
     def find_transporter_by_bank(self, iban: str, bic: str):
+        iban_norm = self._normalize_bank_value(iban)
+        bic_norm = self._normalize_bank_value(bic)
+        bic8 = bic_norm[:8]
+
         query = """
-            SELECT 
-                bank.IBAN,
-                bank.SWIFT,
-                bank.BankName,
-                kun.name1,
-                kun.Strasse,
-                kun.Ort,
-                kun.LKZ,
-                kun.PLZ,
-                kun.UstId,
-                bank.KundenNr
-            FROM xxakunbank bank
-            LEFT JOIN xxakun kun 
-                ON kun.KundenNr = bank.KundenNr
-            WHERE REPLACE(UPPER(bank.IBAN), ' ', '') = REPLACE(UPPER(?), ' ', '')
-            AND REPLACE(UPPER(bank.SWIFT), ' ', '') = REPLACE(UPPER(?), ' ', '')
+            WITH bank_match AS (
+                SELECT
+                    bank.IBAN,
+                    bank.SWIFT,
+                    bank.BankName,
+                    kun.name1,
+                    kun.Strasse,
+                    kun.Ort,
+                    kun.LKZ,
+                    kun.PLZ,
+                    kun.UstId,
+                    bank.KundenNr,
+                    REPLACE(REPLACE(REPLACE(UPPER(COALESCE(bank.IBAN, '')), ' ', ''), '-', ''), CHAR(160), '') AS iban_norm,
+                    REPLACE(REPLACE(REPLACE(UPPER(COALESCE(bank.SWIFT, '')), ' ', ''), '-', ''), CHAR(160), '') AS swift_norm
+                FROM xxakunbank bank
+                LEFT JOIN xxakun kun
+                    ON kun.KundenNr = bank.KundenNr
+            )
+            SELECT TOP 1
+                IBAN,
+                SWIFT,
+                BankName,
+                name1,
+                Strasse,
+                Ort,
+                LKZ,
+                PLZ,
+                UstId,
+                KundenNr
+            FROM bank_match
+            WHERE iban_norm = ?
+              AND (
+                    swift_norm = ?
+                    OR LEFT(swift_norm, 8) = ?
+                  )
+            ORDER BY
+                CASE
+                    WHEN swift_norm = ? THEN 0
+                    WHEN LEN(swift_norm) = 11 AND LEFT(swift_norm, 8) = ? THEN 1
+                    WHEN LEFT(swift_norm, 8) = ? THEN 2
+                    ELSE 9
+                END,
+                LEN(swift_norm),
+                KundenNr
         """
 
-
-        result = self.fetch_one(query, (iban, bic))       
-
-
+        result = self.fetch_one(query, (iban_norm, bic_norm, bic8, bic_norm, bic8, bic8))
         return result
 
     def search_transporters_by_name(self, name_part: str):
@@ -148,4 +188,3 @@ class TransporterRepository(BaseRepository):
         if not row:
             return ""
         return str(row.get("LKZ") or "").strip()
-

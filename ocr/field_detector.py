@@ -3,6 +3,7 @@ import unicodedata
 from typing import Any, Dict, List, Optional
 
 from .folder_patterns import extract_folder_numbers_from_text, is_valid_folder_number
+from .supplier_model import extract_iban_candidates, validate_bic, validate_iban
 
 
 # ------------------------------------------------------------
@@ -167,6 +168,7 @@ IBAN_CANDIDATE_RE = re.compile(
     re.IGNORECASE,
 )
 BIC_EXACT_RE = re.compile(r"[A-Z]{4}[A-Z]{2}[A-Z0-9]{2}(?:[A-Z0-9]{3})?")
+BIC_LABEL_LINE_RE = re.compile(r"(?:\b(?:CODE|COD[EF]|CONF)\s+)?(?:SWIFT|B\.?I\.?C\.?)\b", re.IGNORECASE)
 DATE_RE = re.compile(
     r"\b(?:\d{1,2}[./-]\d{1,2}[./-]\d{2,4}|\d{4}[./-]\d{1,2}[./-]\d{1,2})\b"
 )
@@ -175,6 +177,7 @@ INVOICE_TOKEN_RE = re.compile(r"\b[A-Z0-9][A-Z0-9\-_/\.]{2,40}\b", re.IGNORECASE
 BIC_BLACKLIST = {
     "LOGISTIK", "TRANSPORT", "MODE", "REGLEMENT", "PAYMENT", "INVOICE",
     "FACTURE", "BANK", "IBAN", "BIC", "SWIFT", "TOTAL", "AMOUNT",
+    "DETAILDE", "DETAILDU", "VIREMENT", "ECHEANCE",
 }
 
 NON_VALUE_TOKENS = {
@@ -215,26 +218,14 @@ def _normalize_bic(value: str) -> str:
 
 
 def _validate_iban(iban: str) -> bool:
-    s = _normalize_iban(iban)
-    if not IBAN_EXACT_RE.fullmatch(s):
-        return False
-
-    rearranged = s[4:] + s[:4]
-    digits = ""
-    for ch in rearranged:
-        digits += ch if ch.isdigit() else str(ord(ch) - 55)
-
-    mod = 0
-    for i in range(0, len(digits), 7):
-        mod = int(str(mod) + digits[i:i + 7]) % 97
-    return mod == 1
+    return validate_iban(_normalize_iban(iban))
 
 
 def _validate_bic(bic: str) -> bool:
     s = _normalize_bic(bic)
     if s in BIC_BLACKLIST:
         return False
-    return bool(BIC_EXACT_RE.fullmatch(s))
+    return validate_bic(s)
 
 
 def _contains_alias(text: str, aliases: List[str]) -> bool:
@@ -250,16 +241,7 @@ def _line_has_alias(line: str, field: str) -> bool:
 
 
 def _extract_iban_candidates(text: str) -> List[str]:
-    found: List[str] = []
-    seen: set[str] = set()
-
-    for m in IBAN_CANDIDATE_RE.finditer((text or "").upper()):
-        iban = _normalize_iban(m.group(0))
-        if iban not in seen and _validate_iban(iban):
-            seen.add(iban)
-            found.append(iban)
-
-    return found
+    return [iban for iban, _count in extract_iban_candidates(text or "", prefer_labels=True).most_common()]
 
 
 def _extract_bic_candidates(text: str) -> List[str]:
@@ -350,16 +332,19 @@ def detect_fields_multilingual(text: str) -> Dict[str, Any]:
 
     bic = ""
     for i, line in enumerate(lines):
-        if _line_has_alias(line, "bic"):
-            window = " ".join(lines[i:i + 3])
-            bics = _extract_bic_candidates(window)
-            if bics:
-                bic = bics[0]
-                break
-    if not bic:
-        bics = _extract_bic_candidates(src)
+        if not _line_has_alias(line, "bic"):
+            continue
+
+        m = BIC_LABEL_LINE_RE.search(line)
+        first_chunk = line[m.start():] if m else line
+        scan_chunks = [first_chunk] + lines[i + 1:i + 3]
+        window = " ".join(scan_chunks)
+        bics = _extract_bic_candidates(window)
         if bics:
             bic = bics[0]
+            break
+    # Mode prudent : pas de fallback global pour le BIC.
+    # Sans label explicite (BIC/SWIFT), on préfère laisser vide.
     if bic:
         out["bic"] = bic
 

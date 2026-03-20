@@ -449,6 +449,10 @@ class MainWindow(
         self.btn_analyze_pdf = QPushButton("🔍 Analyser le PDF (OCR)")
         self.btn_analyze_pdf.clicked.connect(self.analyze_pdf)
 
+        self.btn_deep_ocr = QPushButton("OCR profond")
+        self.btn_deep_ocr.setToolTip("Force un OCR Tesseract et complète les informations déjà chargées sans écraser les champs remplis.")
+        self.btn_deep_ocr.clicked.connect(self.analyze_pdf_deep)
+
         self.btn_save_data = QPushButton("💾 Sauvegarder")
         self.btn_save_data.clicked.connect(self.on_save_clicked)
 
@@ -474,6 +478,7 @@ class MainWindow(
         right_panel.addLayout(form_layout)
         right_panel.addStretch()
         right_panel.addWidget(self.btn_analyze_pdf)
+        right_panel.addWidget(self.btn_deep_ocr)
 
         # Layout global
         main_layout.addLayout(center_panel, 5)

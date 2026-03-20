@@ -70,7 +70,7 @@ def _now_iso() -> str:
 
 
 def _norm_for_search(s: str) -> str:
-    return re.sub(r"[\s\u00A0]", "", (s or "").upper())
+    return re.sub(r"[\s\u00A0-]", "", (s or "").upper())
 
 
 def _find_line_with_value(text: str, value: str) -> Optional[str]:
@@ -173,9 +173,110 @@ def _tolerant_exact_regex(value: str) -> Optional[str]:
     return r"\b" + sep.join(map(re.escape, parts)) + r"\b"
 
 
+IBAN_LENGTHS: Dict[str, int] = {
+    "AD": 24, "AE": 23, "AL": 28, "AT": 20, "AZ": 28, "BA": 20, "BE": 16,
+    "BG": 22, "BH": 22, "BR": 29, "BY": 28, "CH": 21, "CR": 22, "CY": 28,
+    "CZ": 24, "DE": 22, "DK": 18, "DO": 28, "EE": 20, "ES": 24, "FI": 18,
+    "FO": 18, "FR": 27, "GB": 22, "GE": 22, "GI": 23, "GL": 18, "GR": 27,
+    "HR": 21, "HU": 28, "IE": 22, "IL": 23, "IS": 26, "IT": 27, "JO": 30,
+    "KW": 30, "KZ": 20, "LB": 28, "LC": 32, "LI": 21, "LT": 20, "LU": 20,
+    "LV": 21, "MC": 27, "MD": 24, "ME": 22, "MK": 19, "MR": 27, "MT": 31,
+    "MU": 30, "NL": 18, "NO": 15, "PK": 24, "PL": 28, "PS": 29, "PT": 25,
+    "QA": 29, "RO": 24, "RS": 22, "SA": 24, "SC": 31, "SE": 24, "SI": 19,
+    "SK": 24, "SM": 27, "ST": 25, "SV": 28, "TL": 23, "TN": 24, "TR": 26,
+    "UA": 29, "VA": 22, "VG": 24, "XK": 20,
+}
+
+IBAN_OCR_DIGIT_FIX = {
+    "O": "0", "Q": "0", "D": "0",
+    "I": "1", "L": "1",
+    "S": "5", "B": "8", "Z": "2", "G": "6", "T": "7",
+}
+
+_IBAN_START_RX = re.compile(
+    r"(?<![A-Z0-9])([A-Z]{2})[\s\u00A0-]*(\d{2})(?=(?:[\s\u00A0-]*[A-Z0-9]){11,40})",
+    re.IGNORECASE,
+)
+
+
+def _normalize_iban_candidate(value: str) -> str:
+    return re.sub(r"[\s\u00A0-]+", "", (value or "").upper()).strip()
+
+
+def _expected_iban_length(country_code: str) -> Optional[int]:
+    return IBAN_LENGTHS.get((country_code or "").upper())
+
+
+def _iban_variants(compact: str) -> List[str]:
+    s = _normalize_iban_candidate(compact)
+    if len(s) < 5:
+        return []
+
+    out = [s]
+    fixed_rest = "".join(IBAN_OCR_DIGIT_FIX.get(ch, ch) for ch in s[4:])
+    fixed = s[:4] + fixed_rest
+    if fixed != s:
+        out.append(fixed)
+    return out
+
+
+def _extract_iban_candidates_from_text(text: str, *, prefer_labels: bool = False) -> Counter:
+    src = (text or "").upper().replace("\u00A0", " ")
+    label_counts: Counter = Counter()
+    seen_windows: set[tuple[int, int]] = set()
+
+    def _ingest_fragment(fragment: str, target: Counter) -> None:
+        for m in _IBAN_START_RX.finditer(fragment):
+            start = m.start()
+            country = m.group(1).upper()
+            tail = fragment[start:start + 96]
+            alnum = "".join(ch for ch in tail if ch.isalnum())
+            if len(alnum) < 15:
+                continue
+
+            lengths: List[int] = []
+            expected = _expected_iban_length(country)
+            if expected:
+                lengths.append(expected)
+            for fallback_len in range(min(34, len(alnum)), 14, -1):
+                if fallback_len not in lengths:
+                    lengths.append(fallback_len)
+
+            for candidate_len in lengths:
+                if len(alnum) < candidate_len:
+                    continue
+                base = alnum[:candidate_len]
+                for candidate in _iban_variants(base):
+                    if validate_iban(candidate):
+                        target[candidate] += 1
+                        return
+
+    if prefer_labels:
+        for m in IBAN_LABEL_RE.finditer(src):
+            window = src[m.end(): m.end() + 120]
+            key = (m.end(), m.end() + 120)
+            if key not in seen_windows:
+                seen_windows.add(key)
+                _ingest_fragment(window, label_counts)
+        if label_counts:
+            return label_counts
+
+    all_counts: Counter = Counter()
+    _ingest_fragment(src, all_counts)
+    return all_counts
+
+
+def extract_iban_candidates(text: str, *, prefer_labels: bool = False) -> Counter:
+    return _extract_iban_candidates_from_text(text, prefer_labels=prefer_labels)
+
+
 def validate_iban(iban: str) -> bool:
-    s = (iban or "").replace(" ", "").upper().strip()
+    s = _normalize_iban_candidate(iban)
     if not re.fullmatch(r"[A-Z]{2}\d{2}[A-Z0-9]{11,30}", s):
+        return False
+
+    expected = _expected_iban_length(s[:2])
+    if expected and len(s) != expected:
         return False
 
     rearr = s[4:] + s[:4]
@@ -189,9 +290,32 @@ def validate_iban(iban: str) -> bool:
     return mod == 1
 
 
+BIC_BLACKLIST = {
+    "LOGISTIK", "TRANSPORT", "MODE", "REGLEMENT", "PAYMENT", "INVOICE", "FACTURE",
+    "BANK", "IBAN", "BIC", "SWIFT", "TOTAL", "AMOUNT", "DETAILDE", "DETAILDU",
+    "VIREMENT", "ECHEANCE", "COMPTE", "MONTANT", "GENERAL", "FACTUREN", "TOTALHT",
+}
+
+BIC_LABEL_RE = re.compile(
+    r"(?:\b(?:CODE|COD[EF]|CONF)\s+)?(?:SWIFT|BIC)\b",
+    re.IGNORECASE,
+)
+
+IBAN_LABEL_RE = re.compile(r"(?:\bI?B?AN\b|\b\\BAN\b)", re.IGNORECASE)
+
+
 def validate_bic(bic: str) -> bool:
-    s = (bic or "").replace(" ", "").upper().strip()
-    return bool(re.fullmatch(r"[A-Z]{4}[A-Z]{2}[A-Z0-9]{2}([A-Z0-9]{3})?", s))
+    s = (bic or "").replace(" ", "").replace(" ", "").replace("-", "").upper().strip()
+    if not re.fullmatch(r"[A-Z]{4}[A-Z]{2}[A-Z0-9]{2}(?:[A-Z0-9]{3})?", s):
+        return False
+    if s in BIC_BLACKLIST:
+        return False
+    # code pays à la position 5-6 : au minimum deux lettres, et on rejette les mots OCR trop fréquents
+    if not s[4:6].isalpha():
+        return False
+    if s.startswith(("IBAN", "SWIF", "BICB", "CODE")):
+        return False
+    return True
 
 
 def learn_supplier_patterns(
@@ -411,6 +535,28 @@ def _norm_iban(s: str) -> str:
 def _norm_bic(s: str) -> str:
     return (s or "").replace(" ", "").replace("\u00A0", "").replace("-", "").upper().strip()
 
+def _iter_context_chunks_for_bic(text: str) -> List[str]:
+    txt = text or ""
+    chunks: List[str] = []
+
+    for m in BIC_LABEL_RE.finditer(txt):
+        start = max(0, m.start() - 12)
+        end = min(len(txt), m.end() + 40)
+        chunks.append(txt[start:end])
+
+    return chunks
+
+
+def _contextual_bic_candidates(text: str) -> Counter:
+    counts: Counter = Counter()
+    for chunk in _iter_context_chunks_for_bic(text):
+        for m in _BIC_CAND_RX.finditer(chunk):
+            bic = _norm_bic(m.group(0))
+            if validate_bic(bic):
+                counts[bic] += 1
+    return counts
+
+
 def extract_best_bank_ids(
     ocr_text: str,
     *,
@@ -424,17 +570,12 @@ def extract_best_bank_ids(
     txt = ocr_text or ""
     txt_norm = _norm_for_search(txt)
 
-    # 1) IBAN candidats -> validation mod97
-    iban_raw = [m.group(0) for m in _IBAN_CAND_RX.finditer(txt)]
-    iban_norm = [_norm_iban(x) for x in iban_raw]
-    iban_valid = [x for x in iban_norm if validate_iban(x)]
-    iban_counts = Counter(iban_valid)
+    # 1) IBAN candidats -> longueur pays + validation mod97 + tolérance OCR
+    iban_counts = extract_iban_candidates(txt, prefer_labels=True)
 
-    # 2) BIC candidats -> validation format
-    bic_raw = [m.group(0) for m in _BIC_CAND_RX.finditer(txt)]
-    bic_norm = [_norm_bic(x) for x in bic_raw]
-    bic_valid = [x for x in bic_norm if validate_bic(x)]
-    bic_counts = Counter(bic_valid)
+    # 2) BIC candidats -> validation + contexte bancaire strict
+    # On ne garde pas les mots qui "ressemblent" à un BIC hors contexte.
+    bic_counts = _contextual_bic_candidates(txt)
 
     # 3) Si user a déjà saisi une valeur valide, on la privilégie
     p_iban = _norm_iban(prefer_iban)
@@ -455,14 +596,14 @@ def extract_best_bank_ids(
             best_iban_score = score
             best_iban = iban
 
-    # 5) choisir meilleur BIC (fréquence + cohérence pays avec IBAN si dispo)
+    # 5) choisir meilleur BIC (fréquence contexte + cohérence pays avec IBAN si dispo)
     best_bic = ""
     best_bic_score = -1
     iban_cc = best_iban[:2] if best_iban else ""
 
     for bic, c in bic_counts.items():
         occ = txt_norm.count(bic)
-        score = c * 10 + occ
+        score = c * 100 + occ
         # cohérence pays : BIC[4:6] doit matcher IBAN country (souvent vrai, très utile)
         if iban_cc and bic[4:6] == iban_cc:
             score += 50
