@@ -70,7 +70,8 @@ def _now_iso() -> str:
 
 
 def _norm_for_search(s: str) -> str:
-    return re.sub(r"[\s\u00A0-]", "", (s or "").upper())
+    # suppressions pour panorama OCR de dates/numéros (espace, NBSP, tiret, slash, point)
+    return re.sub(r"[\s\u00A0\-\./]", "", (s or "").upper())
 
 
 def _find_line_with_value(text: str, value: str) -> Optional[str]:
@@ -105,6 +106,7 @@ def _extract_label_near_value(text: str, value: str, window: int = 50) -> Option
         line_norm = _norm_for_search(line)
         if v_norm in line_norm:
             # 1) Chercher un label sur la même ligne (valeur après label)
+            
             value_idx = line_norm.find(v_norm)
             if value_idx > 0:
                 left_part = line[:value_idx].strip()
@@ -160,8 +162,8 @@ def _value_group_regex(field: str, value: str) -> str:
             hi = min(20, n + 1)
             return rf"{re.escape(prefix)}\d{{{lo},{hi}}}"
 
-        # fallback : au moins une lettre + au moins un chiffre
-        return r"[A-Z][A-Z0-9\-_/\.]*\d[A-Z0-9\-_/\.]*"
+        # fallback : au moins un alphanumérique + au moins un chiffre (permet de commencer par chiffre)
+        return r"[A-Z0-9][A-Z0-9\-_/\.]*\d[A-Z0-9\-_/\.]*"
 
     if vv.isdigit():
         n = len(vv)

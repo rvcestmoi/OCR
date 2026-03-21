@@ -36,6 +36,9 @@ DEFAULT_SETTINGS = {
         "max_pages_error": 50,
         "max_pages_validated": 200,
     },
+    "vat": {
+        "allowed_rates": [0, 20]
+    },
 }
 
 

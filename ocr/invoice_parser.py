@@ -11,6 +11,7 @@ from .folder_patterns import (
     is_valid_folder_number,
     extract_folder_numbers_from_text,
 )
+from app.settings import load_settings
 
 
 @dataclass
@@ -292,6 +293,37 @@ def extract_invoice_number(text: str) -> str:
 # TVA
 # =========================
 
+def _get_allowed_vat_rates() -> List[float]:
+    settings = load_settings()
+    allowed = []
+    raw = (settings.get("vat") or {}).get("allowed_rates")
+    if isinstance(raw, list):
+        for r in raw:
+            try:
+                allowed.append(float(r))
+            except Exception:
+                pass
+    if not allowed:
+        allowed = [0.0, 20.0]
+    return allowed
+
+
+def _is_allowed_vat_rate(rate: float | str | None) -> bool:
+    if rate is None:
+        return False
+    try:
+        r = float(str(rate).replace(",", "."))
+    except Exception:
+        return False
+
+    allowed = _get_allowed_vat_rates()
+    # map with tolerance
+    for ar in allowed:
+        if abs(r - ar) < 1e-6:
+            return True
+    return False
+
+
 def _norm_amount_str(s: str) -> str:
     return (s or "").replace("\u00A0", "").replace(" ", "").strip()
 
@@ -322,6 +354,9 @@ def parse_vat_lines(text: str):
             continue
 
         rate = m_rate.group("rate").replace(",", ".")
+        if not _is_allowed_vat_rate(rate):
+            continue
+
         amounts = MONEY_RE.findall(line)
 
         base = ""
@@ -482,7 +517,7 @@ def _infer_vat_line_from_block(lines: list[str], center: int, window: int = 25):
     if not amounts:
         return None
 
-    rate_cands = [a for a in amounts if 0.0 < a[0] <= 30.0]
+    rate_cands = [a for a in amounts if _is_allowed_vat_rate(a[0])]
     if not rate_cands:
         return None
 
@@ -561,7 +596,7 @@ def _rate_in_line_or_next(lines: list[str], idx: int) -> str:
         cands = []
         for s in MONEY_RE.findall(t):
             v = _to_float(s)
-            if v is not None and 0.0 < v <= 30.0:
+            if v is not None and _is_allowed_vat_rate(v):
                 cands.append((v, _norm_amount_str(s)))
         if not cands:
             return ""
@@ -593,6 +628,37 @@ def _extract_vat_by_labels(lines: list[str]) -> dict | None:
         None,
     )
 
+    # Cas spécial : ligne de tableau TVA (tous labels sur même ligne)
+    if idx_base == idx_vat == idx_rate and idx_base is not None:
+        ln = lines[idx_base]
+        # Chercher montants sur la même ligne ou la suivante
+        amounts = MONEY_RE.findall(ln)
+        if not amounts and idx_base + 1 < len(lines):
+            amounts = MONEY_RE.findall(lines[idx_base + 1])
+        rates = VAT_RATE_RE.findall(ln)
+        if not rates and idx_base + 1 < len(lines):
+            rates = VAT_RATE_RE.findall(lines[idx_base + 1])
+        if len(amounts) >= 2 and rates:
+            # rates est liste de tuples, prendre le premier groupe
+            rate_match = rates[0]
+            if isinstance(rate_match, tuple):
+                rate = rate_match[0].replace(",", ".")
+            else:
+                rate = rate_match.replace(",", ".")
+            vat = _norm_amount_str(amounts[0])  # premier montant = TVA
+            base = _norm_amount_str(amounts[-1])  # dernier montant = base
+            bv = _to_float(base)
+            vv = _to_float(vat)
+            rv = _to_float(rate)
+            print(f"DEBUG: bv={bv}, vv={vv}, rv={rv}, expected={(bv * rv) / 100 if bv and rv else None}")
+            if bv and vv and rv and _is_allowed_vat_rate(rv):
+                expected = (bv * rv) / 100.0
+                if abs(vv - expected) <= max(0.06, expected * 0.03):
+                    print("DEBUG: returning dict")
+                    return {"rate": rate, "base": base, "vat": vat}
+            print("DEBUG: not returning")
+
+    # Cas normal : labels séparés
     base = _money_in_line_or_next(lines, idx_base) if idx_base is not None else ""
     vat = _money_in_line_or_next(lines, idx_vat) if idx_vat is not None else ""
     rate = _rate_in_line_or_next(lines, idx_rate) if idx_rate is not None else ""
@@ -605,6 +671,9 @@ def _extract_vat_by_labels(lines: list[str]) -> dict | None:
         if rv is None or rv <= 0 or rv > 30:
             rv = (vv / bv) * 100.0
             rate = f"{rv:.2f}"
+
+    if rv is not None and not _is_allowed_vat_rate(rv):
+        return None
 
     if bv is not None and vv is not None and rv is not None:
         expected = (bv * rv) / 100.0

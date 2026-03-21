@@ -27,5 +27,8 @@
     "max_pages_pending": 60,
     "max_pages_error": 5,
     "max_pages_validated": 20
+  },
+  "vat": {
+    "allowed_rates": [0, 20]
   }
 }

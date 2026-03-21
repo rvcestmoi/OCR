@@ -64,7 +64,13 @@ def extract_folder_numbers_from_text(text: str) -> list[str]:
         raw = match.group(0)
         folder = normalize_folder_candidate(raw)
         if folder and folder not in seen and is_valid_folder_number(folder):
-            seen.add(folder)
-            found.append(folder)
+            # Éviter les extensions accidentelles (ex: 845000153 + 03 -> 84500015303)
+            is_extension = any(
+                existing for existing in seen
+                if folder.startswith(existing) and len(folder) > len(existing)
+            )
+            if not is_extension:
+                seen.add(folder)
+                found.append(folder)
 
     return found
