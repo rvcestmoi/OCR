@@ -370,6 +370,7 @@ def learn_supplier_patterns(
     bic: str,
     invoice_number: str,
     invoice_date: str,
+    vat_lines: list[dict] | None = None,
 ) -> Dict[str, List[Dict[str, Any]]]:
     """Construit des règles à partir du texte OCR + valeurs validées."""
     patterns: Dict[str, List[Dict[str, Any]]] = {
@@ -377,6 +378,9 @@ def learn_supplier_patterns(
         "bic": [],
         "invoice_number": [],
         "invoice_date": [],
+        "vat_rate": [],
+        "vat_base": [],
+        "vat_amount": [],
     }
 
     # IBAN/BIC : match exact tolérant (fiable)
@@ -474,6 +478,55 @@ def learn_supplier_patterns(
             "hit_count": 0,
             "created_at": _now_iso(),
         })
+
+    # VAT patterns : apprendre des patterns d'extraction comme pour invoice_number
+    if vat_lines:
+        for vat_row in vat_lines:
+            rate = vat_row.get("rate", "").strip()
+            base = vat_row.get("base", "").strip()
+            vat = vat_row.get("vat", "").strip()
+
+            # Pour rate
+            if rate:
+                specific_label = _extract_label_near_value(ocr_text, rate)
+                if specific_label:
+                    patterns["vat_rate"].append({
+                        "mode": "near_label",
+                        "label_regex": rf"\b{re.escape(specific_label)}\b",
+                        "value_regex": r"(\d{1,2}(?:[.,]\d{1,2})?)",
+                        "window": 200,
+                        "group": 1,
+                        "hit_count": 0,
+                        "created_at": _now_iso(),
+                    })
+
+            # Pour base
+            if base:
+                specific_label = _extract_label_near_value(ocr_text, base)
+                if specific_label:
+                    patterns["vat_base"].append({
+                        "mode": "near_label",
+                        "label_regex": rf"\b{re.escape(specific_label)}\b",
+                        "value_regex": r"(\d+(?:[ \u00A0]\d{3})*(?:[.,]\d{2})?)",
+                        "window": 200,
+                        "group": 1,
+                        "hit_count": 0,
+                        "created_at": _now_iso(),
+                    })
+
+            # Pour vat
+            if vat:
+                specific_label = _extract_label_near_value(ocr_text, vat)
+                if specific_label:
+                    patterns["vat_amount"].append({
+                        "mode": "near_label",
+                        "label_regex": rf"\b{re.escape(specific_label)}\b",
+                        "value_regex": r"(\d+(?:[ \u00A0]\d{3})*(?:[.,]\d{2})?)",
+                        "window": 200,
+                        "group": 1,
+                        "hit_count": 0,
+                        "created_at": _now_iso(),
+                    })
 
     return {k: v for k, v in patterns.items() if v}
 

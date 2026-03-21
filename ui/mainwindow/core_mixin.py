@@ -1245,7 +1245,11 @@ class MainWindowCoreMixin:
                 self.statusBar().showMessage("Modèle transporteur non mis à jour (IBAN/BIC non fiables).", 4000)
             return False
 
-        # 2) charger l’existant
+        # 2) extraire les données TVA pour apprentissage
+        from ocr.invoice_parser import parse_vat_lines
+        vat_lines = parse_vat_lines(ocr_text)
+
+        # 3) charger l’existant
         existing = load_supplier_model(supplier_key) or {}
 
         # Supprimer les anciens champs d'exemple pour éviter la confusion
@@ -1259,6 +1263,7 @@ class MainWindowCoreMixin:
             bic=bic,
             invoice_number=self.invoice_number_input.text().strip(),
             invoice_date=self.date_input.text().strip(),
+            vat_lines=vat_lines,
         )
         merged = merge_patterns(existing.get("patterns") or {}, new_patterns)
 

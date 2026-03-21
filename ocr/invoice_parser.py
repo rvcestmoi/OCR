@@ -44,7 +44,7 @@ BIC_BLACKLIST = {
 }
 
 BASE_LABEL_RE = re.compile(r"(BASE\s*HT|TOTAL\s*HT|TOTAL\s*HT\s*NET)", re.IGNORECASE)
-VAT_LABEL_RE = re.compile(r"(MONTANT\s*TVA|TOTAL\s*TVA)", re.IGNORECASE)
+VAT_LABEL_RE = re.compile(r"(MONTANT\s*(?:DE\s*)?TVA|TOTAL\s*TVA)", re.IGNORECASE)
 RATE_LABEL_RE = re.compile(r"(\bTAUX\b|%?\s*TVA\b)", re.IGNORECASE)
 
 VAT_RATE_RE = re.compile(r"(?P<rate>\d{1,2}(?:[.,]\d{1,2})?)\s*%")
@@ -293,6 +293,9 @@ def extract_invoice_number(text: str) -> str:
 # TVA
 # =========================
 
+# Variable globale pour les taux autorisés du fournisseur actuel
+_current_allowed_vat_rates: set[float] | None = None
+
 def _get_allowed_vat_rates() -> List[float]:
     settings = load_settings()
     allowed = []
@@ -309,19 +312,25 @@ def _get_allowed_vat_rates() -> List[float]:
 
 
 def _is_allowed_vat_rate(rate: float | str | None) -> bool:
+    global _current_allowed_vat_rates
     if rate is None:
         return False
     try:
         r = float(str(rate).replace(",", "."))
     except Exception:
         return False
-
-    allowed = _get_allowed_vat_rates()
-    # map with tolerance
-    for ar in allowed:
-        if abs(r - ar) < 1e-6:
-            return True
-    return False
+    
+    if _current_allowed_vat_rates is not None:
+        # Utiliser les taux du modèle fournisseur
+        return r in _current_allowed_vat_rates
+    else:
+        # Fallback aux settings
+        allowed = _get_allowed_vat_rates()
+        # map with tolerance
+        for ar in allowed:
+            if abs(r - ar) < 1e-6:
+                return True
+        return False
 
 
 def _norm_amount_str(s: str) -> str:
@@ -336,7 +345,9 @@ def _to_float(s: str):
         return None
 
 
-def parse_vat_lines(text: str):
+def parse_vat_lines(text: str, allowed_vat_rates: set[float] | None = None):
+    global _current_allowed_vat_rates
+    _current_allowed_vat_rates = allowed_vat_rates
     lines_out = []
     seen = set()
 
@@ -432,8 +443,26 @@ def parse_vat_lines(text: str):
 # =========================
 
 def parse_invoice(text: str) -> InvoiceData:
-    vat_lines = parse_vat_lines(text)
-
+    # Extraire IBAN/BIC d'abord pour charger le modèle fournisseur
+    iban = extract_iban(text)
+    bic = extract_bic(text)
+    
+    # Charger modèle fournisseur si possible
+    supplier_key = None
+    allowed_vat_rates = None
+    if iban or bic:
+        from .supplier_model import build_supplier_key, load_supplier_model
+        supplier_key = build_supplier_key(iban, bic)
+        if supplier_key:
+            model = load_supplier_model(supplier_key)
+            if model and "patterns" in model:
+                vat_rates_patterns = model["patterns"].get("vat_rates", [])
+                if vat_rates_patterns:
+                    allowed_vat_rates = {p["rate"] for p in vat_rates_patterns}
+    
+    # Parser TVA avec filtrage par modèle fournisseur
+    vat_lines = parse_vat_lines(text, allowed_vat_rates=allowed_vat_rates)
+    
     vat_total = 0.0
     has_any = False
     for row in vat_lines:
@@ -446,11 +475,14 @@ def parse_invoice(text: str) -> InvoiceData:
     folder_numbers = extract_folder_numbers(text)
     folder_number = folder_numbers[0] if folder_numbers else ""
 
+    invoice_date = extract_date(text)
+    invoice_number = extract_invoice_number(text)
+
     return InvoiceData(
-        iban=extract_iban(text),
-        bic=extract_bic(text),
-        invoice_date=extract_date(text),
-        invoice_number=extract_invoice_number(text),
+        iban=iban,
+        bic=bic,
+        invoice_date=invoice_date,
+        invoice_number=invoice_number,
         folder_number=folder_number,
         folder_numbers=folder_numbers,
         vat_lines=vat_lines,
@@ -639,24 +671,17 @@ def _extract_vat_by_labels(lines: list[str]) -> dict | None:
         if not rates and idx_base + 1 < len(lines):
             rates = VAT_RATE_RE.findall(lines[idx_base + 1])
         if len(amounts) >= 2 and rates:
-            # rates est liste de tuples, prendre le premier groupe
-            rate_match = rates[0]
-            if isinstance(rate_match, tuple):
-                rate = rate_match[0].replace(",", ".")
-            else:
-                rate = rate_match.replace(",", ".")
+            # rates est liste de strings, prendre la première
+            rate = rates[0].replace(",", ".")
             vat = _norm_amount_str(amounts[0])  # premier montant = TVA
             base = _norm_amount_str(amounts[-1])  # dernier montant = base
             bv = _to_float(base)
             vv = _to_float(vat)
             rv = _to_float(rate)
-            print(f"DEBUG: bv={bv}, vv={vv}, rv={rv}, expected={(bv * rv) / 100 if bv and rv else None}")
             if bv and vv and rv and _is_allowed_vat_rate(rv):
                 expected = (bv * rv) / 100.0
                 if abs(vv - expected) <= max(0.06, expected * 0.03):
-                    print("DEBUG: returning dict")
                     return {"rate": rate, "base": base, "vat": vat}
-            print("DEBUG: not returning")
 
     # Cas normal : labels séparés
     base = _money_in_line_or_next(lines, idx_base) if idx_base is not None else ""
