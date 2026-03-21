@@ -9,15 +9,19 @@ class LogmailRepository(BaseRepository):
     Accès à la table XXA_LOGMAIL_228794
     """
 
-    def get_entry_id_for_file(self, nom_pdf: str):
+    def get_sender_for_entry_id(self, entry_id: str) -> str | None:
+        """
+        Récupère l'expéditeur pour un entry_id donné.
+        Prend le premier enregistrement trouvé (par date_creation DESC).
+        """
         query = """
-            SELECT TOP 1 entry_id
+            SELECT TOP 1 expediteur
             FROM XXA_LOGMAIL_228794
-            WHERE nom_pdf = ?
+            WHERE entry_id = ?
             ORDER BY date_creation DESC, id_log DESC
         """
-        row = self.fetch_one(query, (nom_pdf,))
-        return row["entry_id"] if row else None
+        row = self.fetch_one(query, (entry_id,))
+        return row["expediteur"] if row else None
 
     def get_files_for_entry(self, entry_id: str):
         query = """

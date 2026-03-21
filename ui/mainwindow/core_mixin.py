@@ -3,6 +3,7 @@ import fitz
 import pytesseract
 from .common import *
 from .workers import LinkDownloadWorker, LinkPostProcessWorker, _DownloadCanceled
+from ocr.invoice_parser import normalize_date_format
 
 
 class MainWindowCoreMixin:
@@ -48,8 +49,8 @@ class MainWindowCoreMixin:
             value = m.group(0) if m else ""
         elif self.active_field == self.iban_input:
             value = value.replace(" ", "").upper()
-        elif self.active_field == self.bic_input:
-            value = value.replace(" ", "").upper()
+        elif self.active_field == self.date_input:
+            value = normalize_date_format(value)
 
         self.active_field.setText(value)
         self.active_field.setText(value)
@@ -199,6 +200,9 @@ class MainWindowCoreMixin:
         if hasattr(self, "tour_info") and self.tour_info is not None:
             self.tour_info.clear()
 
+        # expéditeur
+        self.sender_input.clear()
+
         # dossiers + TVA
         self.clear_folder_fields()
         self.vat_table.setRowCount(0)
@@ -226,7 +230,7 @@ class MainWindowCoreMixin:
                 db_bic  = (it_bic.text() if it_bic else "").strip()
 
                 if db_date:
-                    self.date_input.setText(db_date)
+                    self.date_input.setText(normalize_date_format(db_date))
                 if db_iban:
                     self.iban_input.setText(db_iban)
                 if db_bic:
@@ -234,9 +238,102 @@ class MainWindowCoreMixin:
         except Exception:
             pass
 
-    def analyze_pdf(self, checked: bool = False, show_message: bool = False):
+        # ✅ Charger les données sauvegardées depuis le JSON si elles existent
+        try:
+            saved_data = self._read_saved_invoice_json(self.current_pdf_path) or {}
+        except Exception:
+            saved_data = {}
 
-        if not is_ocr_allowed_document(self.current_pdf_path):
+        # Remplir les champs facture si pas déjà remplis depuis BDD
+        if not self.iban_input.text().strip() and saved_data.get("iban"):
+            self.iban_input.setText(saved_data["iban"])
+        if not self.bic_input.text().strip() and saved_data.get("bic"):
+            self.bic_input.setText(saved_data["bic"])
+        if not self.date_input.text().strip() and saved_data.get("invoice_date"):
+            self.date_input.setText(normalize_date_format(saved_data["invoice_date"]))
+        if not self.invoice_number_input.text().strip() and saved_data.get("invoice_number"):
+            self.invoice_number_input.setText(saved_data["invoice_number"])
+
+        # Transporteur
+        if saved_data.get("transporter_text"):
+            self.transporter_input.setText(saved_data["transporter_text"])
+        if saved_data.get("transporter_aux_account"):
+            self.transporter_aux_input.setText(saved_data["transporter_aux_account"])
+        if saved_data.get("selected_kundennr"):
+            self.selected_kundennr = saved_data["selected_kundennr"]
+
+        # Dossiers
+        folders = saved_data.get("folders") or []
+        if folders:
+            # Supprimer la ligne vide ajoutée par clear_folder_fields
+            self.folder_table.setRowCount(0)
+            for folder in folders:
+                if isinstance(folder, dict):
+                    tour_nr = folder.get("tour_nr", "")
+                    amount = folder.get("amount_ht_ocr", "")
+                    vat_theo = ""  # vat_theo n'est pas sauvegardé, laissé vide
+                    self._add_folder_row(tour_nr, amount, vat_theo)
+            # Ajouter une ligne vide à la fin si nécessaire
+            self._ensure_empty_folder_row()
+
+        # TVA
+        vat_lines = saved_data.get("vat_lines") or []
+        if vat_lines:
+            # Supprimer la ligne vide ajoutée par _ensure_empty_vat_row
+            self.vat_table.setRowCount(0)
+            for vat_line in vat_lines:
+                if isinstance(vat_line, dict):
+                    rate = vat_line.get("rate", "")
+                    base = vat_line.get("base", "")
+                    vat = vat_line.get("vat", "")
+                    self._add_vat_row(rate, base, vat)
+
+        # OCR text
+        if saved_data.get("ocr_text"):
+            self.ocr_text_view.setPlainText(saved_data["ocr_text"])
+
+        # Mettre à jour les totaux
+        self.update_folder_totals()
+        self.update_vat_total()
+        self._ensure_empty_vat_row()
+
+        # Vérifier les informations bancaires si IBAN/BIC remplis
+        iban = self.iban_input.text().strip()
+        bic = self.bic_input.text().strip()
+        if iban and bic:
+            self.check_bank_information()
+        if self.transporter_input.text().strip():
+            self.load_transporter_information()
+
+        # Charger l'expéditeur depuis logmail
+        entry_id = getattr(self, "selected_invoice_entry_id", None)
+        if entry_id:
+            try:
+                sender = self.logmail_repo.get_sender_for_entry_id(entry_id)
+                if sender:
+                    self.sender_input.setText(sender)
+                else:
+                    self.sender_input.clear()
+            except Exception:
+                self.sender_input.clear()
+        else:
+            self.sender_input.clear()
+
+    def _get_active_document_path(self, preferred_path: str | None = None) -> str | None:
+        for candidate in (preferred_path, getattr(self, "view_pdf_path", None), getattr(self, "current_pdf_path", None)):
+            candidate = str(candidate or "").strip()
+            if candidate:
+                return candidate
+        return None
+
+    def analyze_pdf(self, checked: bool = False, show_message: bool = False, document_path: str | None = None):
+
+        active_doc_path = self._get_active_document_path(document_path)
+        if not active_doc_path:
+            QMessageBox.warning(self, "Analyse OCR", "Aucun document sélectionné.")
+            return
+
+        if not is_ocr_allowed_document(active_doc_path):
             QMessageBox.information(
                 self,
                 "Analyse OCR",
@@ -245,7 +342,7 @@ class MainWindowCoreMixin:
             return
         try:
             # 1) prélecture rapide : première page uniquement
-            preview_text = extract_text_from_pdf(self.current_pdf_path, max_pages=1)
+            preview_text = extract_text_from_pdf(active_doc_path, max_pages=1)
             doc_type = classify_document_text(preview_text)
 
             # 2) si CMR / document logistique -> on stoppe avant OCR complet
@@ -254,7 +351,7 @@ class MainWindowCoreMixin:
                 return
 
             # 3) sinon OCR complet normal
-            text = extract_text_from_pdf(self.current_pdf_path)
+            text = extract_text_from_pdf(active_doc_path)
             self.ocr_text_view.setPlainText(text)
 
             data = parse_invoice(text)
@@ -319,8 +416,9 @@ class MainWindowCoreMixin:
         dlg.setAutoReset(False)
         dlg.setValue(0)
         return dlg
-    def analyze_pdf_deep(self, checked: bool = False):
-        if not self.current_pdf_path:
+    def analyze_pdf_deep(self, checked: bool = False, document_path: str | None = None):
+        active_doc_path = self._get_active_document_path(document_path)
+        if not active_doc_path:
             QMessageBox.warning(self, "OCR profond", "Aucun document sélectionné.")
             return
 
@@ -343,7 +441,7 @@ class MainWindowCoreMixin:
                 if progress.wasCanceled():
                     raise _DownloadCanceled()
 
-            deep_text = (extract_text_with_tesseract(self.current_pdf_path, progress_callback=_on_progress) or "").strip()
+            deep_text = (extract_text_with_tesseract(active_doc_path, progress_callback=_on_progress) or "").strip()
             if progress is not None:
                 progress.setValue(progress.maximum())
                 QApplication.processEvents()
@@ -434,7 +532,7 @@ class MainWindowCoreMixin:
                 self.bic_input.setText(data.bic)
 
         if getattr(data, "invoice_date", "") and not self.date_input.text().strip():
-            self.date_input.setText(data.invoice_date)
+            self.date_input.setText(normalize_date_format(data.invoice_date))
 
         current_invoice_number = (self.invoice_number_input.text() or "").strip()
         if getattr(data, "invoice_number", "") and not current_invoice_number:
@@ -515,7 +613,7 @@ class MainWindowCoreMixin:
 
         date_value = str(detected.get("date") or "").strip()
         if date_value and not self.date_input.text().strip():
-            self.date_input.setText(date_value)
+            self.date_input.setText(normalize_date_format(date_value))
 
         invoice_number = str(detected.get("invoice_number") or "").strip()
         if invoice_number and not self.invoice_number_input.text().strip():
@@ -538,7 +636,7 @@ class MainWindowCoreMixin:
         # Champs simples
         self.iban_input.setText(data.iban or "")
         self.bic_input.setText(data.bic or "")
-        self.date_input.setText(data.invoice_date or "")
+        self.date_input.setText(normalize_date_format(data.invoice_date or ""))
         self.invoice_number_input.setText(data.invoice_number or "")
 
         # dossiers
@@ -642,7 +740,8 @@ class MainWindowCoreMixin:
             return
 
         if field_key == "date":
-            self.date_input.setText(text)
+            normalized_date = normalize_date_format(text)
+            self.date_input.setText(normalized_date)
             self.date_input.setStyleSheet("background-color: #e6ffe6;")
             return
 
@@ -911,7 +1010,7 @@ class MainWindowCoreMixin:
             if bic:
                 self.bic_input.setText(bic)
             if invoice_date:
-                self.date_input.setText(invoice_date)
+                self.date_input.setText(normalize_date_format(invoice_date))
 
 
             self.invoice_number_input.setText(invoice_number)
@@ -1046,7 +1145,7 @@ class MainWindowCoreMixin:
                     self.current_pdf_path = pdf_path
 
                     # OCR (sans popup)
-                    self.analyze_pdf(show_message=False)
+                    self.analyze_pdf(show_message=False, document_path=pdf_path)
 
                     # sauvegarde OCR, mais on reste en "pending" tant que ce n'est pas validé
                     self.save_current_data(status="pending", show_message=False)
@@ -1149,6 +1248,10 @@ class MainWindowCoreMixin:
         # 2) charger l’existant
         existing = load_supplier_model(supplier_key) or {}
 
+        # Supprimer les anciens champs d'exemple pour éviter la confusion
+        for old_field in ["invoice_number_example", "date_example", "folder_number_example"]:
+            existing.pop(old_field, None)
+
         # 3) apprendre / merger les patterns
         new_patterns = learn_supplier_patterns(
             ocr_text,
@@ -1167,9 +1270,6 @@ class MainWindowCoreMixin:
             "supplier_key": supplier_key,
             "iban": iban,
             "bic": bic,
-            "invoice_number_example": self.invoice_number_input.text().strip(),
-            "date_example": self.date_input.text().strip(),
-            "folder_number_example": (folders[0] if folders else ""),
             "updated_at": datetime.now().isoformat(timespec="seconds"),
             "patterns": merged,
             "model_version": 2,
@@ -1207,21 +1307,17 @@ class MainWindowCoreMixin:
         cur = (self.invoice_number_input.text() or "").strip()
         is_ok = cur and any(c.isdigit() for c in cur) and cur.upper() not in {"DESCRIPTION", "DATE", "FACTURE", "INVOICE"}
         if not is_ok:
-            self.invoice_number_input.setText(
-                found.get("invoice_number") or model.get("invoice_number_example", "")
-            )
+            self.invoice_number_input.setText(found.get("invoice_number") or "")
 
         if not self.date_input.text().strip():
-            self.date_input.setText(
-                found.get("invoice_date") or model.get("date_example", "")
-            )
+            self.date_input.setText(found.get("invoice_date") or "")
 
         if not self.get_folder_numbers():
-            example = str(model.get("folder_number_example", "") or "").strip()
-            if example and self.DOSSIER_PATTERN.fullmatch(example):
+            folder_from_model = found.get("folder_number") or ""
+            if folder_from_model and self.DOSSIER_PATTERN.fullmatch(folder_from_model):
                 dossier_le, _, vat_theo_le = self._get_row_widgets(0)
                 if dossier_le:
-                    dossier_le.setText(example)
+                    dossier_le.setText(folder_from_model)
                     self._ensure_empty_folder_row()
 
     def _update_left_table_date_iban_bic(self, pdf_path: str, invoice_date: str, iban: str, bic: str):

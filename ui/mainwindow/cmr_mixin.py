@@ -742,6 +742,91 @@ class MainWindowCmrMixin:
         finally:
             doc.close()
 
+    def _split_cmr_pages_for_validation(self, pdf_path: str, target_dir: str, entry_id: str | None = None) -> dict[int, str]:
+        """
+        Extrait et écrit un PDF par page CMR rattachée à ce document.
+        Retourne mapping {page_no -> path_pdf}.
+        """
+        pdf_path = str(pdf_path or "").strip()
+        target_dir = str(target_dir or "").strip()
+        if not pdf_path or not os.path.exists(pdf_path) or not target_dir:
+            return {}
+
+        links = self._get_cmr_page_links(pdf_path)
+        if not isinstance(links, list) or not links:
+            return {}
+
+        os.makedirs(target_dir, exist_ok=True)
+        doc = fitz.open(pdf_path)
+        try:
+            split_paths: dict[int, str] = {}
+            src_name = os.path.basename(pdf_path)
+            base_name, ext = os.path.splitext(src_name)
+
+            for link in links:
+                page_no = int(link.get("page", 0) or 0)
+                if page_no <= 0 or page_no > doc.page_count:
+                    continue
+
+                tour_nr = re.sub(r"[^0-9A-Za-z_-]", "", str(link.get("tour_nr") or "").strip())
+                auf_nr = re.sub(r"[^0-9A-Za-z_-]", "", str(link.get("auf_nr") or "").strip())
+                suffix = [f"CMR_p{page_no:02d}"]
+                if tour_nr:
+                    suffix.append(f"T{tour_nr}")
+                if auf_nr:
+                    suffix.append(f"A{auf_nr}")
+
+                new_name = f"{base_name}_" + "_".join(suffix) + ext
+                new_path = os.path.join(target_dir, new_name)
+
+                if os.path.exists(new_path):
+                    root, ext2 = os.path.splitext(new_name)
+                    n = 1
+                    while True:
+                        candidate = os.path.join(target_dir, f"{root}_{n}{ext2}")
+                        if not os.path.exists(candidate):
+                            new_path = candidate
+                            break
+                        n += 1
+
+                new_doc = fitz.open()
+                new_doc.insert_pdf(doc, from_page=page_no - 1, to_page=page_no - 1)
+                new_doc.save(new_path)
+                new_doc.close()
+
+                try:
+                    self.logmail_repo.clone_logmail_row_for_split_file(src_name, os.path.basename(new_path), entry_id=entry_id)
+                except Exception:
+                    pass
+
+                try:
+                    src_json = self._read_saved_invoice_json(pdf_path) or {}
+                    new_data = dict(src_json)
+                    new_data["entry_id"] = str(entry_id or "").strip()
+                    tags = new_data.get("tags") or []
+                    if isinstance(tags, str):
+                        tags = [tags]
+                    if not isinstance(tags, list):
+                        tags = []
+                    tags = sorted({*(tags or []), "cmr"})
+                    new_data["tags"] = tags
+                    new_data["cmr_page_links"] = [link]
+                    new_data["source_split_from"] = src_name
+                    new_data["source_split_page"] = page_no
+
+                    json_path = self._get_saved_json_path(new_path)
+                    os.makedirs(os.path.dirname(json_path), exist_ok=True)
+                    with open(json_path, "w", encoding="utf-8") as f:
+                        json.dump(new_data, f, ensure_ascii=False, indent=2)
+                except Exception:
+                    pass
+
+                split_paths[page_no] = new_path
+
+            return split_paths
+        finally:
+            doc.close()
+
     def _get_cmr_page_links(self, pdf_path: str) -> list[dict]:
         data = self._read_saved_invoice_json(pdf_path) or {}
         links = data.get("cmr_page_links")

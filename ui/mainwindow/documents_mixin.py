@@ -386,7 +386,23 @@ class MainWindowDocumentsMixin:
 
         mode = str(getattr(self, "left_filter_mode", "pending") or "pending").strip().lower()
         sql_status = "error" if mode == "errors" else mode
-        limit = int(getattr(self, "pending_pool_size", 3) or 3) if sql_status == "pending" else None
+
+        # Charger les paramètres UI depuis settings
+        from app.settings import load_settings, get_ui_value
+        settings = load_settings()
+        max_pages_pending = int(get_ui_value(settings, "max_pages_pending", 100))
+        max_pages_error = int(get_ui_value(settings, "max_pages_error", 50))
+        max_pages_validated = int(get_ui_value(settings, "max_pages_validated", 200))
+
+        # Déterminer la limite selon le mode
+        if sql_status == "pending":
+            limit = max_pages_pending
+        elif sql_status == "error":
+            limit = max_pages_error
+        elif sql_status == "validated":
+            limit = max_pages_validated
+        else:
+            limit = None
 
         try:
             rows = self.logmail_repo.get_document_rows_for_folder(folder, sql_status, limit=limit)

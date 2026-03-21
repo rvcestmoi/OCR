@@ -4,6 +4,7 @@ from typing import Any, Dict, List, Optional
 
 from .folder_patterns import extract_folder_numbers_from_text, is_valid_folder_number
 from .supplier_model import extract_iban_candidates, validate_bic, validate_iban
+from .invoice_parser import normalize_date_format
 
 
 # ------------------------------------------------------------
@@ -46,6 +47,9 @@ FIELD_LABELS: Dict[str, List[str]] = {
         "INVOICE DATE",
         "DATE FACTURE",
         "DATE DE FACTURE",
+        "DATE DE FACTURATION",
+        "DATE D'ECHEANCE",
+        "DATE D'ÉCHÉANCE",
         "FACTUURDATUM",
         "RECHNUNGSDATUM",
         "FECHA FACTURA",
@@ -260,7 +264,9 @@ def _extract_bic_candidates(text: str) -> List[str]:
 
 def _extract_first_date(text: str) -> str:
     m = DATE_RE.search(text or "")
-    return m.group(0) if m else ""
+    if m:
+        return normalize_date_format(m.group(0))
+    return ""
 
 
 def _is_probable_invoice_value(token: str) -> bool:
@@ -290,7 +296,7 @@ def _extract_value_near_label(lines: List[str], field: str) -> str:
         if field == "date":
             m = DATE_RE.search(same_line)
             if m:
-                return m.group(0)
+                return normalize_date_format(m.group(0))
         elif field == "folder_number":
             folders = extract_folder_numbers_from_text(line)
             if folders:

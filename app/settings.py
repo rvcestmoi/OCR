@@ -31,6 +31,11 @@ DEFAULT_SETTINGS = {
         "dpi": 150,
         "languages": "fra+eng+deu+spa+ita+nld",
     },
+    "ui": {
+        "max_pages_pending": 100,
+        "max_pages_error": 50,
+        "max_pages_validated": 200,
+    },
 }
 
 
@@ -76,5 +81,12 @@ def get_path(settings: Dict[str, Any], key: str, fallback: str | None = None) ->
 def get_ocr_value(settings: Dict[str, Any], key: str, fallback=None):
     try:
         return (settings.get("ocr") or {}).get(key, fallback)
+    except Exception:
+        return fallback
+
+
+def get_ui_value(settings: Dict[str, Any], key: str, fallback=None):
+    try:
+        return (settings.get("ui") or {}).get(key, fallback)
     except Exception:
         return fallback

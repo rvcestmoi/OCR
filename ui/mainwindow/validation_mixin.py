@@ -21,6 +21,16 @@ class MainWindowValidationMixin:
         if not self._block_validate_if_ht_amounts_not_matching_tours():
             return
 
+        # Vérifier que le numéro de facture est rempli
+        invoice_nr = (self.invoice_number_input.text() or "").strip()
+        if not invoice_nr:
+            QMessageBox.warning(
+                self,
+                "Validation impossible",
+                "Le champ 'N° facture' doit être rempli pour valider la facture."
+            )
+            return
+
         # Vérifie les tournées AVANT toute validation
         tournrs = sorted({
             (r.get("tour_nr") or "").strip()
@@ -429,6 +439,10 @@ class MainWindowValidationMixin:
                 country = ""
 
             self._update_left_row_for_entry(entry_id, invoice_date, iban, bic, country)
+
+
+    def on_ctrl_m_save_supplier_model(self):
+        self.save_supplier_model(show_message=False)
 
 
     def _format_percent(self, v: float | None) -> str:
@@ -855,22 +869,59 @@ class MainWindowValidationMixin:
 
         os.makedirs(target_dir, exist_ok=True)
 
-        filename = os.path.basename(pdf_path)
-        target_path = os.path.join(target_dir, filename)
+        def copy_src_to_target(src_path: str) -> str:
+            src_path = str(src_path or "").strip()
+            if not src_path or not os.path.isfile(src_path):
+                return ""
 
-        # évite l’écrasement si le fichier existe déjà
-        if os.path.exists(target_path):
-            base, ext = os.path.splitext(filename)
-            i = 1
-            while True:
-                candidate = os.path.join(target_dir, f"{base}_{i}{ext}")
-                if not os.path.exists(candidate):
-                    target_path = candidate
-                    break
-                i += 1
+            if os.path.dirname(os.path.abspath(src_path)) == os.path.abspath(target_dir):
+                # déjà dans le dossier cible
+                return os.path.abspath(src_path)
 
-        shutil.copy2(pdf_path, target_path)
-        return target_path
+            name = os.path.basename(src_path)
+            dest_path = os.path.join(target_dir, name)
+            if os.path.exists(dest_path):
+                base, ext = os.path.splitext(name)
+                i = 1
+                while True:
+                    candidate = os.path.join(target_dir, f"{base}_{i}{ext}")
+                    if not os.path.exists(candidate):
+                        dest_path = candidate
+                        break
+                    i += 1
+
+            shutil.copy2(src_path, dest_path)
+            return dest_path
+
+        self._dms_copied_paths = getattr(self, "_dms_copied_paths", {}) or {}
+
+        # Copie principal
+        copied_main_path = copy_src_to_target(pdf_path)
+        if copied_main_path:
+            self._dms_copied_paths[os.path.abspath(pdf_path)] = copied_main_path
+
+        # Copier tous les fichiers du même groupe (entry_pdf_paths)
+        for p in (self.entry_pdf_paths or []):
+            if not p:
+                continue
+            p = str(p or "").strip()
+            if p and p != pdf_path:
+                copied_path = copy_src_to_target(p)
+                if copied_path:
+                    self._dms_copied_paths[os.path.abspath(p)] = copied_path
+
+        # split CMR pages en fichiers dédiés dans DMS
+        try:
+            cmr_splits = self._split_cmr_pages_for_validation(pdf_path, target_dir, entry_id=str(getattr(self, "selected_invoice_entry_id", "") or ""))
+            self._cmr_splits = getattr(self, "_cmr_splits", {}) or {}
+            self._cmr_splits[pdf_path] = cmr_splits
+            for split_path in (cmr_splits or {}).values():
+                if split_path:
+                    self._dms_copied_paths[os.path.abspath(split_path)] = os.path.abspath(split_path)
+        except Exception:
+            self._cmr_splits = getattr(self, "_cmr_splits", {}) or {}
+
+        return copied_main_path or ""
     
     def _collect_validation_csv_rows(self) -> list[list[str]]:
         """
@@ -887,12 +938,15 @@ class MainWindowValidationMixin:
         })
 
         invoice_path = str(getattr(self, "current_pdf_path", "") or "").strip()
+        invoice_path_copied = str(self._dms_copied_paths.get(os.path.abspath(invoice_path), invoice_path) or "").strip()
 
         for tour_nr in invoice_tours:
-            rows.append([tour_nr, "", "", "Facture", invoice_path])
+            rows.append([tour_nr, "", "", "Facture", invoice_path_copied])
 
         # 2) Lignes CMR : une ligne par couple dossier / aufnr
         seen = set()
+        cmr_splits = getattr(self, "_cmr_splits", {}) or {}
+
         for p in (self.entry_pdf_paths or []):
             data = self._read_saved_invoice_json(p) or {}
 
@@ -902,10 +956,16 @@ class MainWindowValidationMixin:
                 for link in page_links:
                     tour_nr = str(link.get("tour_nr") or "").strip()
                     aufnr = str(link.get("auf_nr") or "").strip()
+                    page_no = int(link.get("page") or 0)
                     if not tour_nr or not aufnr:
                         continue
 
-                    key = (tour_nr, aufnr, "CMR", p)
+                    cmr_path = p
+                    file_splits = cmr_splits.get(p, {}) if isinstance(cmr_splits, dict) else {}
+                    if isinstance(file_splits, dict) and page_no and page_no in file_splits:
+                        cmr_path = file_splits.get(page_no, p)
+
+                    key = (tour_nr, aufnr, "CMR", cmr_path)
                     if key in seen:
                         continue
                     seen.add(key)
@@ -915,7 +975,7 @@ class MainWindowValidationMixin:
                     except Exception:
                         aufintnr = ""
 
-                    rows.append([tour_nr, aufintnr, aufnr, "CMR", str(p or "").strip()])
+                    rows.append([tour_nr, aufintnr, aufnr, "CMR", str(self._dms_copied_paths.get(os.path.abspath(cmr_path), cmr_path) or "").strip()])
                 continue
 
             # ancien format legacy

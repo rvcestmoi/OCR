@@ -93,6 +93,49 @@ def _find_line_with_value(text: str, value: str) -> Optional[str]:
     return best
 
 
+def _extract_label_near_value(text: str, value: str, window: int = 50) -> Optional[str]:
+    """Extrait le label réel près d'une valeur (cherche dans les lignes autour)."""
+    if not text or not value:
+        return None
+
+    v_norm = _norm_for_search(value)
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+
+    for i, line in enumerate(lines):
+        line_norm = _norm_for_search(line)
+        if v_norm in line_norm:
+            # 1) Chercher un label sur la même ligne (valeur après label)
+            value_idx = line_norm.find(v_norm)
+            if value_idx > 0:
+                left_part = line[:value_idx].strip()
+                if ':' in left_part:
+                    candidate = left_part.split(':')[0].strip()
+                else:
+                    candidate = left_part.strip()
+
+                # normalisation minimale (pas juste chiffres / trop court)
+                if candidate and len(candidate) > 2 and len(candidate) < 60 and re.search(r"[A-Za-zÀ-ÖØ-öø-ÿ]", candidate):
+                    return candidate
+
+            # 2) Chercher un label dans les lignes précédentes (1-2 lignes)
+            for j in range(max(0, i - 2), i):
+                prev_line = lines[j]
+                if ':' in prev_line:
+                    label = prev_line.split(':')[0].strip()
+                    if label and len(label) > 2 and len(label) < 60:
+                        return label
+
+            # 3) Chercher un label dans la ligne suivante (cas label en dessous)
+            if i + 1 < len(lines):
+                next_line = lines[i + 1]
+                if ':' in next_line:
+                    label = next_line.split(':')[0].strip()
+                    if label and len(label) > 2 and len(label) < 60:
+                        return label
+
+    return None
+
+
 def _value_group_regex(field: str, value: str) -> str:
     v = (value or "").strip()
 
@@ -360,12 +403,21 @@ def learn_supplier_patterns(
         line = _find_line_with_value(ocr_text, invoice_number)
         rx = _make_line_regex(line, "invoice_number", invoice_number) if line else None
         if rx:
-            # ✅ Invoice number : near_label basé sur le FORMAT de l'exemple
-            # (évite de capturer 30/11/2025)
-            group_re = _value_group_regex("invoice_number", invoice_number)  # ex: F\d{7}
+            patterns["invoice_number"].append({
+                "mode": "line_regex",
+                "regex": rx,
+                "group": 1,
+                "hit_count": 0,
+                "created_at": _now_iso(),
+            })
+
+        # Apprendre le label spécifique trouvé près de la valeur
+        specific_label = _extract_label_near_value(ocr_text, invoice_number)
+        if specific_label:
+            group_re = _value_group_regex("invoice_number", invoice_number)
             patterns["invoice_number"].append({
                 "mode": "near_label",
-                "label_regex": r"\b(N[°O]\s*FACTURE|INVOICE\s*(NO\.?|NUMBER)|INV\.?\s*NO\.?)\b",
+                "label_regex": rf"\b{re.escape(specific_label)}\b",
                 "value_regex": rf"(\b{group_re}\b)",
                 "window": 200,
                 "group": 1,
@@ -373,6 +425,7 @@ def learn_supplier_patterns(
                 "created_at": _now_iso(),
             })
 
+        # Fallback générique
         patterns["invoice_number"].append({
             "mode": "near_label",
             "label_regex": r"\b(N[°O]\s*FACTURE|INVOICE\s*(NO\.?|NUMBER)|INV\.?\s*NO\.?)\b",
@@ -392,11 +445,24 @@ def learn_supplier_patterns(
                 "mode": "line_regex",
                 "regex": rx,
                 "group": 1,
-                "example_line": line,
                 "hit_count": 0,
                 "created_at": _now_iso(),
             })
 
+        # Apprendre le label spécifique trouvé près de la valeur
+        specific_label = _extract_label_near_value(ocr_text, invoice_date)
+        if specific_label:
+            patterns["invoice_date"].append({
+                "mode": "near_label",
+                "label_regex": rf"\b{re.escape(specific_label)}\b",
+                "value_regex": r"(\b\d{1,2}[./-]\d{1,2}[./-]\d{2,4}\b)",
+                "window": 120,
+                "group": 1,
+                "hit_count": 0,
+                "created_at": _now_iso(),
+            })
+
+        # Fallback générique
         patterns["invoice_date"].append({
             "mode": "near_label",
             "label_regex": r"\b(DATE|INVOICE\s+DATE|DATE\s+FACTURE|DATUM)\b",

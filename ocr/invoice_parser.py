@@ -177,7 +177,58 @@ def extract_bic(text: str) -> str:
 
 def extract_date(text: str) -> str:
     match = re.search(r"\b\d{2}[./-]\d{2}[./-]\d{4}\b", text or "")
-    return match.group() if match else ""
+    if not match:
+        return ""
+    
+    date_str = match.group()
+    return normalize_date_format(date_str)
+
+
+def normalize_date_format(date_str: str) -> str:
+    """
+    Normalise une date au format jj/mm/aaaa.
+    Accepte les formats courants : jj/mm/aaaa, jj.mm.aaaa, jj-mm-aaaa, aaaa-mm-jj, etc.
+    """
+    if not date_str:
+        return ""
+    
+    # Nettoyer et splitter
+    date_str = date_str.strip()
+    separators = ['/', '.', '-']
+    sep = None
+    for s in separators:
+        if s in date_str:
+            sep = s
+            break
+    
+    if not sep:
+        return date_str
+    
+    parts = date_str.split(sep)
+    if len(parts) != 3:
+        return date_str
+    
+    try:
+        p1, p2, p3 = [int(x.strip()) for x in parts]
+    except ValueError:
+        return date_str
+    
+    # Déterminer le format
+    if p1 > 31:  # aaaa-mm-jj
+        year, month, day = p1, p2, p3
+    elif p3 > 31:  # jj-mm-aaaa ou mm-jj-aaaa
+        year, month, day = p3, p2, p1
+    else:  # jj-mm-aaaa ou mm-jj-aaaa
+        if p2 <= 12:
+            day, month, year = p1, p2, p3
+        else:
+            month, day, year = p1, p2, p3
+    
+    # Validation basique
+    if not (1 <= day <= 31 and 1 <= month <= 12 and 1900 <= year <= 2100):
+        return date_str
+    
+    return f"{day:02d}/{month:02d}/{year:04d}"
 
 
 def extract_invoice_number(text: str) -> str:

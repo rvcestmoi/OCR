@@ -1,6 +1,6 @@
 {
   "paths": {
-    "pdf_inbox_dir": "C:\\Users\\hrouillard\\Documents\\clients\\ED trans\\OCR\\modeles2",
+    "pdf_inbox_dir": "C:\\Users\\hrouillard\\Documents\\clients\\ED trans\\OCR\\PDFS",
     "models_dir": "C:\\git\\OCR\\OCR\\models",
     "supplier_models_dir": "C:\\git\\OCR\\OCR\\models\\suppliers",
     "dms_export_dir": "C:\\konverter\\DMS",
@@ -22,5 +22,10 @@
     "password": "",
 
     "driver": "ODBC Driver 17 for SQL Server"
+  },
+  "ui": {
+    "max_pages_pending": 60,
+    "max_pages_error": 5,
+    "max_pages_validated": 20
   }
 }

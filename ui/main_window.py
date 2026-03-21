@@ -357,7 +357,7 @@ class MainWindow(
         transporter_layout.addWidget(self.transporter_input)
         transporter_layout.addWidget(self.btn_transporter_action)
         transporter_layout.addStretch()
-        form_layout.addRow("Transporteur :", transporter_layout)
+        form_layout.addRow("Trp :", transporter_layout)
         
         self.transporter_aux_input = QLineEdit()
         self.transporter_aux_input.setPlaceholderText("Compte auxiliaire")
@@ -368,7 +368,16 @@ class MainWindow(
         self.transporter_aux_input.setFocusPolicy(Qt.NoFocus)
         self.transporter_aux_input.setStyleSheet("background-color: #f3f3f3;")
 
-        form_layout.addRow("Compte auxiliaire :", self.transporter_aux_input)
+        form_layout.addRow("Cpte a.:", self.transporter_aux_input)
+
+        # Nouveau champ expéditeur
+        self.sender_input = QLineEdit()
+        self.sender_input.setReadOnly(True)
+        self.sender_input.setFocusPolicy(Qt.ClickFocus)  # Permet la sélection pour copie
+        self.sender_input.setStyleSheet("background-color: #f3f3f3;")
+        self.sender_input.setContextMenuPolicy(Qt.DefaultContextMenu)  # Menu contextuel par défaut pour copie
+
+        form_layout.addRow("Expéditeur :", self.sender_input)
 
         form_layout.addRow("Date facture :", self.date_input)
         form_layout.addRow("N° facture :", self.invoice_number_input)
@@ -459,6 +468,10 @@ class MainWindow(
         self.shortcut_save = QShortcut(QKeySequence("Ctrl+S"), self)
         self.shortcut_save.setContext(Qt.ApplicationShortcut)
         self.shortcut_save.activated.connect(self.on_ctrl_s_save)
+
+        self.shortcut_save_supplier = QShortcut(QKeySequence("Ctrl+M"), self)
+        self.shortcut_save_supplier.setContext(Qt.ApplicationShortcut)
+        self.shortcut_save_supplier.activated.connect(self.on_ctrl_m_save_supplier_model)
 
         self.btn_validate = QPushButton("✅ Valider la facture (V)")
         self.btn_validate.clicked.connect(self.on_validate_invoice)
