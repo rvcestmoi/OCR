@@ -218,6 +218,44 @@ def _tolerant_exact_regex(value: str) -> Optional[str]:
     return r"\b" + sep.join(map(re.escape, parts)) + r"\b"
 
 
+_INVOICE_DATE_LABEL_HINT_RE = re.compile(
+    r"(?:DATE\s+D['’]?[ÉE]MISSION|DATE\s+FACTURE|INVOICE\s+DATE|ISSUED?\s+DATE|DATUM)",
+    re.IGNORECASE,
+)
+
+_DUE_DATE_HINT_RE = re.compile(
+    r"(?:[ÉE]CH[ÉE]ANCE|DUE\s+DATE|PAYMENT\s+DUE|PAYABLE|R[ÈE]GLEMENT|VIREMENT|MATURIT[ÉE])",
+    re.IGNORECASE,
+)
+
+
+def _score_invoice_date_candidate(rule: Dict[str, Any], context: str) -> int:
+    score = int(rule.get("hit_count", 0)) * 10
+    mode = (rule.get("mode") or "").strip().lower()
+    rule_text = " ".join([
+        str(rule.get("label_regex") or ""),
+        str(rule.get("regex") or ""),
+    ])
+    haystack = f"{rule_text}\n{context or ''}"
+
+    if mode == "near_label":
+        score += 80
+    elif mode == "line_regex":
+        score += 30
+
+    if _INVOICE_DATE_LABEL_HINT_RE.search(haystack):
+        score += 180
+    if _DUE_DATE_HINT_RE.search(haystack):
+        score -= 220
+
+    if re.search(r"DATE\s+D['’]?[ÉE]MISSION", haystack, re.IGNORECASE):
+        score += 140
+    if re.search(r"\bFACTURE\b|\bINVOICE\b", haystack, re.IGNORECASE):
+        score += 40
+
+    return score
+
+
 IBAN_LENGTHS: Dict[str, int] = {
     "AD": 24, "AE": 23, "AL": 28, "AT": 20, "AZ": 28, "BA": 20, "BE": 16,
     "BG": 22, "BH": 22, "BR": 29, "BY": 28, "CH": 21, "CR": 22, "CY": 28,
@@ -639,6 +677,54 @@ def extract_fields_with_model(text: str, model: dict) -> Dict[str, str]:
                         break
             if found_val:
                 out[field] = found_val
+            continue
+
+        # Pour invoice_date, scorer tous les candidats pour éviter de prendre une échéance
+        if field == "invoice_date":
+            best_date = None
+            best_score = -10**9
+            for r in rules:
+                mode = (r.get("mode") or "").strip().lower()
+                if mode == "line_regex":
+                    rx = re.compile(r.get("regex", ""), re.IGNORECASE | re.MULTILINE)
+                    g = int(r.get("group", 0))
+                    for m in rx.finditer(src):
+                        val = (m.group(g) if g else m.group(0) or "").strip()
+                        if not val:
+                            continue
+                        ctx = src[max(0, m.start() - 120): min(len(src), m.end() + 120)]
+                        score = _score_invoice_date_candidate(r, ctx)
+                        if score > best_score:
+                            best_score = score
+                            best_date = val
+                elif mode == "near_label":
+                    label_rx = re.compile(r.get("label_regex", ""), re.IGNORECASE)
+                    value_rx = re.compile(r.get("value_regex", ""), re.IGNORECASE)
+                    window = int(r.get("window", 120))
+                    g = int(r.get("group", 0))
+                    for lm in label_rx.finditer(src):
+                        chunk = src[lm.end(): lm.end() + window]
+                        vm = value_rx.search(chunk)
+                        if not vm:
+                            continue
+                        val = (vm.group(g) if g else vm.group(0) or "").strip()
+                        if not val:
+                            continue
+                        abs_end = min(len(src), lm.end() + vm.end())
+                        ctx = src[max(0, lm.start() - 120): min(len(src), abs_end + 120)]
+                        score = _score_invoice_date_candidate(r, ctx)
+                        if score > best_score:
+                            best_score = score
+                            best_date = val
+                else:
+                    val = apply_rule(field, r)
+                    if val:
+                        score = _score_invoice_date_candidate(r, val)
+                        if score > best_score:
+                            best_score = score
+                            best_date = val.strip()
+            if best_date:
+                out[field] = best_date.strip()
             continue
 
         # Comportement standard pour les autres champs

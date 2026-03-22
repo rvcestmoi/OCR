@@ -1355,8 +1355,10 @@ class MainWindowCoreMixin:
         elif not is_ok:
             self.invoice_number_input.setText(invoice_number_from_model or "")
 
-        if not self.date_input.text().strip():
-            self.date_input.setText(found.get("invoice_date") or "")
+        model_invoice_date = normalize_date_format(found.get("invoice_date") or "")
+        current_invoice_date = normalize_date_format(self.date_input.text().strip())
+        if model_invoice_date and (not current_invoice_date or model_invoice_date != current_invoice_date):
+            self.date_input.setText(model_invoice_date)
 
         if not self.get_folder_numbers():
             folder_from_model = found.get("folder_number") or ""

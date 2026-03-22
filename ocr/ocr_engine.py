@@ -24,7 +24,7 @@ pytesseract.pytesseract.tesseract_cmd = get_path(
     r"C:\Users\hrouillard\AppData\Local\Programs\Tesseract-OCR\tesseract.exe",
 )
 
-_OCR_DPI = int(get_ocr_value(_SETTINGS, "dpi", 200) or 200)
+_OCR_DPI = int(get_ocr_value(_SETTINGS, "dpi", 50) or 50)
 _OCR_LANGS = str(get_ocr_value(_SETTINGS, "languages", "fra+eng+deu+spa+ita+nld") or "fra")
 
 _BAD_OCR_CHARS = set("□■▪▫█▌▐▎▍▏|¦│┃┆┇")

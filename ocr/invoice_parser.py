@@ -177,12 +177,53 @@ def extract_bic(text: str) -> str:
 
 
 def extract_date(text: str) -> str:
-    match = re.search(r"\b\d{2}[./-]\d{2}[./-]\d{4}\b", text or "")
-    if not match:
+    src = text or ""
+    if not src:
         return ""
-    
-    date_str = match.group()
-    return normalize_date_format(date_str)
+
+    date_rx = re.compile(r"\b(?:\d{1,2}[./-]\d{1,2}[./-]\d{2,4}|\d{4}[./-]\d{1,2}[./-]\d{1,2})\b")
+    strong_label_rx = re.compile(
+        r"(?:DATE\s+D['’]?[ÉE]MISSION|DATE\s+FACTURE|INVOICE\s+DATE|ISSUED?\s+DATE|DATUM)",
+        re.IGNORECASE,
+    )
+    weak_label_rx = re.compile(r"\b(?:DATE|FACTURE|INVOICE)\b", re.IGNORECASE)
+    due_hint_rx = re.compile(
+        r"\b(?:[ÉE]CH[ÉE]ANCE|DUE\s+DATE|PAYMENT\s+DUE|PAYABLE|R[ÈE]GLEMENT|VIREMENT|MATURIT[ÉE])\b",
+        re.IGNORECASE,
+    )
+
+    lines = [ln.strip() for ln in src.splitlines() if ln.strip()]
+
+    for idx, line in enumerate(lines):
+        window = line
+        if idx + 1 < len(lines):
+            window += " " + lines[idx + 1]
+        if strong_label_rx.search(window):
+            m = date_rx.search(window)
+            if m:
+                return normalize_date_format(m.group(0))
+
+    for idx, line in enumerate(lines):
+        window = line
+        if idx + 1 < len(lines):
+            window += " " + lines[idx + 1]
+        if due_hint_rx.search(window):
+            continue
+        if weak_label_rx.search(window):
+            m = date_rx.search(window)
+            if m:
+                return normalize_date_format(m.group(0))
+
+    fallback = ""
+    for m in date_rx.finditer(src):
+        ctx = src[max(0, m.start() - 80): min(len(src), m.end() + 80)]
+        if due_hint_rx.search(ctx):
+            if not fallback:
+                fallback = m.group(0)
+            continue
+        return normalize_date_format(m.group(0))
+
+    return normalize_date_format(fallback) if fallback else ""
 
 
 def normalize_date_format(date_str: str) -> str:
