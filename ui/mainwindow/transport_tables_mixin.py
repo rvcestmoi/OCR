@@ -100,6 +100,7 @@ class MainWindowTransportTablesMixin:
                 kundennr = str(getattr(self, "selected_kundennr", "") or "").strip()
                 if not kundennr:
                     self.transporter_info.setPlainText("ℹ️ Aucun transporteur sélectionné.")
+                    self.transporter_input.clear()
                     return
 
                 transporter = self.transporter_repo.find_transporter_by_kundennr(kundennr)
@@ -110,6 +111,7 @@ class MainWindowTransportTablesMixin:
 
                 if not iban or not bic:
                     self.transporter_info.setPlainText("ℹ️ Aucun IBAN/BIC renseigné.")
+                    self.transporter_input.clear()
                     return
 
                 transporter = self.transporter_repo.find_transporter_by_bank(iban, bic)
@@ -124,6 +126,7 @@ class MainWindowTransportTablesMixin:
                     self.transporter_info.setPlainText(f"❌ Transporteur introuvable : {kundennr}")
                 else:
                     self.transporter_info.setPlainText("❌ Aucun transporteur trouvé pour cet IBAN / SWIFT.")
+                self.transporter_input.clear()
                 return
 
             if not kundennr:

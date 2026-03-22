@@ -26,7 +26,18 @@ from PySide6.QtWidgets import (QApplication, QButtonGroup, QCompleter, QDialog,
 from app.paths import DEFAULT_PDF_FOLDER, MODELS_DIR, SUPPLIERS_DIR
 from ocr.invoice_parser import parse_invoice
 from ocr.field_detector import detect_fields_multilingual
-from ocr.ocr_engine import extract_text_from_pdf, extract_text_with_tesseract
+try:
+    from ocr.ocr_engine import extract_text_from_pdf, extract_text_with_tesseract
+    OCR_ENGINE_AVAILABLE = True
+except ImportError:
+    # Fallback functions if OCR engine is not available
+    def extract_text_from_pdf(pdf_path: str) -> str:
+        return "OCR engine not available"
+    
+    def extract_text_with_tesseract(image_path: str) -> str:
+        return "OCR engine not available"
+    
+    OCR_ENGINE_AVAILABLE = False
 from ocr.document_classifier import classify_document_text
 from ocr.supplier_model import (build_supplier_key, extract_best_bank_ids,
                                 extract_fields_with_model, learn_supplier_patterns,

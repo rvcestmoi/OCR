@@ -225,13 +225,13 @@ class MainWindowDocumentsMixin:
 
         action_link = menu.addAction("Rattacher ce document à la facture sélectionnée")
         action_attach_cmr = menu.addAction("Rattacher CMR à un dossier…")
-        action_attach_cmr.setEnabled(bool(pdf_path))  # ✅ maintenant OK
+        action_attach_cmr.setEnabled(False)  # ✅ maintenant OK
 
         menu.addSeparator()
         action_delete = menu.addAction("Supprimer")
         action_delete.setEnabled(bool(pdf_path))
         action_fetch_links = menu.addAction("Télécharger documents via liens (CMR)…")
-        action_fetch_links.setEnabled(bool(pdf_path))
+        action_fetch_links.setEnabled(False)
         # --- cible = ligne actuellement sélectionnée (la facture cible)
         target_row = self.pdf_table.currentRow()
         target_filename = None
@@ -249,7 +249,7 @@ class MainWindowDocumentsMixin:
             target_entry_id = self.selected_invoice_entry_id or self.logmail_repo.get_entry_id_for_file(target_filename)
 
         can_link = bool(target_entry_id and target_filename and linked_filename and linked_filename != target_filename)
-        action_link.setEnabled(can_link)
+        action_link.setEnabled(False)
         action_relink = menu.addAction("Rattacher à un Dossier (regrouper avec un autre fichier)…")
         action_relink.setEnabled(bool(pdf_path))
 
@@ -385,7 +385,10 @@ class MainWindowDocumentsMixin:
         self.pdf_table.setRowCount(0)
 
         mode = str(getattr(self, "left_filter_mode", "pending") or "pending").strip().lower()
-        sql_status = "error" if mode == "errors" else mode
+        if mode == "errors":
+            sql_status = "error"
+        else:
+            sql_status = mode
 
         # Charger les paramètres UI depuis settings
         from app.settings import load_settings, get_ui_value
@@ -721,6 +724,7 @@ class MainWindowDocumentsMixin:
                 status_visible = (status == "validated")
             elif mode == "errors":
                 status_visible = (status == "error")
+
             else:
                 status_visible = True
 

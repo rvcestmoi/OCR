@@ -345,11 +345,53 @@ def _to_float(s: str):
         return None
 
 
-def parse_vat_lines(text: str, allowed_vat_rates: set[float] | None = None):
+def parse_vat_lines(text: str, allowed_vat_rates: set[float] | None = None, model: dict | None = None):
     global _current_allowed_vat_rates
     _current_allowed_vat_rates = allowed_vat_rates
     lines_out = []
     seen = set()
+
+    # 0) Utiliser les patterns du modèle supplier si disponible
+    if model and "patterns" in model:
+        patterns = model["patterns"]
+        vat_rate_patterns = patterns.get("vat_rate", [])
+        vat_base_patterns = patterns.get("vat_base", [])
+        vat_amount_patterns = patterns.get("vat_amount", [])
+
+        if vat_rate_patterns or vat_base_patterns or vat_amount_patterns:
+            from .supplier_model import extract_fields_with_model
+            found = extract_fields_with_model(text, model)
+
+            rate = found.get("vat_rate", "")
+            base = found.get("vat_base", "")
+            vat = found.get("vat_amount", "")
+
+            if rate or base or vat:
+                # Essayer de compléter les valeurs manquantes
+                if rate and base and vat:
+                    lines_out.append({"rate": rate, "base": base, "vat": vat})
+                elif rate and base and not vat:
+                    # Calculer le montant TVA
+                    try:
+                        r = float(rate.replace(",", "."))
+                        b = _to_float(base)
+                        if b and _is_allowed_vat_rate(r):
+                            v = (b * r) / 100.0
+                            vat = f"{v:.2f}"
+                            lines_out.append({"rate": rate, "base": base, "vat": vat})
+                    except:
+                        pass
+                elif rate and vat and not base:
+                    # Calculer la base HT
+                    try:
+                        r = float(rate.replace(",", "."))
+                        v = _to_float(vat)
+                        if v and _is_allowed_vat_rate(r):
+                            b = (v * 100.0) / r
+                            base = f"{b:.2f}"
+                            lines_out.append({"rate": rate, "base": base, "vat": vat})
+                    except:
+                        pass
 
     # 1) format ligne TVA directe
     for raw in (text or "").splitlines():
@@ -435,6 +477,9 @@ def parse_vat_lines(text: str, allowed_vat_rates: set[float] | None = None):
             seen.add(key)
             lines_out.append({"rate": rate, "base": base, "vat": vat})
 
+    # 3) Fusionner les lignes TVA avec le même taux
+    lines_out = _merge_duplicate_vat_lines(lines_out)
+
     return lines_out
 
 
@@ -450,6 +495,7 @@ def parse_invoice(text: str) -> InvoiceData:
     # Charger modèle fournisseur si possible
     supplier_key = None
     allowed_vat_rates = None
+    model = None
     if iban or bic:
         from .supplier_model import build_supplier_key, load_supplier_model
         supplier_key = build_supplier_key(iban, bic)
@@ -461,7 +507,7 @@ def parse_invoice(text: str) -> InvoiceData:
                     allowed_vat_rates = {p["rate"] for p in vat_rates_patterns}
     
     # Parser TVA avec filtrage par modèle fournisseur
-    vat_lines = parse_vat_lines(text, allowed_vat_rates=allowed_vat_rates)
+    vat_lines = parse_vat_lines(text, allowed_vat_rates=allowed_vat_rates, model=model)
     
     vat_total = 0.0
     has_any = False
@@ -604,12 +650,14 @@ def _money_in_line_or_next(lines: list[str], idx: int) -> str:
     if m:
         return _norm_amount_str(m.group(0))
 
-    if idx + 1 < len(lines):
-        ln2 = (lines[idx + 1] or "").strip()
-        if ONLY_AMOUNT_RE.match(ln2):
-            m2 = MONEY_RE.search(ln2)
-            if m2:
-                return _norm_amount_str(m2.group(0))
+    # Chercher dans les lignes suivantes (jusqu'à 4 lignes plus loin)
+    for offset in range(1, 5):
+        if idx + offset >= len(lines):
+            break
+        ln_next = (lines[idx + offset] or "").strip()
+        m_next = MONEY_RE.search(ln_next)
+        if m_next:
+            return _norm_amount_str(m_next.group(0))
 
     return ""
 
@@ -639,14 +687,69 @@ def _rate_in_line_or_next(lines: list[str], idx: int) -> str:
     if r:
         return r
 
-    if idx + 1 < len(lines):
-        ln2 = (lines[idx + 1] or "").strip()
-        if ONLY_AMOUNT_RE.match(ln2):
-            r2 = pick_rate_from_text(ln2)
-            if r2:
-                return r2
+    # Chercher dans les lignes suivantes (jusqu'à 4 lignes plus loin)
+    for offset in range(1, 5):
+        if idx + offset >= len(lines):
+            break
+        ln_next = (lines[idx + offset] or "").strip()
+        r_next = pick_rate_from_text(ln_next)
+        if r_next:
+            return r_next
 
     return ""
+
+
+def _merge_duplicate_vat_lines(lines: list[dict]) -> list[dict]:
+    """Fusionne les lignes TVA avec le même taux, gardant celle avec le plus d'informations."""
+    if not lines:
+        return lines
+
+    # Grouper par taux
+    by_rate: dict[str, list[dict]] = {}
+    for line in lines:
+        rate = line.get("rate", "").strip()
+        if rate:
+            if rate not in by_rate:
+                by_rate[rate] = []
+            by_rate[rate].append(line)
+
+    merged = []
+    for rate, group in by_rate.items():
+        if len(group) == 1:
+            merged.append(group[0])
+            continue
+
+        # Plusieurs lignes avec le même taux - garder la meilleure
+        best_line = None
+        best_score = -1
+
+        for line in group:
+            score = 0
+            if line.get("base", "").strip():
+                score += 2  # Base HT présente = très important
+            if line.get("vat", "").strip():
+                score += 2  # Montant TVA présent = très important
+            if line.get("rate", "").strip():
+                score += 1  # Taux présent = important
+
+            # Bonus si les valeurs sont cohérentes
+            base_val = _to_float(line.get("base", ""))
+            vat_val = _to_float(line.get("vat", ""))
+            rate_val = _to_float(line.get("rate", ""))
+
+            if base_val and vat_val and rate_val:
+                expected_vat = (base_val * rate_val) / 100.0
+                if abs(vat_val - expected_vat) < 0.01:  # Tolérance de 1 centime
+                    score += 3  # Valeurs cohérentes = excellent
+
+            if score > best_score:
+                best_score = score
+                best_line = line
+
+        if best_line:
+            merged.append(best_line)
+
+    return merged
 
 
 def _extract_vat_by_labels(lines: list[str]) -> dict | None:
@@ -687,6 +790,15 @@ def _extract_vat_by_labels(lines: list[str]) -> dict | None:
     base = _money_in_line_or_next(lines, idx_base) if idx_base is not None else ""
     vat = _money_in_line_or_next(lines, idx_vat) if idx_vat is not None else ""
     rate = _rate_in_line_or_next(lines, idx_rate) if idx_rate is not None else ""
+
+    # Si pas de label de taux trouvé, chercher autour des autres labels
+    if not rate:
+        # Chercher autour du label TVA
+        if idx_vat is not None:
+            rate = _rate_in_line_or_next(lines, idx_vat)
+        # Ou autour du label base
+        if not rate and idx_base is not None:
+            rate = _rate_in_line_or_next(lines, idx_base)
 
     bv = _to_float(base) if base else None
     vv = _to_float(vat) if vat else None

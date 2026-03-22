@@ -4,6 +4,7 @@ import pytesseract
 from .common import *
 from .workers import LinkDownloadWorker, LinkPostProcessWorker, _DownloadCanceled
 from ocr.invoice_parser import normalize_date_format
+from ocr.supplier_model import validate_iban, validate_bic
 
 
 class MainWindowCoreMixin:
@@ -102,13 +103,11 @@ class MainWindowCoreMixin:
 
         self.selected_invoice_filename = os.path.basename(self.current_pdf_path)
 
-
         entry_id = item.data(Qt.UserRole + 4)
         new_entry_id = str(entry_id or "").strip()
         
         if not new_entry_id or new_entry_id.startswith("__NO_ENTRY__"):
             new_entry_id = None
-
 
         self.selected_invoice_entry_id = new_entry_id
 
@@ -400,6 +399,13 @@ class MainWindowCoreMixin:
                 if model:
                     self.apply_supplier_model(model)
 
+            # ✅ Si aucun IBAN ou BIC valide n'est trouvé, lancer OCR profond automatiquement
+            final_iban = self.iban_input.text().strip()
+            final_bic = self.bic_input.text().strip()
+            if not final_iban or not validate_iban(final_iban) or not final_bic or not validate_bic(final_bic):
+                self.statusBar().showMessage("OCR normal terminé, lancement OCR profond...", 2000)
+                QApplication.processEvents()
+                self.analyze_pdf_deep(document_path=document_path)
 
             self.statusBar().showMessage("OCR terminé.", 3000)
         except Exception as e:
@@ -897,20 +903,26 @@ class MainWindowCoreMixin:
             pass
 
 
-        # ✅ 1) pousse d'abord les métadonnées en BDD (liste gauche)
+        # ✅ 1) mettre à jour EN BDD par nom de fichier (crée entry_id si absent)
         sql_error = None
         try:
-            if current_entry_id:
-                self.logmail_repo.update_document_metadata_for_entry(
-                    current_entry_id,
-                    invoice_date=self.date_input.text().strip(),
-                    iban=self.iban_input.text().strip(),
-                    bic=self.bic_input.text().strip(),
-                    status=str(status or "").strip().lower() if status else None,
-                )
+            pdf_filename = os.path.basename(pdf_path)
+            iban_to_save = self.iban_input.text().strip()
+            bic_to_save = self.bic_input.text().strip()
+            print(f"DEBUG: Saving to DB for {pdf_filename} - IBAN: {iban_to_save}, BIC: {bic_to_save}")
+            self.logmail_repo.update_document_by_filename(
+                pdf_filename,
+                entry_id=current_entry_id,  # Peut être vide, la méthode va chercher en BDD
+                invoice_date=self.date_input.text().strip(),
+                iban=iban_to_save,
+                bic=bic_to_save,
+                status=str(status or "").strip().lower() if status else None,
+            )
+            print(f"✅ Métadonnées mises à jour en BDD pour {pdf_filename}")
         except Exception as e:
             # on garde l'erreur mais on continue (les champs lourds restent en fichier)
             sql_error = e
+            print(f"⚠️ Erreur mise à jour BDD: {e}")
 
         # ✅ 2) écriture disque (champs lourds)
         try:
@@ -971,6 +983,21 @@ class MainWindowCoreMixin:
                     f"Données sauvegardées, mais modèle transporteur non mis à jour : {supplier_model_error}",
                     5000
                 )
+
+        # ✅ Recharger l'entry_id depuis BDD si on vient de l'assigner
+        try:
+            pdf_filename = os.path.basename(pdf_path)
+            db_entry_id = str(self.logmail_repo.get_entry_id_for_file(pdf_filename) or "").strip()
+            if db_entry_id and db_entry_id != current_entry_id:
+                self.selected_invoice_entry_id = db_entry_id
+                # Synchroniser aussi le JSON
+                data["entry_id"] = db_entry_id
+                json_path = self._get_saved_json_path(pdf_path)
+                os.makedirs(os.path.dirname(json_path), exist_ok=True)
+                with open(json_path, "w", encoding="utf-8") as f:
+                    json.dump(data, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
 
         return True
 
@@ -1144,8 +1171,17 @@ class MainWindowCoreMixin:
                 try:
                     self.current_pdf_path = pdf_path
 
+                    # Clear fields before processing each PDF to avoid carrying over data from previous PDFs
+                    self.clear_fields()
+
                     # OCR (sans popup)
                     self.analyze_pdf(show_message=False, document_path=pdf_path)
+
+                    # Debug: show extracted IBAN/BIC
+                    pdf_filename = os.path.basename(pdf_path)
+                    iban_after_ocr = self.iban_input.text().strip()
+                    bic_after_ocr = self.bic_input.text().strip()
+                    print(f"DEBUG: After OCR for {pdf_filename} - IBAN: {iban_after_ocr}, BIC: {bic_after_ocr}")
 
                     # sauvegarde OCR, mais on reste en "pending" tant que ce n'est pas validé
                     self.save_current_data(status="pending", show_message=False)
@@ -1303,16 +1339,21 @@ class MainWindowCoreMixin:
         found = extract_fields_with_model(ocr_text, model)
 
         # IBAN/BIC : valeur trouvée via patterns, sinon valeur stockée modèle
-        if not self.iban_input.text().strip():
-            self.iban_input.setText(found.get("iban") or model.get("iban", ""))
+        self.iban_input.setText(found.get("iban") or model.get("iban", ""))
 
         if not self.bic_input.text().strip():
             self.bic_input.setText(found.get("bic") or model.get("bic", ""))
 
         cur = (self.invoice_number_input.text() or "").strip()
-        is_ok = cur and any(c.isdigit() for c in cur) and cur.upper() not in {"DESCRIPTION", "DATE", "FACTURE", "INVOICE"}
-        if not is_ok:
-            self.invoice_number_input.setText(found.get("invoice_number") or "")
+        is_date_like = bool(re.fullmatch(r"\d{1,2}[./-]\d{1,2}[./-]\d{2,4}", cur)) or bool(re.fullmatch(r"\d{4}-\d{2}-\d{2}", cur))
+        is_ok = bool(cur) and any(c.isdigit() for c in cur) and cur.upper() not in {"DESCRIPTION", "DATE", "FACTURE", "INVOICE"} and not is_date_like
+
+        # si le modèle a trouvé un numéro de facture, on lui donne priorité
+        invoice_number_from_model = (found.get("invoice_number") or "").strip()
+        if invoice_number_from_model:
+            self.invoice_number_input.setText(invoice_number_from_model)
+        elif not is_ok:
+            self.invoice_number_input.setText(invoice_number_from_model or "")
 
         if not self.date_input.text().strip():
             self.date_input.setText(found.get("invoice_date") or "")
@@ -1352,8 +1393,6 @@ class MainWindowCoreMixin:
         entry_id = str(entry_id or "").strip()
         username = str(getattr(self, "current_username", "") or "").strip()
 
-        print(f"[UI CLAIM] entry_id={entry_id!r}, username={username!r}")
-
         if not entry_id or entry_id.startswith("__NO_ENTRY__"):
             return
 
@@ -1363,7 +1402,6 @@ class MainWindowCoreMixin:
         try:
             claimed = bool(self.logmail_repo.claim_entry_for_user(entry_id, username))
         except Exception as e:
-            print(f"[UI CLAIM] erreur claim_entry_for_user: {e}")
             claimed = False
 
         if claimed:

@@ -31,6 +31,16 @@ class MainWindowValidationMixin:
             )
             return
 
+        # Vérifier que la date de facture est remplie
+        invoice_date = (self.date_input.text() or "").strip()
+        if not invoice_date:
+            QMessageBox.warning(
+                self,
+                "Validation impossible",
+                "Le champ 'Date facture' doit être rempli pour valider la facture."
+            )
+            return
+
         # Vérifie les tournées AVANT toute validation
         tournrs = sorted({
             (r.get("tour_nr") or "").strip()

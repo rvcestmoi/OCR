@@ -27,10 +27,10 @@ def build_supplier_key(iban: str, bic: str) -> Optional[str]:
     iban = (iban or "").replace(" ", "").replace("\u00A0", "").replace("-", "").upper().strip()
     bic  = (bic  or "").replace(" ", "").replace("\u00A0", "").replace("-", "").upper().strip()
 
-    if not iban or not bic:
+    if not bic:
         return None
-    if not validate_iban(iban):
-        return None
+    if iban and not validate_iban(iban):
+        iban = ""
     if not validate_bic(bic):
         return None
 
@@ -616,10 +616,32 @@ def extract_fields_with_model(text: str, model: dict) -> Dict[str, str]:
 
         return None
 
-    for field in ("iban", "bic", "invoice_date", "invoice_number"):
+
+    for field in ("iban", "bic", "invoice_date", "invoice_number", "vat_rate", "vat_base", "vat_amount"):
         rules = list(patterns.get(field, []) or [])
         rules.sort(key=lambda x: int(x.get("hit_count", 0)), reverse=True)
 
+        # Pour invoice_number, prioriser les near_label
+        if field == "invoice_number":
+            near_label_rules = [r for r in rules if r.get("mode") == "near_label"]
+            other_rules = [r for r in rules if r.get("mode") != "near_label"]
+            found_val = None
+            for r in near_label_rules:
+                val = apply_rule(field, r)
+                if val:
+                    found_val = val.strip()
+                    break
+            if not found_val:
+                for r in other_rules:
+                    val = apply_rule(field, r)
+                    if val:
+                        found_val = val.strip()
+                        break
+            if found_val:
+                out[field] = found_val
+            continue
+
+        # Comportement standard pour les autres champs
         for r in rules:
             val = apply_rule(field, r)
             if not val:
@@ -634,10 +656,6 @@ def extract_fields_with_model(text: str, model: dict) -> Dict[str, str]:
                 continue
             if field == "bic" and not validate_bic(val):
                 continue
-            if field == "invoice_number":
-                # rejette les dates du style 30/11/2025
-                if re.fullmatch(r"\d{1,2}[./-]\d{1,2}[./-]\d{2,4}", val.strip()):
-                    continue
 
             out[field] = val
             break

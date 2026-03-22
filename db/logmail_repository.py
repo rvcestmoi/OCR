@@ -131,7 +131,6 @@ class LogmailRepository(BaseRepository):
         username = str(username or "").strip()
 
         if not entry_id or not username:
-            print(f"[CLAIM] paramètres invalides: entry_id={entry_id!r}, username={username!r}")
             return False
 
         with self._connection.connect() as conn:
@@ -139,7 +138,6 @@ class LogmailRepository(BaseRepository):
 
             cursor.execute("SELECT @@SERVERNAME AS server_name, DB_NAME() AS db_name")
             row = cursor.fetchone()
-            print(f"[CLAIM] server={row[0]!r}, db={row[1]!r}, entry_id={entry_id!r}, username={username!r}")
 
             cursor.execute(
                 """
@@ -150,7 +148,6 @@ class LogmailRepository(BaseRepository):
                 (entry_id,)
             )
             before_count = cursor.fetchone()[0]
-            print(f"[CLAIM] nb lignes trouvées pour entry_id avant update = {before_count}")
             if int(before_count or 0) <= 0:
                 return False
 
@@ -165,7 +162,6 @@ class LogmailRepository(BaseRepository):
                 (username, entry_id),
             )
             released_rows = int(cursor.rowcount or 0)
-            print(f"[CLAIM] release autres lignes user -> rowcount={released_rows}")
 
             cursor.execute(
                 """
@@ -182,7 +178,6 @@ class LogmailRepository(BaseRepository):
                 (username, entry_id, username),
             )
             claimed_rows = int(cursor.rowcount or 0)
-            print(f"[CLAIM] claim ligne -> rowcount={claimed_rows}")
 
             conn.commit()
 
@@ -195,7 +190,6 @@ class LogmailRepository(BaseRepository):
                 (entry_id,)
             )
             rows = cursor.fetchall()
-            print("[CLAIM] état après commit:")
             for r in rows:
                 print("   ", tuple(r))
 
@@ -435,6 +429,61 @@ class LogmailRepository(BaseRepository):
         """
         self.execute(query, (status, entry_id))
 
+    def update_document_by_filename(self, nom_pdf: str, *, entry_id: str = "", invoice_date: str = "", iban: str = "", bic: str = "", status: str | None = None) -> None:
+        """Met à jour un document par nom de fichier, en créant une entrée si nécessaire."""
+        from uuid import uuid4
+
+        nom_pdf = str(nom_pdf or "").strip()
+        if not nom_pdf:
+            return
+
+        existing_entry_id = str(self.get_entry_id_for_file(nom_pdf) or "").strip()
+
+        # Si on n'a pas d'entry_id courant, générer et définir via set_entry_id_for_file
+        if not existing_entry_id:
+            new_entry_id = str(entry_id or "").strip() or f"MANUAL-{uuid4()}"
+            self.set_entry_id_for_file(nom_pdf, new_entry_id)
+            existing_entry_id = new_entry_id
+
+        # Si on fournit un entry_id et qu'il diffère, on override
+        if entry_id and entry_id.strip() and entry_id.strip() != existing_entry_id:
+            self.set_entry_id_for_file(nom_pdf, entry_id.strip())
+            existing_entry_id = entry_id.strip()
+
+        final_entry_id = existing_entry_id
+        if not final_entry_id:
+            return
+
+        set_parts = []
+        params = []
+
+        if invoice_date:
+            set_parts.append("invoice_date = ?")
+            params.append(str(invoice_date).strip())
+        if iban:
+            set_parts.append("iban = ?")
+            params.append(str(iban).strip())
+        if bic:
+            set_parts.append("bic = ?")
+            params.append(str(bic).strip())
+        if status is not None:
+            set_parts.append("processing_status = ?")
+            params.append(str(status or "").strip().lower())
+
+        if not set_parts:
+            return
+
+        params.append(final_entry_id)
+        params.append(nom_pdf)
+        query = f"""
+            UPDATE dbo.XXA_LOGMAIL_228794
+            SET {", ".join(set_parts)}
+            WHERE entry_id = ?
+              AND nom_pdf = ?
+        """
+        print(f"DEBUG DBACTION: update_document_by_filename query={query.strip()} params={params}")
+        self.execute(query, tuple(params))
+
 
     def get_document_rows_for_folder(self, folder_path: str, status: str, limit: int | None = None) -> list[dict]:
         """
@@ -530,3 +579,13 @@ class LogmailRepository(BaseRepository):
             WHERE entry_id = ?
         """
         self.execute(query, tuple(params))
+
+    def get_entry_id_for_file(self, nom_pdf: str):
+        query = """
+            SELECT TOP 1 entry_id
+            FROM XXA_LOGMAIL_228794
+            WHERE nom_pdf = ?
+            ORDER BY date_creation DESC, id_log DESC
+        """
+        row = self.fetch_one(query, (nom_pdf,))
+        return row["entry_id"] if row else None
