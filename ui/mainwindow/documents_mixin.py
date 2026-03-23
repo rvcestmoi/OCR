@@ -215,7 +215,7 @@ class MainWindowDocumentsMixin:
         if not it0:
             return
 
-        linked_filename = (it0.text() or "").strip()
+        linked_filename = get_left_table_item_filename(it0)
         if not linked_filename:
             return
 
@@ -240,7 +240,7 @@ class MainWindowDocumentsMixin:
         if target_row >= 0:
             it = self.pdf_table.item(target_row, 0)
             if it:
-                target_filename = (it.text() or "").strip()
+                target_filename = get_left_table_item_filename(it)
                 target_entry_id = self.logmail_repo.get_entry_id_for_file(target_filename)
 
         # fallback: si mémorisé via clic gauche
@@ -291,7 +291,7 @@ class MainWindowDocumentsMixin:
         if target_row >= 0:
             it = self.pdf_table.item(target_row, 0)
             if it:
-                target_filename = (it.text() or "").strip()
+                target_filename = get_left_table_item_filename(it)
                 target_entry_id = self.logmail_repo.get_entry_id_for_file(target_filename)
 
         # fallback: si tu avais déjà mémorisé une cible via clic gauche
@@ -426,7 +426,7 @@ class MainWindowDocumentsMixin:
             if not os.path.exists(rep_path):
                 continue
 
-            display_filename = strip_entry_prefix(stored_filename)
+            display_filename = format_left_table_filename(stored_filename)
 
             try:
                 if not is_supported_document(rep_path):
@@ -467,8 +467,12 @@ class MainWindowDocumentsMixin:
         self.pdf_table.setRowCount(len(rows_to_add))
 
         for row_index, (rep_filename, rep_path, entry_id, group_paths, status, invoice_date, iban, bic) in enumerate(rows_to_add):
-            it0 = QTableWidgetItem(rep_filename)
+            real_filename = os.path.basename(rep_path)
+            display_filename = format_left_table_filename(real_filename)
+            it0 = QTableWidgetItem(display_filename)
+            it0.setToolTip(real_filename)
             it0.setData(Qt.UserRole, rep_path)
+            it0.setData(Qt.UserRole + 6, real_filename)
             it0.setData(Qt.UserRole + 1, status)
             it0.setData(Qt.UserRole + 4, entry_id)
             it0.setData(Qt.UserRole + 5, group_paths)

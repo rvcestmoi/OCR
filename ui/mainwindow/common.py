@@ -113,3 +113,57 @@ def strip_entry_prefix(filename: str) -> str:
         return right
 
     return name
+
+
+def format_left_table_filename(filename: str) -> str:
+    """Nom à afficher uniquement dans la liste de gauche.
+
+    Cas gérés :
+    - ancien format : `<entry_id>__<nom>.pdf`  -> affiche `<nom>.pdf`
+    - format actuel : `<nom>___<entry_id>.pdf` -> affiche `<nom>.pdf`
+
+    Le nom réel n'est jamais modifié ; seul le texte affiché l'est.
+    """
+    name = os.path.basename(str(filename or "").strip())
+    if not name:
+        return ""
+
+    # 1) ancien format : <entry_id>__<nom>.pdf
+    name = strip_entry_prefix(name)
+
+    # 2) format suffixé : <nom>___<entry_id>.pdf
+    stem, ext = os.path.splitext(name)
+    m = re.match(r"^(?P<base>.+?)___\d+$", stem)
+    if m:
+        stem = m.group("base").strip()
+
+    return f"{stem}{ext}" if stem else name
+
+
+def get_left_table_item_filename(item) -> str:
+    """Retourne le vrai nom de fichier associé à une ligne de la table de gauche."""
+    if item is None:
+        return ""
+
+    stored_name = str(item.data(Qt.UserRole + 6) or "").strip()
+    if stored_name:
+        return os.path.basename(stored_name)
+
+    pdf_path = str(item.data(Qt.UserRole) or "").strip()
+    if pdf_path:
+        return os.path.basename(pdf_path)
+
+    return str(item.text() or "").strip()
+
+
+def left_table_filename_matches(item, filename: str) -> bool:
+    """Compare un item de la table gauche avec un vrai nom de fichier ou son affichage."""
+    target = os.path.basename(str(filename or "").strip())
+    if not item or not target:
+        return False
+
+    displayed = str(item.text() or "").strip()
+    stored = get_left_table_item_filename(item)
+    target_display = format_left_table_filename(target)
+
+    return target in {stored, displayed} or target_display in {stored, displayed}

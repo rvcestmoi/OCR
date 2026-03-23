@@ -456,11 +456,11 @@ class MainWindow(
 
         # Boutons principaux
         self.btn_analyze_pdf = QPushButton("🔍 Analyser le PDF (OCR)")
-        self.btn_analyze_pdf.clicked.connect(self.analyze_pdf)
+        self.btn_analyze_pdf.clicked.connect(self.on_analyze_pdf_clicked)
 
         self.btn_deep_ocr = QPushButton("OCR profond")
         self.btn_deep_ocr.setToolTip("Force un OCR Tesseract et complète les informations déjà chargées sans écraser les champs remplis.")
-        self.btn_deep_ocr.clicked.connect(self.analyze_pdf_deep)
+        self.btn_deep_ocr.clicked.connect(self.on_analyze_pdf_deep_clicked)
 
         self.btn_save_data = QPushButton("💾 Sauvegarder")
         self.btn_save_data.clicked.connect(self.on_save_clicked)

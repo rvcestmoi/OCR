@@ -368,7 +368,7 @@ class MainWindowTransportTablesMixin:
         if invoice_row >= 0:
             it = self.pdf_table.item(invoice_row, 0)
             if it:
-                invoice_filename = it.text().strip()
+                invoice_filename = get_left_table_item_filename(it)
                 entry_id = self.logmail_repo.get_entry_id_for_file(invoice_filename)
 
         action_associer.setEnabled(bool(entry_id))

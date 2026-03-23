@@ -318,6 +318,24 @@ class MainWindowCoreMixin:
         else:
             self.sender_input.clear()
 
+    def _confirm_relaunch_ocr_data(self, title: str) -> bool:
+        reply = QMessageBox.question(
+            self,
+            title,
+            "Voulez-vous relancer les données ?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        return reply == QMessageBox.Yes
+
+    def on_analyze_pdf_clicked(self, checked: bool = False):
+        if self._confirm_relaunch_ocr_data("Analyser le PDF (OCR)"):
+            self.analyze_pdf(checked=checked)
+
+    def on_analyze_pdf_deep_clicked(self, checked: bool = False):
+        if self._confirm_relaunch_ocr_data("OCR profond"):
+            self.analyze_pdf_deep(checked=checked)
+
     def _get_active_document_path(self, preferred_path: str | None = None) -> str | None:
         for candidate in (preferred_path, getattr(self, "view_pdf_path", None), getattr(self, "current_pdf_path", None)):
             candidate = str(candidate or "").strip()
@@ -325,7 +343,7 @@ class MainWindowCoreMixin:
                 return candidate
         return None
 
-    def analyze_pdf(self, checked: bool = False, show_message: bool = False, document_path: str | None = None):
+    def analyze_pdf(self, checked: bool = False, show_message: bool = False, document_path: str | None = None, auto_save: bool = True):
 
         active_doc_path = self._get_active_document_path(document_path)
         if not active_doc_path:
@@ -405,13 +423,58 @@ class MainWindowCoreMixin:
             if not final_iban or not validate_iban(final_iban) or not final_bic or not validate_bic(final_bic):
                 self.statusBar().showMessage("OCR normal terminé, lancement OCR profond...", 2000)
                 QApplication.processEvents()
-                self.analyze_pdf_deep(document_path=document_path)
+                self.analyze_pdf_deep(document_path=document_path, auto_save=False)
 
-            self.statusBar().showMessage("OCR terminé.", 3000)
+            if auto_save:
+                self._auto_save_after_ocr()
+            else:
+                self.statusBar().showMessage("OCR terminé.", 3000)
         except Exception as e:
             QMessageBox.critical(self, "Erreur OCR", str(e))
         if show_message:
             QMessageBox.information(...)
+
+    def _get_existing_status_for_current_pdf(self, default: str = "pending") -> str:
+        status = str(default or "pending").strip().lower()
+
+        try:
+            pdf_path = str(getattr(self, "current_pdf_path", "") or "").strip()
+            if pdf_path:
+                data = self._read_saved_invoice_json(pdf_path) or {}
+                json_status = str(data.get("status") or "").strip().lower()
+                if json_status in {"pending", "validated", "error"}:
+                    return json_status
+        except Exception:
+            pass
+
+        try:
+            entry_id = str(self._resolve_current_entry_id() or "").strip()
+            if entry_id:
+                sql_status = str(self.logmail_repo.get_processing_status_for_entry(entry_id) or "").strip().lower()
+                if sql_status in {"pending", "validated", "error"}:
+                    return sql_status
+        except Exception:
+            pass
+
+        return status if status in {"pending", "validated", "error"} else "pending"
+
+    def _auto_save_after_ocr(self) -> bool:
+        if not getattr(self, "current_pdf_path", None):
+            return False
+
+        status_to_keep = self._get_existing_status_for_current_pdf(default="pending")
+        ok = self.save_current_data(status=status_to_keep, show_message=False)
+
+        if ok:
+            try:
+                self._set_left_row_status(self.current_pdf_path, status_to_keep)
+            except Exception:
+                pass
+            self.statusBar().showMessage("OCR terminé et sauvegardé.", 3000)
+        else:
+            self.statusBar().showMessage("OCR terminé, mais la sauvegarde a échoué.", 5000)
+
+        return ok
 
     def _build_progress_dialog(self, title: str, label: str, maximum: int) -> QProgressDialog:
         dlg = QProgressDialog(label, "Annuler", 0, max(0, int(maximum)), self)
@@ -422,7 +485,7 @@ class MainWindowCoreMixin:
         dlg.setAutoReset(False)
         dlg.setValue(0)
         return dlg
-    def analyze_pdf_deep(self, checked: bool = False, document_path: str | None = None):
+    def analyze_pdf_deep(self, checked: bool = False, document_path: str | None = None, auto_save: bool = True):
         active_doc_path = self._get_active_document_path(document_path)
         if not active_doc_path:
             QMessageBox.warning(self, "OCR profond", "Aucun document sélectionné.")
@@ -510,7 +573,10 @@ class MainWindowCoreMixin:
                     self.apply_supplier_model(model)
 
             self.highlight_missing_fields()
-            self.statusBar().showMessage("OCR profond terminé.", 4000)
+            if auto_save:
+                self._auto_save_after_ocr()
+            else:
+                self.statusBar().showMessage("OCR profond terminé.", 4000)
         except _DownloadCanceled:
             self.statusBar().showMessage("OCR profond annulé.", 4000)
         except pytesseract.TesseractNotFoundError:
@@ -1175,7 +1241,7 @@ class MainWindowCoreMixin:
                     self.clear_fields()
 
                     # OCR (sans popup)
-                    self.analyze_pdf(show_message=False, document_path=pdf_path)
+                    self.analyze_pdf(show_message=False, document_path=pdf_path, auto_save=False)
 
                     # Debug: show extracted IBAN/BIC
                     pdf_filename = os.path.basename(pdf_path)
@@ -1449,35 +1515,32 @@ class MainWindowCoreMixin:
         """
         Retrouve l'entry_id courant de façon robuste.
         Priorité :
-        1) selected_invoice_entry_id
-        2) data déjà présent dans le JSON du document
-        3) lookup SQL via nom du fichier
+        1) lookup SQL via le nom du PDF courant
+        2) entry_id déjà présent dans le JSON du document courant
+        3) selected_invoice_entry_id (fallback UI)
         """
+        pdf_path = str(getattr(self, "current_pdf_path", "") or "").strip()
+
+        if pdf_path:
+            try:
+                entry_id = str(
+                    self.logmail_repo.get_entry_id_for_file(os.path.basename(pdf_path)) or ""
+                ).strip()
+                if entry_id:
+                    return entry_id
+            except Exception:
+                pass
+
+            try:
+                data = self._read_saved_invoice_json(pdf_path) or {}
+                entry_id = str(data.get("entry_id") or "").strip()
+                if entry_id:
+                    return entry_id
+            except Exception:
+                pass
+
         entry_id = str(getattr(self, "selected_invoice_entry_id", "") or "").strip()
         if entry_id:
             return entry_id
-
-        pdf_path = str(getattr(self, "current_pdf_path", "") or "").strip()
-        if not pdf_path:
-            return ""
-
-        # 1) JSON existant
-        try:
-            data = self._read_saved_invoice_json(pdf_path) or {}
-            entry_id = str(data.get("entry_id") or "").strip()
-            if entry_id:
-                return entry_id
-        except Exception:
-            pass
-
-        # 2) BDD via nom du fichier physique
-        try:
-            entry_id = str(
-                self.logmail_repo.get_entry_id_for_file(os.path.basename(pdf_path)) or ""
-            ).strip()
-            if entry_id:
-                return entry_id
-        except Exception:
-            pass
 
         return ""

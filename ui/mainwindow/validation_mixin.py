@@ -647,7 +647,9 @@ class MainWindowValidationMixin:
             return None
         for r in range(self.pdf_table.rowCount()):
             it0 = self.pdf_table.item(r, 0)
-            if it0 and (it0.text() or "").strip() == filename:
+            if not it0:
+                continue
+            if left_table_filename_matches(it0, filename):
                 return it0.data(Qt.UserRole)
         return None
 
