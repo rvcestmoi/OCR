@@ -6,6 +6,29 @@ from .workers import LinkDownloadWorker, LinkPostProcessWorker, _DownloadCancele
 
 class MainWindowTransportTablesMixin:
 
+    def _set_transporter_aux_locked(self, locked: bool, value: str = ""):
+        self._transporter_aux_locked = bool(locked)
+        self.transporter_aux_input.blockSignals(True)
+        self.transporter_aux_input.setText(str(value or "").strip())
+        self.transporter_aux_input.setReadOnly(bool(locked))
+        self.transporter_aux_input.setFocusPolicy(Qt.NoFocus if locked else Qt.StrongFocus)
+        self.transporter_aux_input.setClearButtonEnabled(not locked)
+        self.transporter_aux_input.blockSignals(False)
+        self._refresh_transporter_aux_style()
+
+    def _refresh_transporter_aux_style(self):
+        locked = bool(getattr(self, "_transporter_aux_locked", True))
+        match_ok = getattr(self, "_transporter_aux_match_ok", None)
+
+        bg = "#f3f3f3" if locked else "#ffffff"
+        extra = ""
+        if match_ok is True:
+            extra = "border: 2px solid #28a745;"
+        elif match_ok is False:
+            extra = "border: 2px solid #dc3545;"
+
+        self.transporter_aux_input.setStyleSheet(f"background-color: {bg}; {extra}")
+
     def on_prev_page(self):
         self.pdf_viewer.previous_page()
         self.update_page_indicator()
@@ -101,6 +124,7 @@ class MainWindowTransportTablesMixin:
                 if not kundennr:
                     self.transporter_info.setPlainText("ℹ️ Aucun transporteur sélectionné.")
                     self.transporter_input.clear()
+                    self._set_transporter_aux_locked(True, "")
                     return
 
                 transporter = self.transporter_repo.find_transporter_by_kundennr(kundennr)
@@ -112,6 +136,7 @@ class MainWindowTransportTablesMixin:
                 if not iban or not bic:
                     self.transporter_info.setPlainText("ℹ️ Aucun IBAN/BIC renseigné.")
                     self.transporter_input.clear()
+                    self._set_transporter_aux_locked(True, "")
                     return
 
                 transporter = self.transporter_repo.find_transporter_by_bank(iban, bic)
@@ -127,12 +152,24 @@ class MainWindowTransportTablesMixin:
                 else:
                     self.transporter_info.setPlainText("❌ Aucun transporteur trouvé pour cet IBAN / SWIFT.")
                 self.transporter_input.clear()
+                self._set_transporter_aux_locked(True, "")
                 return
 
             if not kundennr:
                 kundennr = str(transporter.get("KundenNr") or "").strip()
 
             self.selected_kundennr = kundennr
+
+            aux_row = self.transporter_repo.get_ktoKreA_by_kundennr(kundennr)
+            db_aux = str((aux_row or {}).get("KtoKreA") or "").strip()
+            pending_aux_kundennr = str(getattr(self, "_pending_saved_transporter_aux_kundennr", "") or "").strip()
+            pending_aux_value = str(getattr(self, "_pending_saved_transporter_aux", "") or "").strip()
+
+            if db_aux:
+                self._set_transporter_aux_locked(True, db_aux)
+            else:
+                candidate_aux = pending_aux_value if pending_aux_kundennr == kundennr else ""
+                self._set_transporter_aux_locked(False, candidate_aux)
 
             transporter_name = str(transporter.get("name1", "") or "").strip()
             vat_no = str(transporter.get("USTIDNR", "") or "").strip()
@@ -210,6 +247,9 @@ class MainWindowTransportTablesMixin:
                 self.current_db_iban = str(transporter.get("IBAN", "") or "").strip()
                 self.current_db_bic = str(transporter.get("SWIFT", "") or "").strip()
 
+            self._pending_saved_transporter_aux = ""
+            self._pending_saved_transporter_aux_kundennr = ""
+
         except Exception as e:
             self.transporter_info.setPlainText(f"Erreur chargement transporteur :\n{e}")
 
@@ -246,6 +286,8 @@ class MainWindowTransportTablesMixin:
         self.transporter_selected_mode = bool(self.selected_kundennr)
 
         # ✅ Charger le transporteur par KundenNr (pas par IBAN/BIC)
+        self._pending_saved_transporter_aux = ""
+        self._pending_saved_transporter_aux_kundennr = ""
         self.load_transporter_information(force_by_kundennr=True)
 
         self.enable_transporter_update()

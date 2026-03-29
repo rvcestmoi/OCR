@@ -36,8 +36,6 @@ class SqlServerConnection:
                 f"DATABASE={self.database};"
                 f"UID={self.username};"
                 f"PWD={self.password};"
-                "Encrypt=yes;"
-                "TrustServerCertificate=yes;"
             )
 
         return pyodbc.connect(conn_str)

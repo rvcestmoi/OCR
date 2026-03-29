@@ -191,6 +191,8 @@ class MainWindowDocumentsMixin:
             document_name=doc_name,
             blocked=bool(current.get("blocked", False)),
             comment=str(current.get("comment", "") or ""),
+            reason=str(current.get("reason", "") or ""),
+            free_comment=str(current.get("free_comment", "") or ""),
         )
 
         if dlg.exec() != QDialog.Accepted:
@@ -415,6 +417,12 @@ class MainWindowDocumentsMixin:
 
         rows_to_add = []
 
+        entry_ids = [str(r.get("entry_id") or "").strip() for r in rows if str(r.get("entry_id") or "").strip()]
+        try:
+            files_by_entry = self.logmail_repo.get_files_for_entries(entry_ids) or {}
+        except Exception:
+            files_by_entry = {}
+
         for r in rows:
             entry_id = str(r.get("entry_id") or "").strip()
 
@@ -434,10 +442,7 @@ class MainWindowDocumentsMixin:
             except Exception:
                 pass
 
-            try:
-                files = self.logmail_repo.get_files_for_entry(entry_id) or []
-            except Exception:
-                files = []
+            files = files_by_entry.get(entry_id) or []
 
             group_paths = []
             for f in files:
@@ -530,16 +535,24 @@ class MainWindowDocumentsMixin:
         file_name = os.path.basename(str(pdf_path or "").strip())
         base_name, _ = os.path.splitext(file_name)
 
+        # Cas courant moderne : le nom contient déjà un suffixe unique du type
+        # <nom>___<entry_id>.pdf. Inutile d'aller relire la BDD pour reconstruire
+        # un autre nom JSON.
+        if re.search(r"___\d+$", base_name):
+            model_dir = MODELS_DIR
+            return os.path.join(model_dir, f"{base_name}.json")
+
         # sécurité supplémentaire : si le fichier n'a pas encore de préfixe
-        # mais qu'on sait retrouver l'entry_id, on le rajoute au nom JSON
+        # mais qu'on connaît déjà l'entry_id courant, on l'utilise sans requête SQL.
         if ENTRY_FILE_SEPARATOR not in file_name:
-            entry_id = ""
-            try:
-                entry_id = str(
-                    self.logmail_repo.get_entry_id_for_file(file_name) or ""
-                ).strip()
-            except Exception:
-                entry_id = ""
+            entry_id = str(getattr(self, "selected_invoice_entry_id", "") or "").strip()
+            if not entry_id:
+                try:
+                    entry_id = str(
+                        self.logmail_repo.get_entry_id_for_file(file_name) or ""
+                    ).strip()
+                except Exception:
+                    entry_id = ""
 
             if entry_id:
                 base_name = f"{entry_id}{ENTRY_FILE_SEPARATOR}{base_name}"

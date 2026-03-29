@@ -35,8 +35,8 @@ class FolderSelectDialog(QDialog):
         layout.addWidget(QLabel("Sélectionne une COMMANDE (AufNr) à rattacher. 1 CMR = 1 commande."))
 
         self.tree = QTreeWidget()
-        self.tree.setColumnCount(6)
-        self.tree.setHeaderLabels(["Dossier", "Commande", "Trajet", "VPE", "Palettes", "Poids"])
+        self.tree.setColumnCount(5)
+        self.tree.setHeaderLabels(["Dossier", "Commande", "Trajet", "VPE", "Palettes"])
         self.tree.setSelectionMode(QTreeWidget.SingleSelection)
         self.tree.setSelectionBehavior(QTreeWidget.SelectRows)
         self.tree.setUniformRowHeights(True)
@@ -46,10 +46,9 @@ class FolderSelectDialog(QDialog):
         header = self.tree.header()
         header.setSectionResizeMode(0, QHeaderView.ResizeToContents)
         header.setSectionResizeMode(1, QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(2, QHeaderView.Stretch)
+        header.setSectionResizeMode(2, QHeaderView.Stretch)   # Trajet prend toute la place restante
         header.setSectionResizeMode(3, QHeaderView.ResizeToContents)
         header.setSectionResizeMode(4, QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(5, QHeaderView.ResizeToContents)
 
         layout.addWidget(self.tree)
 
@@ -77,10 +76,10 @@ class FolderSelectDialog(QDialog):
 
         for tour in tour_numbers:
             # noeud Dossier
-            tour_item = QTreeWidgetItem([tour, "", "", "TOTAL", "", ""])
+            tour_item = QTreeWidgetItem([tour, "", "", "TOTAL", ""])
             tour_item.setData(0, ROLE_TOUR, tour)
             tour_item.setData(0, ROLE_AUF, "")
-            for c in range(6):
+            for c in range(5):
                 tour_item.setFont(c, bold)
 
             self.tree.addTopLevelItem(tour_item)
@@ -90,7 +89,7 @@ class FolderSelectDialog(QDialog):
             # commandes dans ce dossier
             aufnrs = sorted({auf for (t, auf) in by_tour_auf.keys() if t == tour})
             if not aufnrs:
-                child = QTreeWidgetItem(["", "(aucune commande trouvée)", "", "", "", ""])
+                child = QTreeWidgetItem(["", "(aucune commande trouvée)", "", "", "",])
                 child.setData(0, ROLE_TOUR, tour)
                 child.setData(0, ROLE_AUF, "")
                 tour_item.addChild(child)
@@ -109,10 +108,10 @@ class FolderSelectDialog(QDialog):
                     except Exception: pass
 
                 trajet = trajet_by_tour_auf.get((tour, auf), "")
-                auf_item = QTreeWidgetItem(["", auf, trajet, "TOTAL", self._fmt_num(total_pal), self._fmt_num(total_poids)])
+                auf_item = QTreeWidgetItem(["", auf, trajet, "TOTAL", self._fmt_num(total_pal)])
                 auf_item.setData(0, ROLE_TOUR, tour)
                 auf_item.setData(0, ROLE_AUF, auf)
-                for c in range(6):
+                for c in range(5):
                     auf_item.setFont(c, bold)
 
                 tour_item.addChild(auf_item)
@@ -121,8 +120,7 @@ class FolderSelectDialog(QDialog):
                 for rr in rows:
                     vpe = str(rr.get("VPE") or "").strip()
                     pal = self._fmt_num(rr.get("Palettes") or "")
-                    poids = self._fmt_num(rr.get("Poids") or "")
-                    vpe_item = QTreeWidgetItem(["", "", "", vpe, pal, poids])
+                    vpe_item = QTreeWidgetItem(["", "", "", vpe, pal])
                     vpe_item.setData(0, ROLE_TOUR, tour)
                     vpe_item.setData(0, ROLE_AUF, auf)
                     auf_item.addChild(vpe_item)

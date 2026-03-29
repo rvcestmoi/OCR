@@ -429,13 +429,16 @@ class LogmailRepository(BaseRepository):
         """
         self.execute(query, (status, entry_id))
 
-    def update_document_by_filename(self, nom_pdf: str, *, entry_id: str = "", invoice_date: str = "", iban: str = "", bic: str = "", status: str | None = None) -> None:
-        """Met à jour un document par nom de fichier, en créant une entrée si nécessaire."""
+    def update_document_by_filename(self, nom_pdf: str, *, entry_id: str = "", invoice_date: str = "", iban: str = "", bic: str = "", status: str | None = None) -> str:
+        """Met à jour un document par nom de fichier, en créant une entrée si nécessaire.
+
+        Retourne l'entry_id finalement utilisé.
+        """
         from uuid import uuid4
 
         nom_pdf = str(nom_pdf or "").strip()
         if not nom_pdf:
-            return
+            return ""
 
         existing_entry_id = str(self.get_entry_id_for_file(nom_pdf) or "").strip()
 
@@ -452,7 +455,7 @@ class LogmailRepository(BaseRepository):
 
         final_entry_id = existing_entry_id
         if not final_entry_id:
-            return
+            return ""
 
         set_parts = []
         params = []
@@ -471,7 +474,7 @@ class LogmailRepository(BaseRepository):
             params.append(str(status or "").strip().lower())
 
         if not set_parts:
-            return
+            return final_entry_id
 
         params.append(final_entry_id)
         params.append(nom_pdf)
@@ -483,12 +486,17 @@ class LogmailRepository(BaseRepository):
         """
         print(f"DEBUG DBACTION: update_document_by_filename query={query.strip()} params={params}")
         self.execute(query, tuple(params))
+        return final_entry_id
 
 
     def get_document_rows_for_folder(self, folder_path: str, status: str, limit: int | None = None) -> list[dict]:
         """
         Retourne les lignes groupées par entry_id pour alimenter le tableau de gauche.
         Le disque sert ensuite uniquement à vérifier que le fichier existe.
+
+        Pour la vue "pending", le tri se fait sur date_mail ASC.
+        Fallback sur date_creation si date_mail est NULL ou non convertible.
+        Les autres vues gardent le tri historique sur date_creation ASC.
         """
         status = str(status or "pending").strip().lower()
         if status not in {"pending", "validated", "error"}:
@@ -497,6 +505,8 @@ class LogmailRepository(BaseRepository):
         top_clause = ""
         if limit is not None and int(limit) > 0:
             top_clause = f"TOP {int(limit)}"
+
+        sort_expr = "COALESCE(TRY_CONVERT(datetime2, date_mail), date_creation)" if status == "pending" else "date_creation"
 
         query = f"""
             ;WITH base AS (
@@ -509,9 +519,11 @@ class LogmailRepository(BaseRepository):
                     bic,
                     doc_type,
                     date_creation,
+                    date_mail,
                     ROW_NUMBER() OVER (
                         PARTITION BY entry_id
-                        ORDER BY date_creation ASC, id_log ASC
+                        ORDER BY {sort_expr} ASC,
+                                 id_log ASC
                     ) AS rn
                 FROM dbo.XXA_LOGMAIL_228794
                 WHERE LTRIM(RTRIM(COALESCE(nom_pdf, ''))) <> ''
@@ -525,10 +537,12 @@ class LogmailRepository(BaseRepository):
                 iban,
                 bic,
                 doc_type,
-                date_creation
+                date_creation,
+                date_mail
             FROM base
             WHERE rn = 1
-            ORDER BY date_creation ASC, nom_pdf ASC
+            ORDER BY {sort_expr} ASC,
+                     nom_pdf ASC
         """
         return self.fetch_all(query, (status,)) or []
     
@@ -554,6 +568,40 @@ class LogmailRepository(BaseRepository):
         """
         return self.fetch_all(query, (entry_id,)) or []
     
+
+    def get_files_for_entries(self, entry_ids: list[str]) -> dict[str, list[dict]]:
+        out: dict[str, list[dict]] = {}
+        clean_ids = [str(e or "").strip() for e in (entry_ids or []) if str(e or "").strip()]
+        if not clean_ids:
+            return out
+
+        chunk_size = 200
+        for i in range(0, len(clean_ids), chunk_size):
+            chunk = clean_ids[i:i + chunk_size]
+            placeholders = ",".join(["?"] * len(chunk))
+            query = f"""
+                SELECT
+                    nom_pdf,
+                    entry_id,
+                    processing_status,
+                    invoice_date,
+                    iban,
+                    bic,
+                    doc_type,
+                    date_creation
+                FROM dbo.XXA_LOGMAIL_228794
+                WHERE entry_id IN ({placeholders})
+                ORDER BY entry_id ASC, date_creation ASC, id_log ASC
+            """
+            rows = self.fetch_all(query, tuple(chunk)) or []
+            for r in rows:
+                entry_id = str(r.get("entry_id") or "").strip()
+                if not entry_id:
+                    continue
+                out.setdefault(entry_id, []).append(r)
+
+        return out
+
 
     def update_document_metadata_for_entry(self, entry_id: str, *, invoice_date: str = "", iban: str = "", bic: str = "", status: str | None = None):
         entry_id = str(entry_id or "").strip()

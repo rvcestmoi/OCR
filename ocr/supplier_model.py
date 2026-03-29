@@ -106,7 +106,6 @@ def _extract_label_near_value(text: str, value: str, window: int = 50) -> Option
         line_norm = _norm_for_search(line)
         if v_norm in line_norm:
             # 1) Chercher un label sur la même ligne (valeur après label)
-            
             value_idx = line_norm.find(v_norm)
             if value_idx > 0:
                 left_part = line[:value_idx].strip()
@@ -115,7 +114,6 @@ def _extract_label_near_value(text: str, value: str, window: int = 50) -> Option
                 else:
                     candidate = left_part.strip()
 
-                # normalisation minimale (pas juste chiffres / trop court)
                 if candidate and len(candidate) > 2 and len(candidate) < 60 and re.search(r"[A-Za-zÀ-ÖØ-öø-ÿ]", candidate):
                     return candidate
 
@@ -138,6 +136,51 @@ def _extract_label_near_value(text: str, value: str, window: int = 50) -> Option
     return None
 
 
+def _is_plausible_vat_label(field: str, label: str) -> bool:
+    lab = (label or "").strip()
+    up = lab.upper()
+    if not lab:
+        return False
+    bad = (
+        "REFERENCE", "RÉF", "REF", "N° TVA", "NO TVA", "TVA INTRA", "INTRACOMMUNAUTAIRE",
+        "ED-TRANS", "SIRET", "SIREN", "CMR", "DOSSIER", "FACTURE", "INVOICE"
+    )
+    if any(b in up for b in bad):
+        return False
+
+    if field == "vat_rate":
+        return any(k in up for k in ("TAUX", "TVA", "VAT", "%", "MWST", "IVA", "BTW", "PVM"))
+    if field == "vat_base":
+        return any(k in up for k in ("BASE", "HT", "NET", "NETTO", "TAXABLE"))
+    if field == "vat_amount":
+        return any(k in up for k in ("MONTANT", "TOTAL TVA", "VAT", "TVA", "TAX"))
+    return True
+
+
+def _is_plausible_model_value(field: str, value: str) -> bool:
+    v = (value or "").strip()
+    if not v:
+        return False
+    compact = re.sub(r"[\s €EUReur]", "", v)
+    if field == "vat_rate":
+        try:
+            n = float(v.replace("%", "").replace(",", "."))
+        except Exception:
+            return False
+        return 0 <= n <= 30
+    if field in ("vat_base", "vat_amount"):
+        if re.fullmatch(r"\d{8,}", compact):
+            return False
+        if not any(ch in v for ch in ",.") and len(compact) > 6:
+            return False
+        try:
+            float(v.replace(" ", "").replace(" ", "").replace("€", "").replace("EUR", "").replace("eur", "").replace(",", "."))
+        except Exception:
+            return False
+        return True
+    return True
+
+
 def _value_group_regex(field: str, value: str) -> str:
     v = (value or "").strip()
 
@@ -148,21 +191,48 @@ def _value_group_regex(field: str, value: str) -> str:
 
     # ✅ spécial invoice_number : si c'est du type LETTRES + CHIFFRES (ex: F2511326)
     if field == "invoice_number":
-        m = re.fullmatch(r"([A-Z]{1,6})(\d{3,})", vv)
+        raw = (value or "").strip().upper().replace("\u00A0", " ")
+        raw = re.sub(r"\s+", "", raw)
+
+        # cas simple type F2511326
+        m = re.fullmatch(r"([A-Z]{1,6})(\d{3,})", raw)
         if m:
             prefix, digits = m.groups()
             n = len(digits)
 
-            # cas exact demandé : F + 7 chiffres
             if prefix == "F" and n == 7:
                 return r"F\d{7}"
 
-            # sinon: même prefix, digits proche
             lo = max(3, n - 1)
             hi = min(20, n + 1)
             return rf"{re.escape(prefix)}\d{{{lo},{hi}}}"
 
-        # fallback : au moins un alphanumérique + au moins un chiffre (permet de commencer par chiffre)
+        # cas avec séparateurs conservés : FV1450/02/2026, INV-41-03, F.2026.001, etc.
+        if any(sep in raw for sep in "/-_."):
+            parts = re.split(r"([/_\-.])", raw)
+            chunks = []
+
+            for part in parts:
+                if not part:
+                    continue
+
+                if re.fullmatch(r"[/_\-.]", part):
+                    chunks.append(re.escape(part))
+                elif part.isdigit():
+                    chunks.append(rf"\d{{{len(part)}}}")
+                elif re.fullmatch(r"[A-Z]{1,6}\d+", part):
+                    m2 = re.fullmatch(r"([A-Z]{1,6})(\d+)", part)
+                    prefix2, digits2 = m2.groups()
+                    chunks.append(re.escape(prefix2) + rf"\d{{{len(digits2)}}}")
+                elif re.fullmatch(r"[A-Z]+", part):
+                    chunks.append(re.escape(part))
+                elif re.fullmatch(r"[A-Z0-9]+", part):
+                    chunks.append(rf"[A-Z0-9]{{{len(part)}}}")
+                else:
+                    chunks.append(re.escape(part))
+
+            return "".join(chunks)
+
         return r"[A-Z0-9][A-Z0-9\-_/\.]*\d[A-Z0-9\-_/\.]*"
 
     if vv.isdigit():
@@ -472,14 +542,13 @@ def learn_supplier_patterns(
         # Fallback générique
         patterns["invoice_number"].append({
             "mode": "near_label",
-            "label_regex": r"\b(N[°O]\s*FACTURE|INVOICE\s*(NO\.?|NUMBER)|INV\.?\s*NO\.?)\b",
+            "label_regex": r"\b(Num[eé]ro\s+de\s+facture|Numero\s+de\s+facture|N[°O]\s*FACTURE|FACTURE\s*(N[°O]|NO\.?)|INVOICE\s*(NO\.?|NUMBER)|INV\.?\s*NO\.?|NUMER\s+FAKTURY)\b",
             "value_regex": r"([A-Z0-9][A-Z0-9\-_/\.]*\d[A-Z0-9\-_/\.]{1,})",
-            "window": 120,
+            "window": 200,
             "group": 1,
             "hit_count": 0,
             "created_at": _now_iso(),
         })
-
     # Date : ligne + fallback label
     if invoice_date:
         line = _find_line_with_value(ocr_text, invoice_date)
@@ -527,7 +596,7 @@ def learn_supplier_patterns(
             # Pour rate
             if rate:
                 specific_label = _extract_label_near_value(ocr_text, rate)
-                if specific_label:
+                if specific_label and _is_plausible_vat_label("vat_rate", specific_label):
                     patterns["vat_rate"].append({
                         "mode": "near_label",
                         "label_regex": rf"\b{re.escape(specific_label)}\b",
@@ -541,7 +610,7 @@ def learn_supplier_patterns(
             # Pour base
             if base:
                 specific_label = _extract_label_near_value(ocr_text, base)
-                if specific_label:
+                if specific_label and _is_plausible_vat_label("vat_base", specific_label):
                     patterns["vat_base"].append({
                         "mode": "near_label",
                         "label_regex": rf"\b{re.escape(specific_label)}\b",
@@ -555,7 +624,7 @@ def learn_supplier_patterns(
             # Pour vat
             if vat:
                 specific_label = _extract_label_near_value(ocr_text, vat)
-                if specific_label:
+                if specific_label and _is_plausible_vat_label("vat_amount", specific_label):
                     patterns["vat_amount"].append({
                         "mode": "near_label",
                         "label_regex": rf"\b{re.escape(specific_label)}\b",
@@ -565,6 +634,35 @@ def learn_supplier_patterns(
                         "hit_count": 0,
                         "created_at": _now_iso(),
                     })
+
+    # Fallbacks génériques TVA : plus sûrs que des labels appris au hasard
+    patterns["vat_rate"].append({
+        "mode": "near_label",
+        "label_regex": r"(TAUX(?:\s+DE)?\s*TVA|VAT\s+RATE|TVA\s*%)",
+        "value_regex": r"(\d{1,2}(?:[.,]\d{1,2})?\s*%?)",
+        "window": 80,
+        "group": 1,
+        "hit_count": 0,
+        "created_at": _now_iso(),
+    })
+    patterns["vat_base"].append({
+        "mode": "near_label",
+        "label_regex": r"(BASE\s*HT|NET\s*HT|TAXABLE\s+BASE|TOTAL\s*HT)",
+        "value_regex": r"(\d+(?:[  ]\d{3})*(?:[.,]\d{2,3})?)",
+        "window": 100,
+        "group": 1,
+        "hit_count": 0,
+        "created_at": _now_iso(),
+    })
+    patterns["vat_amount"].append({
+        "mode": "near_label",
+        "label_regex": r"(MONTANT\s*(?:DE\s*)?TVA|TOTAL\s*TVA|VAT\s+AMOUNT|AMOUNT\s+VAT)",
+        "value_regex": r"(\d+(?:[  ]\d{3})*(?:[.,]\d{2,3})?)",
+        "window": 100,
+        "group": 1,
+        "hit_count": 0,
+        "created_at": _now_iso(),
+    })
 
     return {k: v for k, v in patterns.items() if v}
 
@@ -741,6 +839,8 @@ def extract_fields_with_model(text: str, model: dict) -> Dict[str, str]:
             if field == "iban" and not validate_iban(val):
                 continue
             if field == "bic" and not validate_bic(val):
+                continue
+            if field in ("vat_rate", "vat_base", "vat_amount") and not _is_plausible_model_value(field, val):
                 continue
 
             out[field] = val

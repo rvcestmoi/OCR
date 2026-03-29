@@ -305,7 +305,7 @@ class MainWindow(
         # Stockage en mémoire des détails palettes (chargé depuis le JSON)
         self.pallet_details = {}
 
-        self.block_options = {}   # { "nom_fichier.pdf": {"blocked": bool, "comment": str} }
+        self.block_options = {}   # { "nom_fichier.pdf": {"blocked": bool, "reason": str, "free_comment": str, "comment": str} }
 
 
         # --- Volet info dossier / tournée ---

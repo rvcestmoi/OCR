@@ -43,9 +43,9 @@ BIC_BLACKLIST = {
     "BANK", "IBAN", "BIC", "SWIFT", "DETAILDE", "DETAILDU", "VIREMENT", "ECHEANCE"
 }
 
-BASE_LABEL_RE = re.compile(r"(BASE\s*HT|TOTAL\s*HT|TOTAL\s*HT\s*NET)", re.IGNORECASE)
-VAT_LABEL_RE = re.compile(r"(MONTANT\s*(?:DE\s*)?TVA|TOTAL\s*TVA)", re.IGNORECASE)
-RATE_LABEL_RE = re.compile(r"(\bTAUX\b|%?\s*TVA\b)", re.IGNORECASE)
+BASE_LABEL_RE = re.compile(r"(\bBASE\s*HT\b|\bBASE\s*H\.?T\.?\b|\bNET\s*HT\b|\bTAXABLE\s+BASE\b)", re.IGNORECASE)
+VAT_LABEL_RE = re.compile(r"(\bMONTANT\s*(?:DE\s*)?TVA\b|\bTOTAL\s*TVA\b|\bVAT\s+AMOUNT\b|\bAMOUNT\s+VAT\b)", re.IGNORECASE)
+RATE_LABEL_RE = re.compile(r"(\bTAUX(?:\s+DE)?\s*TVA\b|\bVAT\s+RATE\b|\bRATE\s+VAT\b|\bTVA\s*%\b)", re.IGNORECASE)
 
 VAT_RATE_RE = re.compile(r"(?P<rate>\d{1,2}(?:[.,]\d{1,2})?)\s*%")
 MONEY_RE = re.compile(r"\b\d+(?:[ \u00A0]\d{3})*(?:[.,]\d{2})\b")
@@ -56,7 +56,7 @@ ONLY_AMOUNT_RE = re.compile(
 )
 
 VAT_BLOCK_HINT_RE = re.compile(
-    r"(MONTANT\s*TVA|TOTAL\s*TVA|TAUX|BASE\s*HT|TVA)",
+    r"(\bTAUX(?:\s+DE)?\s*TVA\b|\bBASE\s*HT\b|\bMONTANT\s*(?:DE\s*)?TVA\b|\bTOTAL\s*TVA\b|\bVAT\s+RATE\b|\bVAT\s+AMOUNT\b|\bTAXABLE\s+BASE\b)",
     re.IGNORECASE
 )
 
@@ -282,10 +282,20 @@ def extract_invoice_number(text: str) -> str:
         "CLIENT", "REFERENCE", "RÉFÉRENCE", "QTE", "QTÉ", "PU", "HT", "TVA", "TTC",
     }
 
+
     label_rx = re.compile(
-        r"\b(N[°O]\s*FACTURE|FACTURE\s*(N[°O]|NO\.?)|INVOICE\s*(NO\.?|NUMBER)|INV\.?\s*NO\.?)\b",
+        r"\b("
+        r"NUM[EÉ]RO\s+DE\s+FACTURE|"
+        r"NUMERO\s+DE\s+FACTURE|"
+        r"N[°O]\s*FACTURE|"
+        r"FACTURE\s*(N[°O]|NO\.?)|"
+        r"INVOICE\s*(NO\.?|NUMBER)|"
+        r"INV\.?\s*NO\.?|"
+        r"NUMER\s+FAKTURY"
+        r")\b",
         re.IGNORECASE,
     )
+
     token_rx = re.compile(r"\b[A-Z0-9][A-Z0-9\-_/\.]{2,}\b", re.IGNORECASE)
 
     lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
@@ -318,14 +328,33 @@ def extract_invoice_number(text: str) -> str:
                     return tok
 
     m = re.search(
-        r"(?:N[°O]\s*)?(?:INVOICE|INV\.?|FACTURE)\b[^\w]{0,20}([A-Z0-9\-_/\.]{3,})",
+        r"(?:"
+        r"NUM[EÉ]RO\s+DE\s+FACTURE|"
+        r"NUMERO\s+DE\s+FACTURE|"
+        r"N[°O]\s*FACTURE|"
+        r"FACTURE\s*(?:N[°O]|NO\.?)|"
+        r"INVOICE\s*(?:NO\.?|NUMBER)|"
+        r"INV\.?\s*NO\.?|"
+        r"NUMER\s+FAKTURY"
+        r")\b[^\w]{0,20}([A-Z0-9\-_/\.]{3,})",
         text,
         re.IGNORECASE,
     )
+
+
     if m:
         cand = m.group(1).strip()
         if ok(cand):
             return cand
+        
+    try:
+        from .field_detector import detect_fields_multilingual
+        detected = detect_fields_multilingual(text or "")
+        candidate = str((detected or {}).get("invoice_number") or "").strip()
+        if candidate:
+            return candidate
+    except Exception:
+        pass
 
     return ""
 
@@ -386,6 +415,91 @@ def _to_float(s: str):
         return None
 
 
+def _clean_vat_number(raw: str) -> str:
+    s = (raw or "").strip()
+    s = s.replace("€", "").replace("EUR", "").replace("eur", "")
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+
+def _is_plausible_money_value(raw: str) -> bool:
+    s = _clean_vat_number(raw)
+    if not s:
+        return False
+    compact = re.sub(r"[\s\u00A0]", "", s)
+    if re.fullmatch(r"\d{8,}", compact):
+        return False
+    if not any(ch in s for ch in ",.") and len(compact) > 6:
+        return False
+    v = _to_float(s)
+    if v is None or v < 0:
+        return False
+    return True
+
+
+def _build_valid_vat_line(rate: str = "", base: str = "", vat: str = ""):
+    rate = (rate or "").replace("%", "").strip().replace(",", ".")
+    base = _clean_vat_number(base)
+    vat = _clean_vat_number(vat)
+
+    rv = _to_float(rate) if rate else None
+    bv = _to_float(base) if base else None
+    vv = _to_float(vat) if vat else None
+
+    if rv is not None and not _is_allowed_vat_rate(rv):
+        return None
+    if base and not _is_plausible_money_value(base):
+        return None
+    if vat and not _is_plausible_money_value(vat):
+        return None
+
+    if rv is not None and bv is not None and vv is None and rv > 0:
+        vv = round((bv * rv) / 100.0, 2)
+        vat = f"{vv:.2f}".replace(".", ",")
+    elif rv is not None and vv is not None and bv is None and rv > 0:
+        bv = round((vv * 100.0) / rv, 2)
+        base = f"{bv:.2f}".replace(".", ",")
+
+    if rv is None or bv is None or vv is None:
+        return None
+    if bv <= 0:
+        return None
+
+    expected = (bv * rv) / 100.0
+    tol = max(0.06, expected * 0.03)
+    if abs(vv - expected) > tol:
+        return None
+
+    return {
+        "rate": (f"{rv:.2f}".rstrip("0").rstrip(".")).replace(".", "."),
+        "base": base,
+        "vat": vat,
+    }
+
+
+def _is_structural_vat_label(line: str) -> bool:
+    up = (line or "").upper()
+    if not up:
+        return False
+    bad = ("N° TVA", "NO TVA", "TVA INTRA", "INTRACOMMUNAUTAIRE", "VAT NO", "VAT N°", "N TVA")
+    if any(b in up for b in bad):
+        return False
+    return bool(VAT_BLOCK_HINT_RE.search(up))
+
+
+def _extract_vat_vertical_table(lines: list[str]) -> dict | None:
+    n = len(lines)
+    for i in range(n - 5):
+        l1, l2, l3 = lines[i], lines[i + 1], lines[i + 2]
+        if RATE_LABEL_RE.search(l1) and VAT_LABEL_RE.search(l2) and BASE_LABEL_RE.search(l3):
+            return _build_valid_vat_line(lines[i + 3], lines[i + 5], lines[i + 4])
+        if BASE_LABEL_RE.search(l1) and VAT_LABEL_RE.search(l2) and RATE_LABEL_RE.search(l3):
+            return _build_valid_vat_line(lines[i + 5], lines[i + 3], lines[i + 4])
+        if RATE_LABEL_RE.search(l1) and BASE_LABEL_RE.search(l2) and VAT_LABEL_RE.search(l3):
+            return _build_valid_vat_line(lines[i + 3], lines[i + 4], lines[i + 5])
+    return None
+
+
 def parse_vat_lines(text: str, allowed_vat_rates: set[float] | None = None, model: dict | None = None):
     global _current_allowed_vat_rates
     _current_allowed_vat_rates = allowed_vat_rates
@@ -408,31 +522,9 @@ def parse_vat_lines(text: str, allowed_vat_rates: set[float] | None = None, mode
             vat = found.get("vat_amount", "")
 
             if rate or base or vat:
-                # Essayer de compléter les valeurs manquantes
-                if rate and base and vat:
-                    lines_out.append({"rate": rate, "base": base, "vat": vat})
-                elif rate and base and not vat:
-                    # Calculer le montant TVA
-                    try:
-                        r = float(rate.replace(",", "."))
-                        b = _to_float(base)
-                        if b and _is_allowed_vat_rate(r):
-                            v = (b * r) / 100.0
-                            vat = f"{v:.2f}"
-                            lines_out.append({"rate": rate, "base": base, "vat": vat})
-                    except:
-                        pass
-                elif rate and vat and not base:
-                    # Calculer la base HT
-                    try:
-                        r = float(rate.replace(",", "."))
-                        v = _to_float(vat)
-                        if v and _is_allowed_vat_rate(r):
-                            b = (v * 100.0) / r
-                            base = f"{b:.2f}"
-                            lines_out.append({"rate": rate, "base": base, "vat": vat})
-                    except:
-                        pass
+                row = _build_valid_vat_line(rate, base, vat)
+                if row:
+                    lines_out.append(row)
 
     # 1) format ligne TVA directe
     for raw in (text or "").splitlines():
@@ -464,20 +556,22 @@ def parse_vat_lines(text: str, allowed_vat_rates: set[float] | None = None, mode
         else:
             continue
 
-        key = (rate, base, vat)
+        row = _build_valid_vat_line(rate, base, vat)
+        if not row:
+            continue
+        key = (row["rate"], row["base"], row["vat"])
         if key in seen:
             continue
         seen.add(key)
 
-        lines_out.append({"rate": rate, "base": base, "vat": vat})
+        lines_out.append(row)
 
     # 2) format table TVA
     lines = [ln.strip() for ln in (text or "").splitlines() if ln.strip()]
-    label_table = _extract_vat_by_labels(lines)
+    vertical_table = _extract_vat_vertical_table(lines)
+    label_table = vertical_table or _extract_vat_by_labels(lines)
 
-    centers = [i for i, ln in enumerate(lines) if VAT_BLOCK_HINT_RE.search(ln)]
-    if not centers:
-        centers = [i for i, ln in enumerate(lines) if "TVA" in ln.upper()]
+    centers = [i for i, ln in enumerate(lines) if _is_structural_vat_label(ln)]
 
     best_table = None
     best_score = -1
@@ -499,24 +593,20 @@ def parse_vat_lines(text: str, allowed_vat_rates: set[float] | None = None, mode
     chosen = label_table if label_table else best_table
 
     if chosen:
-        rate = chosen["rate"]
-        base = chosen["base"]
-        vat = chosen["vat"]
-
-        key = (rate.replace(",", "."), base, vat)
-        if key not in seen:
-            seen.add(key)
-            lines_out.append({"rate": rate, "base": base, "vat": vat})
+        row = _build_valid_vat_line(chosen.get("rate", ""), chosen.get("base", ""), chosen.get("vat", ""))
+        if row:
+            key = (row["rate"], row["base"], row["vat"])
+            if key not in seen:
+                seen.add(key)
+                lines_out.append(row)
 
     if best_table:
-        rate = best_table["rate"]
-        base = best_table["base"]
-        vat = best_table["vat"]
-
-        key = (rate.replace(",", "."), base, vat)
-        if key not in seen:
-            seen.add(key)
-            lines_out.append({"rate": rate, "base": base, "vat": vat})
+        row = _build_valid_vat_line(best_table.get("rate", ""), best_table.get("base", ""), best_table.get("vat", ""))
+        if row:
+            key = (row["rate"], row["base"], row["vat"])
+            if key not in seen:
+                seen.add(key)
+                lines_out.append(row)
 
     # 3) Fusionner les lignes TVA avec le même taux
     lines_out = _merge_duplicate_vat_lines(lines_out)
@@ -678,7 +768,7 @@ def _infer_vat_line_from_block(lines: list[str], center: int, window: int = 25):
         return None
 
     _, rstr, bstr, vstr = best
-    return {"rate": rstr, "base": bstr, "vat": vstr}
+    return _build_valid_vat_line(rstr, bstr, vstr)
 
 
 def _money_in_line_or_next(lines: list[str], idx: int) -> str:
@@ -794,71 +884,41 @@ def _merge_duplicate_vat_lines(lines: list[dict]) -> list[dict]:
 
 
 def _extract_vat_by_labels(lines: list[str]) -> dict | None:
-    idx_base = next((i for i, ln in enumerate(lines) if BASE_LABEL_RE.search(ln)), None)
-    idx_vat = next((i for i, ln in enumerate(lines) if VAT_LABEL_RE.search(ln)), None)
-    idx_rate = next(
-        (
-            i for i, ln in enumerate(lines)
-            if RATE_LABEL_RE.search(ln) and "TOTAL TVA" not in ln.upper()
-        ),
-        None,
-    )
-
-    # Cas spécial : ligne de tableau TVA (tous labels sur même ligne)
-    if idx_base == idx_vat == idx_rate and idx_base is not None:
-        ln = lines[idx_base]
-        # Chercher montants sur la même ligne ou la suivante
-        amounts = MONEY_RE.findall(ln)
-        if not amounts and idx_base + 1 < len(lines):
-            amounts = MONEY_RE.findall(lines[idx_base + 1])
-        rates = VAT_RATE_RE.findall(ln)
-        if not rates and idx_base + 1 < len(lines):
-            rates = VAT_RATE_RE.findall(lines[idx_base + 1])
-        if len(amounts) >= 2 and rates:
-            # rates est liste de strings, prendre la première
-            rate = rates[0].replace(",", ".")
-            vat = _norm_amount_str(amounts[0])  # premier montant = TVA
-            base = _norm_amount_str(amounts[-1])  # dernier montant = base
-            bv = _to_float(base)
-            vv = _to_float(vat)
-            rv = _to_float(rate)
-            if bv and vv and rv and _is_allowed_vat_rate(rv):
-                expected = (bv * rv) / 100.0
-                if abs(vv - expected) <= max(0.06, expected * 0.03):
-                    return {"rate": rate, "base": base, "vat": vat}
-
-    # Cas normal : labels séparés
-    base = _money_in_line_or_next(lines, idx_base) if idx_base is not None else ""
-    vat = _money_in_line_or_next(lines, idx_vat) if idx_vat is not None else ""
-    rate = _rate_in_line_or_next(lines, idx_rate) if idx_rate is not None else ""
-
-    # Si pas de label de taux trouvé, chercher autour des autres labels
-    if not rate:
-        # Chercher autour du label TVA
-        if idx_vat is not None:
-            rate = _rate_in_line_or_next(lines, idx_vat)
-        # Ou autour du label base
-        if not rate and idx_base is not None:
-            rate = _rate_in_line_or_next(lines, idx_base)
-
-    bv = _to_float(base) if base else None
-    vv = _to_float(vat) if vat else None
-    rv = _to_float(rate) if rate else None
-
-    if (bv is not None and bv > 0) and (vv is not None and vv > 0):
-        if rv is None or rv <= 0 or rv > 30:
-            rv = (vv / bv) * 100.0
-            rate = f"{rv:.2f}"
-
-    if rv is not None and not _is_allowed_vat_rate(rv):
+    if not lines:
         return None
 
-    if bv is not None and vv is not None and rv is not None:
-        expected = (bv * rv) / 100.0
-        if abs(vv - expected) > max(0.06, expected * 0.03):
-            return None
+    vertical = _extract_vat_vertical_table(lines)
+    if vertical:
+        return vertical
 
-    if rate and base and vat:
-        return {"rate": rate.replace(",", "."), "base": base, "vat": vat}
+    rate_idxs = [i for i, ln in enumerate(lines) if RATE_LABEL_RE.search(ln) and _is_structural_vat_label(ln)]
+    base_idxs = [i for i, ln in enumerate(lines) if BASE_LABEL_RE.search(ln) and _is_structural_vat_label(ln)]
+    vat_idxs = [i for i, ln in enumerate(lines) if VAT_LABEL_RE.search(ln) and _is_structural_vat_label(ln)]
 
-    return None
+    best = None
+    best_span = 10**9
+    for ri in rate_idxs:
+        for bi in base_idxs:
+            for vi in vat_idxs:
+                span = max(ri, bi, vi) - min(ri, bi, vi)
+                if span > 8:
+                    continue
+                if span < best_span:
+                    best_span = span
+                    best = (ri, bi, vi)
+
+    if not best:
+        return None
+
+    ri, bi, vi = best
+    rate = _rate_in_line_or_next(lines, ri)
+    base = _money_in_line_or_next(lines, bi)
+    vat = _money_in_line_or_next(lines, vi)
+
+    if not rate:
+        search_window = " ".join(lines[min(ri, bi, vi): min(len(lines), max(ri, bi, vi) + 4)])
+        m = VAT_RATE_RE.search(search_window)
+        if m:
+            rate = m.group("rate").replace(",", ".")
+
+    return _build_valid_vat_line(rate, base, vat)

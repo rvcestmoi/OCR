@@ -56,13 +56,34 @@ class MainWindowValidationMixin:
             )
             return
         
+        # Vérifie que le dossier n'est pas déjà en facturation
+        for tour_nr in tournrs:
+            try:
+                already_invoiced = self.lisinvoice_repo.tour_exists(tour_nr)
+            except Exception as e:
+                QMessageBox.warning(
+                    self,
+                    "Validation impossible",
+                    "Erreur lors du contrôle du dossier dans LISINVOICE_EDTRANS.\n\n"
+                    f"Détail : {e}"
+                )
+                return
+
+            if already_invoiced:
+                QMessageBox.warning(
+                    self,
+                    "Validation impossible",
+                    "Le dossier est deja en facturation"
+                )
+                return
+
         
         # --- Anti-doublon facture (XXARe) + proposition mise en erreur ---
         invoice_nr, kundennr = self._get_invoice_number_and_kundennr_for_dupecheck()
 
         if invoice_nr and kundennr:
             try:
-                exists = bool(self.xxare_repo.invoice_exists(invoice_nr, kundennr, aufdk="D"))
+                exists = bool(self.xxare_repo.invoice_exists(invoice_nr, kundennr, aufdk="K"))
             except Exception as e:
                 QMessageBox.warning(
                     self,
@@ -97,6 +118,17 @@ class MainWindowValidationMixin:
         # 1) Toujours re-sauvegarder AVANT les updates SQL
         self.save_current_data(status="validated", show_message=False)
 
+        aux_update_error = ""
+        kundennr_for_aux = str(getattr(self, "selected_kundennr", "") or "").strip()
+        aux_value = str(self.transporter_aux_input.text() or "").strip()
+        if kundennr_for_aux and aux_value:
+            try:
+                self.transporter_repo.update_ktoKreA(kundennr_for_aux, aux_value)
+                if hasattr(self, "_set_transporter_aux_locked"):
+                    self._set_transporter_aux_locked(True, aux_value)
+            except Exception as e:
+                aux_update_error = str(e)
+
         entry_id = str(getattr(self, "selected_invoice_entry_id", "") or "").strip()
         if entry_id:
             try:
@@ -116,10 +148,17 @@ class MainWindowValidationMixin:
 
         # 4) Updates SQL
         errors = []
+        ocr_user = str(getattr(self, "current_username", "") or "").strip()
         for t in tournrs:
             try:
                 self.tour_repo.set_infosymbol18_for_tournr(t, value=value)
-                self.tour_repo.set_block_status_for_tournr(t, is_blocked=blocked, motif=comment)
+                self.tour_repo.set_ocr_user_for_tournr(t, ocr_user=ocr_user)
+                self.tour_repo.set_block_status_for_tournr(
+                    t,
+                    is_blocked=blocked,
+                    motif=comment,
+                    ocr_user=ocr_user,
+                )
             except Exception as e:
                 errors.append(f"{t} : {e}")
 
@@ -158,6 +197,11 @@ class MainWindowValidationMixin:
         if lisinvoice_errors:
             all_error_parts.append(
                 "Erreurs LISINVOICE_EDTRANS :\n" + "\n".join(lisinvoice_errors)
+            )
+
+        if aux_update_error:
+            all_error_parts.append(
+                "Erreur mise à jour compte auxiliaire transporteur :\n" + aux_update_error
             )
 
         if all_error_parts:
@@ -249,9 +293,12 @@ class MainWindowValidationMixin:
                 break
 
     def _set_transporter_match_color(self, ok: bool | None):
+        self._transporter_aux_match_ok = ok
+
         if ok is None:
             self.transporter_info.setStyleSheet("")
-            self.transporter_aux_input.setStyleSheet("background-color: #f3f3f3;")
+            if hasattr(self, "_refresh_transporter_aux_style"):
+                self._refresh_transporter_aux_style()
             return
 
         if ok:
@@ -262,7 +309,8 @@ class MainWindowValidationMixin:
             border = "#dc3545"
 
         self.transporter_info.setStyleSheet(f"background-color: {bg}; border: 2px solid {border};")
-        self.transporter_aux_input.setStyleSheet(f"background-color: {bg}; border: 2px solid {border};")
+        if hasattr(self, "_refresh_transporter_aux_style"):
+            self._refresh_transporter_aux_style()
 
     def update_transporter_vs_dossiers_status(self):
         """

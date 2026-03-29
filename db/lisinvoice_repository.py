@@ -49,10 +49,10 @@ class LISInvoiceRepository(BaseRepository):
         if self.row_exists(rech_nr, kunden_nr, tour_nr):
             sql = """
                 UPDATE dbo.LISINVOICE_EDTRANS
-                SET RechDat = ?,
-                    HT = ?,
-                    TTC = ?,
-                    Taux = ?,
+                SET RechDat = CAST(? AS date),
+                    HT = CAST(? AS decimal(18,2)),
+                    TTC = CAST(? AS decimal(18,2)),
+                    Taux = CAST(? AS decimal(18,2)),
                     [Import] = ?
                 WHERE RechNr = ?
                   AND KundenNr = ?
@@ -81,7 +81,16 @@ class LISInvoiceRepository(BaseRepository):
                     TourNr,
                     [Import]
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (
+                    ?,
+                    CAST(? AS date),
+                    CAST(? AS decimal(18,2)),
+                    CAST(? AS decimal(18,2)),
+                    CAST(? AS decimal(18,2)),
+                    ?,
+                    ?,
+                    ?
+                )
             """
             params = (
                 rech_nr,
@@ -95,3 +104,28 @@ class LISInvoiceRepository(BaseRepository):
             )
 
         self.execute(sql, params)
+
+
+    def tour_exists(self, tour_nr: str) -> bool:
+        tour_nr = str(tour_nr or "").strip()
+        if not tour_nr:
+            return False
+
+        sql = """
+            SELECT TOP 1 TourNr
+            FROM dbo.LISINVOICE_EDTRANS
+            WHERE LTRIM(RTRIM(CAST(TourNr AS VARCHAR(20)))) = ?
+        """
+        row = self.fetch_one(sql, (tour_nr,))
+        return row is not None
+
+    def row_exists(self, rech_nr: str, kunden_nr, tour_nr: str) -> bool:
+        sql = """
+            SELECT TOP 1 1 AS ok
+            FROM dbo.LISINVOICE_EDTRANS
+            WHERE RechNr = ?
+              AND KundenNr = ?
+              AND TourNr = ?
+        """
+        row = self.fetch_one(sql, (rech_nr, kunden_nr, tour_nr))
+        return row is not None

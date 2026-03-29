@@ -223,45 +223,103 @@ class TourRepository(BaseRepository):
 
         placeholders = ",".join(["?"] * len(tour_numbers))
         query = f"""
-            SELECT
-                LTRIM(RTRIM(CAST(auf.TourNr AS VARCHAR(20)))) AS Dossier,
-                LTRIM(RTRIM(CAST(auf.AufNr AS VARCHAR(50)))) AS AufNr,
-                pos.VPE,
-                SUM(pos.VPEAnz) AS Palettes,
-                SUM(pos.TatsGew) AS Poids,
-                CONCAT(
-                    COALESCE(NULLIF(MAX(LTRIM(RTRIM(CAST(auf.BELLKZ AS VARCHAR(20))))), ''), NULLIF(MAX(LTRIM(RTRIM(CAST(tour.BELLKZ AS VARCHAR(20))))), ''), ''),
-                    '-',
-                    COALESCE(NULLIF(MAX(LTRIM(RTRIM(CAST(auf.BelPLZ AS VARCHAR(20))))), ''), NULLIF(MAX(LTRIM(RTRIM(CAST(tour.BelPLZ AS VARCHAR(20))))), ''), ''),
-                    ' ',
-                    COALESCE(NULLIF(MAX(LTRIM(RTRIM(CAST(auf.BelOrt AS VARCHAR(100))))), ''), NULLIF(MAX(LTRIM(RTRIM(CAST(tour.BelOrt AS VARCHAR(100))))), ''), ''),
-                    '-',
-                    COALESCE(NULLIF(MAX(LTRIM(RTRIM(CAST(auf.EmgLKZ AS VARCHAR(20))))), ''), NULLIF(MAX(LTRIM(RTRIM(CAST(tour.EmgLKZ AS VARCHAR(20))))), ''), ''),
-                    '-',
-                    COALESCE(NULLIF(MAX(LTRIM(RTRIM(CAST(auf.EmgPLZ AS VARCHAR(20))))), ''), NULLIF(MAX(LTRIM(RTRIM(CAST(tour.EmgPLZ AS VARCHAR(20))))), ''), ''),
-                    ' ',
-                    COALESCE(NULLIF(MAX(LTRIM(RTRIM(CAST(auf.EmgOrt AS VARCHAR(100))))), ''), NULLIF(MAX(LTRIM(RTRIM(CAST(tour.EmgOrt AS VARCHAR(100))))), ''), '')
-                ) AS Trajet
-            FROM XXAV_FR_MainAufIntNrByLegs leg
-            LEFT JOIN xxaslauf auf ON auf.AufIntNr = leg.leg_AufIntNr
-            LEFT JOIN xxaaufpos pos ON pos.aufintnr = leg.MAin_aufintnr
-            LEFT JOIN XXATour tour ON tour.TourNr = auf.TourNr
-            WHERE pos.VPE IS NOT NULL
-              AND LTRIM(RTRIM(CAST(auf.TourNr AS VARCHAR(20)))) IN ({placeholders})
-            GROUP BY
-                LTRIM(RTRIM(CAST(auf.TourNr AS VARCHAR(20)))),
-                LTRIM(RTRIM(CAST(auf.AufNr AS VARCHAR(50)))),
-                pos.VPE
-            ORDER BY
-                LTRIM(RTRIM(CAST(auf.TourNr AS VARCHAR(20)))),
-                LTRIM(RTRIM(CAST(auf.AufNr AS VARCHAR(50)))),
-                pos.VPE
+                SELECT
+                    LTRIM(RTRIM(CAST(auf.TourNr AS VARCHAR(20)))) AS Dossier,
+                    LTRIM(RTRIM(CAST(auf.AufNr AS VARCHAR(50)))) AS AufNr,
+                    pos.VPE,
+                    SUM(pos.VPEAnz) AS Palettes,
+                    SUM(pos.TatsGew) AS Poids,
+                    CONCAT(
+                        MAX(LTRIM(RTRIM(CONVERT(VARCHAR(10), CAST(auf.belvondat AS DATE), 103)))),
+                        '-',
+                        COALESCE(
+                            NULLIF(MAX(LTRIM(RTRIM(CAST(auf.BELLKZ AS VARCHAR(20))))), ''),
+                            NULLIF(MAX(LTRIM(RTRIM(CAST(tour.BELLKZ AS VARCHAR(20))))), ''),
+                            ''
+                        ),
+                        '-',
+                        COALESCE(
+                            NULLIF(MAX(LTRIM(RTRIM(CAST(auf.BelPLZ AS VARCHAR(20))))), ''),
+                            NULLIF(MAX(LTRIM(RTRIM(CAST(tour.BelPLZ AS VARCHAR(20))))), ''),
+                            ''
+                        ),
+                        ' ',
+                        COALESCE(
+                            NULLIF(MAX(LTRIM(RTRIM(CAST(auf.BelOrt AS VARCHAR(100))))), ''),
+                            NULLIF(MAX(LTRIM(RTRIM(CAST(tour.BelOrt AS VARCHAR(100))))), ''),
+                            ''
+                        ),
+                        '-',
+                        COALESCE(
+                            NULLIF(MAX(LTRIM(RTRIM(CAST(auf.EmgLKZ AS VARCHAR(20))))), ''),
+                            NULLIF(MAX(LTRIM(RTRIM(CAST(tour.EmgLKZ AS VARCHAR(20))))), ''),
+                            ''
+                        ),
+                        '-',
+                        COALESCE(
+                            NULLIF(MAX(LTRIM(RTRIM(CAST(auf.EmgPLZ AS VARCHAR(20))))), ''),
+                            NULLIF(MAX(LTRIM(RTRIM(CAST(tour.EmgPLZ AS VARCHAR(20))))), ''),
+                            ''
+                        ),
+                        ' ',
+                        COALESCE(
+                            NULLIF(MAX(LTRIM(RTRIM(CAST(auf.EmgOrt AS VARCHAR(100))))), ''),
+                            NULLIF(MAX(LTRIM(RTRIM(CAST(tour.EmgOrt AS VARCHAR(100))))), ''),
+                            ''
+                        )
+                    ) AS Trajet
+                FROM XXAV_FR_MainAufIntNrByLegs leg
+                LEFT JOIN xxaslauf auf
+                    ON auf.AufIntNr = leg.leg_AufIntNr
+                LEFT JOIN xxaaufpos pos
+                    ON pos.aufintnr = leg.Main_aufintnr
+                LEFT JOIN XXATour tour
+                    ON tour.TourNr = auf.TourNr
+                WHERE pos.VPE IS NOT NULL
+                AND LTRIM(RTRIM(CAST(auf.TourNr AS VARCHAR(20)))) IN ({placeholders})
+                GROUP BY
+                    LTRIM(RTRIM(CAST(auf.TourNr AS VARCHAR(20)))),
+                    LTRIM(RTRIM(CAST(auf.AufNr AS VARCHAR(50)))),
+                    pos.VPE
+                ORDER BY
+                    Dossier,                    
+                    AufNr,
+                    pos.VPE;    
         """
         return self.fetch_all(query, tuple(tour_numbers))
     
-    def set_block_status_for_tournr(self, tour_nr: str, is_blocked: bool, motif: str = ""):
+    def set_ocr_user_for_tournr(self, tour_nr: str, ocr_user: str = ""):
         """
-        Met à jour XXATourExt.isBloqued + MotifBlocage pour un TourNr.
+        Met à jour XXATourExt.OCRUser pour un TourNr, même si la tournée n'est pas bloquée.
+        Crée la ligne XXATourExt si nécessaire.
+        """
+        sql = """
+            DECLARE @TourIntNr INT;
+            SELECT TOP 1 @TourIntNr = TourIntNr
+            FROM XXATour
+            WHERE TourNr = ?;
+
+            IF @TourIntNr IS NULL
+                RETURN;
+
+            IF EXISTS (SELECT 1 FROM XXATourExt WHERE TourIntNr = @TourIntNr)
+            BEGIN
+                UPDATE XXATourExt
+                SET OCRUser = ?
+                WHERE TourIntNr = @TourIntNr;
+            END
+            ELSE
+            BEGIN
+                INSERT INTO XXATourExt (TourIntNr, OCRUser)
+                VALUES (@TourIntNr, ?);
+            END
+        """
+        ocr_user_db = (ocr_user or "").strip() or None
+        self.execute(sql, (tour_nr, ocr_user_db, ocr_user_db))
+
+    def set_block_status_for_tournr(self, tour_nr: str, is_blocked: bool, motif: str = "", ocr_user: str = ""):
+        """
+        Met à jour XXATourExt.isBloqued + MotifBlocage + ComBloquageOCR + OCRUser pour un TourNr.
         Upsert si la ligne XXATourExt n'existe pas encore.
         """
         sql = """
@@ -278,18 +336,34 @@ class TourRepository(BaseRepository):
                 UPDATE XXATourExt
                 SET
                     isBloqued = ?,
-                    MotifBlocage = ?
+                    MotifBlocage = ?,
+                    ComBloquageOCR = ?,
+                    OCRUser = ?
                 WHERE TourIntNr = @TourIntNr;
             END
             ELSE
             BEGIN
-                INSERT INTO XXATourExt (TourIntNr, isBloqued, MotifBlocage)
-                VALUES (@TourIntNr, ?, ?);
+                INSERT INTO XXATourExt (TourIntNr, isBloqued, MotifBlocage, ComBloquageOCR, OCRUser)
+                VALUES (@TourIntNr, ?, ?, ?, ?);
             END
         """
-        # si pas bloqué -> motif NULL (plus propre)
-        motif_db = (motif or "").strip() if is_blocked else None
-        self.execute(sql, (tour_nr, 1 if is_blocked else 0, motif_db, 1 if is_blocked else 0, motif_db))
+        # si pas bloqué -> commentaire NULL (plus propre)
+        comment_db = (motif or "").strip() if is_blocked else None
+        ocr_user_db = (ocr_user or "").strip() or None
+        self.execute(
+            sql,
+            (
+                tour_nr,
+                1 if is_blocked else 0,
+                comment_db,
+                comment_db,
+                ocr_user_db,
+                1 if is_blocked else 0,
+                comment_db,
+                comment_db,
+                ocr_user_db,
+            ),
+        )
 
     def get_tournrs_matching_ffnr(self, tournrs: List[str], kundennr: str) -> Set[str]:
         tournrs = [str(t).strip() for t in (tournrs or []) if str(t).strip()]

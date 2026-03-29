@@ -3,7 +3,8 @@ from __future__ import annotations
 
 from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel,
-    QCheckBox, QComboBox, QPushButton, QMessageBox
+    QCheckBox, QComboBox, QPushButton, QMessageBox,
+    QPlainTextEdit
 )
 
 
@@ -19,10 +20,19 @@ BLOCK_REASONS = [
 
 
 class BlockOptionsDialog(QDialog):
-    def __init__(self, parent=None, *, document_name: str, blocked: bool = False, comment: str = ""):
+    def __init__(
+        self,
+        parent=None,
+        *,
+        document_name: str,
+        blocked: bool = False,
+        comment: str = "",
+        reason: str = "",
+        free_comment: str = "",
+    ):
         super().__init__(parent)
         self.setWindowTitle("Options de blocage")
-        self.resize(520, 200)
+        self.resize(560, 280)
 
         root = QVBoxLayout(self)
 
@@ -39,13 +49,31 @@ class BlockOptionsDialog(QDialog):
         self.cbo_reason.setEditable(False)
 
         current_comment = (comment or "").strip()
-        idx = self.cbo_reason.findText(current_comment)
-        if idx >= 0:
-            self.cbo_reason.setCurrentIndex(idx)
-        else:
-            self.cbo_reason.setCurrentIndex(0)
+        current_reason = (reason or "").strip()
+        current_free_comment = (free_comment or "").strip()
 
+        if not current_reason and current_comment:
+            for candidate in BLOCK_REASONS:
+                prefix = f"{candidate} - "
+                if current_comment == candidate:
+                    current_reason = candidate
+                    current_free_comment = ""
+                    break
+                if current_comment.startswith(prefix):
+                    current_reason = candidate
+                    current_free_comment = current_comment[len(prefix):].strip()
+                    break
+
+        idx = self.cbo_reason.findText(current_reason)
+        self.cbo_reason.setCurrentIndex(idx if idx >= 0 else 0)
         root.addWidget(self.cbo_reason)
+
+        root.addWidget(QLabel("Commentaire :"))
+        self.txt_comment = QPlainTextEdit()
+        self.txt_comment.setPlaceholderText("Commentaire libre…")
+        self.txt_comment.setPlainText(current_free_comment)
+        self.txt_comment.setMaximumHeight(100)
+        root.addWidget(self.txt_comment)
 
         btns = QHBoxLayout()
         btns.addStretch()
@@ -64,9 +92,12 @@ class BlockOptionsDialog(QDialog):
         self._update_state(self.chk_block.isChecked())
 
     def _update_state(self, blocked: bool):
-        self.cbo_reason.setEnabled(bool(blocked))
-        if not blocked:
+        enabled = bool(blocked)
+        self.cbo_reason.setEnabled(enabled)
+        self.txt_comment.setEnabled(enabled)
+        if not enabled:
             self.cbo_reason.setCurrentIndex(0)
+            self.txt_comment.setPlainText("")
 
     def _on_accept(self):
         if self.chk_block.isChecked() and not (self.cbo_reason.currentText() or "").strip():
@@ -75,8 +106,18 @@ class BlockOptionsDialog(QDialog):
         self.accept()
 
     def get_result(self) -> dict:
-        comment = (self.cbo_reason.currentText() or "").strip() if self.chk_block.isChecked() else ""
+        blocked = self.chk_block.isChecked()
+        reason = (self.cbo_reason.currentText() or "").strip() if blocked else ""
+        free_comment = (self.txt_comment.toPlainText() or "").strip() if blocked else ""
+
+        if reason and free_comment:
+            comment = f"{reason} - {free_comment}"
+        else:
+            comment = reason or free_comment
+
         return {
-            "blocked": self.chk_block.isChecked(),
+            "blocked": blocked,
+            "reason": reason,
+            "free_comment": free_comment,
             "comment": comment,
         }

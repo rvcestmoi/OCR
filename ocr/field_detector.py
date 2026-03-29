@@ -85,6 +85,8 @@ FIELD_LABELS: Dict[str, List[str]] = {
         "INV #",
         "FACTURE",
         "NUMERO FACTURE",
+        "NUMERO DE FACTURE",
+        "NUMÉRO DE FACTURE",
         "N FACTURE",
         "NO FACTURE",
         "NR FACTURE",

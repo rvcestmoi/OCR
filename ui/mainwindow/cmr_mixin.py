@@ -556,9 +556,79 @@ class MainWindowCmrMixin:
 
 
 
+    def _is_cmr_missing_block_enabled_for_current_invoice(self) -> bool:
+        """
+        Autorise la validation si la facture courante est bloquée avec un motif
+        de type "CMR manquant".
+
+        On supporte :
+        - le nouveau format block_options par document
+        - l'ancien format top-level blocked / block_comment
+        - le cas où le blocage a été posé sur le document affiché, la facture
+          principale, ou une PJ du même groupe.
+        """
+        try:
+            data = self._read_saved_invoice_json(getattr(self, 'current_pdf_path', '') or '') or {}
+        except Exception:
+            data = {}
+
+        block_options = {}
+        try:
+            block_options.update(data.get('block_options', {}) or {})
+        except Exception:
+            pass
+        try:
+            block_options.update(getattr(self, 'block_options', {}) or {})
+        except Exception:
+            pass
+
+        # On n'autorise le bypass QUE si le blocage est posé sur le
+        # document courant (facture sélectionnée) ou sur le document
+        # actuellement affiché. Surtout pas sur n'importe quelle PJ du groupe,
+        # sinon une ancienne PJ bloquée pourrait autoriser la validation par erreur.
+        candidate_names = set()
+        for p in [getattr(self, 'current_pdf_path', None), getattr(self, 'view_pdf_path', None)]:
+            if not p:
+                continue
+            name = os.path.basename(str(p))
+            if not name:
+                continue
+            candidate_names.add(name)
+            try:
+                candidate_names.add(strip_entry_prefix(name))
+            except Exception:
+                pass
+
+        def _matches_cmr_missing(info: dict) -> bool:
+            if not isinstance(info, dict):
+                return False
+            if not bool(info.get('blocked', False)):
+                return False
+            tokens = [
+                str(info.get('reason', '') or ''),
+                str(info.get('comment', '') or ''),
+                str(info.get('free_comment', '') or ''),
+            ]
+            normalized = ' '.join(tokens).strip().lower()
+            return 'cmr manquant' in normalized
+
+        for name in candidate_names:
+            if _matches_cmr_missing(block_options.get(name, {}) or {}):
+                return True
+
+        if bool(data.get('blocked', False)):
+            normalized = str(data.get('block_comment', '') or '').strip().lower()
+            if 'cmr manquant' in normalized:
+                return True
+
+        return False
+
     def _block_validate_if_missing_cmr(self) -> bool:
         ok, missing_by_tour = self._check_all_orders_have_cmr()
         if ok:
+            return True
+
+        if self._is_cmr_missing_block_enabled_for_current_invoice():
             return True
 
         lines = []

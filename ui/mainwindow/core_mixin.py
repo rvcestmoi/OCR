@@ -182,6 +182,10 @@ class MainWindowCoreMixin:
         self.current_db_iban = None
         self.current_db_bic = None
         self.transporter_selected_mode = False
+        self._pending_saved_transporter_aux = ""
+        self._pending_saved_transporter_aux_kundennr = ""
+        self._transporter_aux_match_ok = None
+        self._transporter_aux_locked = True
 
         # champs facture
         for field in [self.iban_input, self.bic_input, self.date_input, self.invoice_number_input]:
@@ -194,6 +198,13 @@ class MainWindowCoreMixin:
         self.transporter_input.blockSignals(True)
         self.transporter_input.clear()
         self.transporter_input.blockSignals(False)
+        if hasattr(self, "_set_transporter_aux_locked"):
+            self._set_transporter_aux_locked(True, "")
+        else:
+            self.transporter_aux_input.clear()
+            self.transporter_aux_input.setReadOnly(True)
+            self.transporter_aux_input.setFocusPolicy(Qt.NoFocus)
+            self.transporter_aux_input.setStyleSheet("background-color: #f3f3f3;")
         self.btn_transporter_action.setEnabled(False)
         self.transporter_info.clear()
         if hasattr(self, "tour_info") and self.tour_info is not None:
@@ -256,10 +267,19 @@ class MainWindowCoreMixin:
         # Transporteur
         if saved_data.get("transporter_text"):
             self.transporter_input.setText(saved_data["transporter_text"])
-        if saved_data.get("transporter_aux_account"):
-            self.transporter_aux_input.setText(saved_data["transporter_aux_account"])
-        if saved_data.get("selected_kundennr"):
-            self.selected_kundennr = saved_data["selected_kundennr"]
+        saved_aux_account = str(saved_data.get("transporter_aux_account") or "").strip()
+        if saved_aux_account:
+            self.transporter_aux_input.setText(saved_aux_account)
+            self._pending_saved_transporter_aux = saved_aux_account
+
+        saved_kundennr = str(
+            saved_data.get("transporter_kundennr")
+            or saved_data.get("selected_kundennr")
+            or ""
+        ).strip()
+        if saved_kundennr:
+            self.selected_kundennr = saved_kundennr
+            self._pending_saved_transporter_aux_kundennr = saved_kundennr
 
         # Dossiers
         folders = saved_data.get("folders") or []
@@ -374,7 +394,14 @@ class MainWindowCoreMixin:
             data = parse_invoice(text)
 
             self.fill_fields(data)
+
+            detected_fields = detect_fields_multilingual(text)
+            if detected_fields:
+                self._merge_detected_fields_without_overwrite(detected_fields)
+
             self.autofill_folder_amounts_from_ocr(text)
+
+
             self.update_folder_totals()
             self.check_bank_information()
             self.load_transporter_information()
@@ -971,12 +998,13 @@ class MainWindowCoreMixin:
 
         # ✅ 1) mettre à jour EN BDD par nom de fichier (crée entry_id si absent)
         sql_error = None
+        final_entry_id = str(current_entry_id or "").strip()
         try:
             pdf_filename = os.path.basename(pdf_path)
             iban_to_save = self.iban_input.text().strip()
             bic_to_save = self.bic_input.text().strip()
             print(f"DEBUG: Saving to DB for {pdf_filename} - IBAN: {iban_to_save}, BIC: {bic_to_save}")
-            self.logmail_repo.update_document_by_filename(
+            returned_entry_id = self.logmail_repo.update_document_by_filename(
                 pdf_filename,
                 entry_id=current_entry_id,  # Peut être vide, la méthode va chercher en BDD
                 invoice_date=self.date_input.text().strip(),
@@ -984,6 +1012,7 @@ class MainWindowCoreMixin:
                 bic=bic_to_save,
                 status=str(status or "").strip().lower() if status else None,
             )
+            final_entry_id = str(returned_entry_id or final_entry_id or "").strip()
             print(f"✅ Métadonnées mises à jour en BDD pour {pdf_filename}")
         except Exception as e:
             # on garde l'erreur mais on continue (les champs lourds restent en fichier)
@@ -1011,26 +1040,49 @@ class MainWindowCoreMixin:
             )
 
         # si on a retrouvé un entry_id, on le garde en mémoire pour la suite
-        if current_entry_id:
-            self.selected_invoice_entry_id = current_entry_id
+        if final_entry_id:
+            self.selected_invoice_entry_id = final_entry_id
+            data["entry_id"] = final_entry_id
 
-        # refresh léger de la ligne dans le tableau gauche
+        # refresh léger de la ligne dans le tableau gauche, sans recharger tout le dossier
         try:
-            if hasattr(self, "_update_left_table_date_iban_bic"):
+            country = ""
+            if hasattr(self, "_get_country_for_document"):
+                country = self._get_country_for_document(
+                    pdf_path,
+                    self.iban_input.text().strip(),
+                    self.bic_input.text().strip(),
+                )
+
+            if final_entry_id and hasattr(self, "_update_left_row_for_entry"):
+                self._update_left_row_for_entry(
+                    final_entry_id,
+                    self.date_input.text().strip(),
+                    self.iban_input.text().strip(),
+                    self.bic_input.text().strip(),
+                    country,
+                )
+            elif hasattr(self, "_update_left_table_date_iban_bic"):
                 self._update_left_table_date_iban_bic(
                     pdf_path,
                     self.date_input.text().strip(),
                     self.iban_input.text().strip(),
                     self.bic_input.text().strip(),
                 )
-        except Exception:
-            pass
 
-        # si un dossier courant est chargé, on peut recharger la liste pour garder les onglets cohérents
-        try:
-            current_folder = str(getattr(self, "current_folder_path", "") or "").strip()
-            if current_folder and os.path.isdir(current_folder):
-                self.load_folder(current_folder)
+            if hasattr(self, "pdf_table") and self.pdf_table is not None and hasattr(self, "refresh_left_row_processing_state"):
+                for row in range(self.pdf_table.rowCount()):
+                    it0 = self.pdf_table.item(row, 0)
+                    if not it0:
+                        continue
+                    row_pdf = it0.data(Qt.UserRole)
+                    row_entry_id = str(it0.data(Qt.UserRole + 4) or "").strip()
+                    if row_pdf == pdf_path or (final_entry_id and row_entry_id == final_entry_id):
+                        self.refresh_left_row_processing_state(row)
+                        break
+
+            if hasattr(self, "apply_left_table_search_filter"):
+                self.apply_left_table_search_filter()
         except Exception:
             pass
 
@@ -1050,14 +1102,11 @@ class MainWindowCoreMixin:
                     5000
                 )
 
-        # ✅ Recharger l'entry_id depuis BDD si on vient de l'assigner
+        # ✅ Synchroniser le JSON si l'entry_id final a été déterminé pendant la sauvegarde
         try:
-            pdf_filename = os.path.basename(pdf_path)
-            db_entry_id = str(self.logmail_repo.get_entry_id_for_file(pdf_filename) or "").strip()
-            if db_entry_id and db_entry_id != current_entry_id:
-                self.selected_invoice_entry_id = db_entry_id
-                # Synchroniser aussi le JSON
-                data["entry_id"] = db_entry_id
+            if final_entry_id and final_entry_id != current_entry_id:
+                self.selected_invoice_entry_id = final_entry_id
+                data["entry_id"] = final_entry_id
                 json_path = self._get_saved_json_path(pdf_path)
                 os.makedirs(os.path.dirname(json_path), exist_ok=True)
                 with open(json_path, "w", encoding="utf-8") as f:
@@ -1124,6 +1173,8 @@ class MainWindowCoreMixin:
             saved_aux = str(data.get("transporter_aux_account") or "").strip()
             if saved_aux and not self.transporter_aux_input.text().strip():
                 self.transporter_aux_input.setText(saved_aux)
+            if saved_aux:
+                self._pending_saved_transporter_aux = saved_aux
 
 
             kundennr = str(
@@ -1134,6 +1185,7 @@ class MainWindowCoreMixin:
 
             self.selected_kundennr = kundennr or None
             self.transporter_selected_mode = bool(self.selected_kundennr)
+            self._pending_saved_transporter_aux_kundennr = kundennr
 
             # restaurer l'affichage tel quel (même si la BDD ne répond pas)
             self.transporter_input.blockSignals(True)
@@ -1348,8 +1400,18 @@ class MainWindowCoreMixin:
             return False
 
         # 2) extraire les données TVA pour apprentissage
-        from ocr.invoice_parser import parse_vat_lines
-        vat_lines = parse_vat_lines(ocr_text)
+        # On privilégie les lignes TVA déjà visibles / corrigées dans l'écran.
+        vat_lines = []
+        if hasattr(self, "get_vat_rows"):
+            for row in (self.get_vat_rows() or []):
+                rate = str((row or {}).get("rate") or "").strip()
+                base = str((row or {}).get("base") or "").strip()
+                vat = str((row or {}).get("vat") or "").strip()
+                if rate or base or vat:
+                    vat_lines.append({"rate": rate, "base": base, "vat": vat})
+        if not vat_lines:
+            from ocr.invoice_parser import parse_vat_lines
+            vat_lines = parse_vat_lines(ocr_text)
 
         # 3) charger l’existant
         existing = load_supplier_model(supplier_key) or {}
