@@ -154,6 +154,9 @@ class MainWindow(
         self.btn_filter_errors = QPushButton("⚠️ Erreurs")
         self.btn_filter_errors.setCheckable(True)
 
+        self.btn_filter_ecart = QPushButton("🟠 Ecarts")
+        self.btn_filter_ecart.setCheckable(True)
+
         # Filtre pays (LKZ) – ne filtre que sur la colonne "Pays"
         self.left_country_filter_input = QLineEdit()
         self.left_country_filter_input.setPlaceholderText("Pays (ex: FR)")
@@ -170,10 +173,12 @@ class MainWindow(
         self._filter_group.addButton(self.btn_filter_pending)
         self._filter_group.addButton(self.btn_filter_validated)
         self._filter_group.addButton(self.btn_filter_errors)
+        self._filter_group.addButton(self.btn_filter_ecart)
 
         filter_bar.addWidget(self.btn_filter_pending)
         filter_bar.addWidget(self.btn_filter_validated)
         filter_bar.addWidget(self.btn_filter_errors)
+        filter_bar.addWidget(self.btn_filter_ecart)
         filter_bar.addStretch(1)
 
         left_layout.addLayout(filter_bar)
@@ -181,6 +186,7 @@ class MainWindow(
         self.btn_filter_pending.clicked.connect(lambda: self.set_left_filter("pending"))
         self.btn_filter_validated.clicked.connect(lambda: self.set_left_filter("validated"))
         self.btn_filter_errors.clicked.connect(lambda: self.set_left_filter("errors"))
+        self.btn_filter_ecart.clicked.connect(lambda: self.set_left_filter("ecart"))
 
         self.left_search_input = QLineEdit()
         self.left_search_input.setPlaceholderText("🔎 Rechercher fichier / date / IBAN / BIC…")

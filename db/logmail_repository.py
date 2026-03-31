@@ -381,7 +381,8 @@ class LogmailRepository(BaseRepository):
             WHERE entry_id = ?
         """
         row = self.fetch_one(query, (entry_id,))
-        return str((row or {}).get("processing_status") or "pending").strip().lower()
+        status = str((row or {}).get("processing_status") or "pending").strip().lower()
+        return "ecart" if status == "eccarts" else status
 
 
     def get_processing_status_map_for_entries(self, entry_ids: list[str]) -> dict[str, str]:
@@ -408,7 +409,7 @@ class LogmailRepository(BaseRepository):
                 entry_id = str(r.get("entry_id") or "").strip()
                 status = str(r.get("processing_status") or "pending").strip().lower()
                 if entry_id:
-                    out[entry_id] = status or "pending"
+                    out[entry_id] = ("ecart" if status == "eccarts" else status) or "pending"
 
         return out
 
@@ -416,10 +417,12 @@ class LogmailRepository(BaseRepository):
     def set_processing_status_for_entry(self, entry_id: str, status: str) -> None:
         entry_id = str(entry_id or "").strip()
         status = str(status or "").strip().lower()
+        if status == "eccarts":
+            status = "ecart"
 
         if not entry_id:
             return
-        if status not in {"pending", "validated", "error"}:
+        if status not in {"pending", "validated", "error", "ecart"}:
             raise ValueError(f"Statut invalide: {status}")
 
         query = """
@@ -470,8 +473,11 @@ class LogmailRepository(BaseRepository):
             set_parts.append("bic = ?")
             params.append(str(bic).strip())
         if status is not None:
+            normalized_status = str(status or "").strip().lower()
+            if normalized_status == "eccarts":
+                normalized_status = "ecart"
             set_parts.append("processing_status = ?")
-            params.append(str(status or "").strip().lower())
+            params.append(normalized_status)
 
         if not set_parts:
             return final_entry_id
@@ -499,7 +505,7 @@ class LogmailRepository(BaseRepository):
         Les autres vues gardent le tri historique sur date_creation ASC.
         """
         status = str(status or "pending").strip().lower()
-        if status not in {"pending", "validated", "error"}:
+        if status not in {"pending", "validated", "error", "ecart"}:
             status = "pending"
 
         top_clause = ""
@@ -513,7 +519,10 @@ class LogmailRepository(BaseRepository):
                 SELECT
                     entry_id,
                     nom_pdf,
-                    processing_status,
+                    CASE
+                        WHEN LTRIM(RTRIM(COALESCE(processing_status, 'pending'))) = 'eccarts' THEN 'ecart'
+                        ELSE LTRIM(RTRIM(COALESCE(processing_status, 'pending')))
+                    END AS processing_status,
                     invoice_date,
                     iban,
                     bic,
@@ -527,7 +536,10 @@ class LogmailRepository(BaseRepository):
                     ) AS rn
                 FROM dbo.XXA_LOGMAIL_228794
                 WHERE LTRIM(RTRIM(COALESCE(nom_pdf, ''))) <> ''
-                AND LTRIM(RTRIM(COALESCE(processing_status, 'pending'))) = ?
+                AND CASE
+                        WHEN LTRIM(RTRIM(COALESCE(processing_status, 'pending'))) = 'eccarts' THEN 'ecart'
+                        ELSE LTRIM(RTRIM(COALESCE(processing_status, 'pending')))
+                    END = ?
             )
             SELECT {top_clause}
                 entry_id,
@@ -616,8 +628,11 @@ class LogmailRepository(BaseRepository):
         ]
 
         if status is not None:
+            normalized_status = str(status or "").strip().lower()
+            if normalized_status == "eccarts":
+                normalized_status = "ecart"
             set_parts.append("processing_status = ?")
-            params.append(str(status or "").strip().lower())
+            params.append(normalized_status)
 
         params.append(entry_id)
 

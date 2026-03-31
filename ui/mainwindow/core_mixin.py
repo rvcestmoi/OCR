@@ -469,7 +469,7 @@ class MainWindowCoreMixin:
             if pdf_path:
                 data = self._read_saved_invoice_json(pdf_path) or {}
                 json_status = str(data.get("status") or "").strip().lower()
-                if json_status in {"pending", "validated", "error"}:
+                if json_status in {"pending", "validated", "error", "ecart"}:
                     return json_status
         except Exception:
             pass
@@ -478,12 +478,12 @@ class MainWindowCoreMixin:
             entry_id = str(self._resolve_current_entry_id() or "").strip()
             if entry_id:
                 sql_status = str(self.logmail_repo.get_processing_status_for_entry(entry_id) or "").strip().lower()
-                if sql_status in {"pending", "validated", "error"}:
+                if sql_status in {"pending", "validated", "error", "ecart"}:
                     return sql_status
         except Exception:
             pass
 
-        return status if status in {"pending", "validated", "error"} else "pending"
+        return status if status in {"pending", "validated", "error", "ecart"} else "pending"
 
     def _auto_save_after_ocr(self) -> bool:
         if not getattr(self, "current_pdf_path", None):
@@ -949,7 +949,10 @@ class MainWindowCoreMixin:
 
         # met à jour uniquement les champs utiles
         data["entry_id"] = current_entry_id
-        data["status"] = str(status or "draft").strip().lower()
+        normalized_status = str(status or "draft").strip().lower()
+        if normalized_status == "eccarts":
+            normalized_status = "ecart"
+        data["status"] = normalized_status
         data["iban"] = self.iban_input.text().strip()
         data["bic"] = self.bic_input.text().strip()
         data["invoice_date"] = self.date_input.text().strip()

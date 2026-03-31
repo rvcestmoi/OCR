@@ -389,6 +389,8 @@ class MainWindowDocumentsMixin:
         mode = str(getattr(self, "left_filter_mode", "pending") or "pending").strip().lower()
         if mode == "errors":
             sql_status = "error"
+        elif mode == "ecart":
+            sql_status = "ecart"
         else:
             sql_status = mode
 
@@ -398,6 +400,7 @@ class MainWindowDocumentsMixin:
         max_pages_pending = int(get_ui_value(settings, "max_pages_pending", 100))
         max_pages_error = int(get_ui_value(settings, "max_pages_error", 50))
         max_pages_validated = int(get_ui_value(settings, "max_pages_validated", 200))
+        max_pages_ecart = int(get_ui_value(settings, "max_pages_ecart", max_pages_error))
 
         # Déterminer la limite selon le mode
         if sql_status == "pending":
@@ -406,6 +409,8 @@ class MainWindowDocumentsMixin:
             limit = max_pages_error
         elif sql_status == "validated":
             limit = max_pages_validated
+        elif sql_status == "ecart":
+            limit = max_pages_ecart
         else:
             limit = None
 
@@ -462,7 +467,7 @@ class MainWindowDocumentsMixin:
                     rep_path,
                     entry_id,
                     group_paths,
-                    str(r.get("processing_status") or "pending").strip().lower(),
+                    ("ecart" if str(r.get("processing_status") or "pending").strip().lower() == "eccarts" else str(r.get("processing_status") or "pending").strip().lower()),
                     str(r.get("invoice_date") or "").strip(),
                     str(r.get("iban") or "").strip(),
                     str(r.get("bic") or "").strip(),
@@ -733,6 +738,8 @@ class MainWindowDocumentsMixin:
                 continue
 
             status = str(it0.data(Qt.UserRole + 1) or "pending").strip().lower()
+            if status == "eccarts":
+                status = "ecart"
 
             # 1) filtre statut
             if mode == "pending":
@@ -741,7 +748,8 @@ class MainWindowDocumentsMixin:
                 status_visible = (status == "validated")
             elif mode == "errors":
                 status_visible = (status == "error")
-
+            elif mode == "ecart":
+                status_visible = (status == "ecart")
             else:
                 status_visible = True
 

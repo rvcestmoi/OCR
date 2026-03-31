@@ -236,11 +236,17 @@ class MainWindowValidationMixin:
 
 
 
-        # 7) Recharge le pool "En attente"
+        # 7) Après validation d'un document provenant des écarts,
+        #    revenir automatiquement sur le filtre En attente.
         try:
             current_folder = getattr(self, "current_folder_path", None)
             if current_folder and os.path.isdir(current_folder):
-                self.load_folder(current_folder)
+                previous_filter = str(getattr(self, "left_filter_mode", "pending") or "pending").strip().lower()
+
+                if previous_filter == "ecart":
+                    self.set_left_filter("pending")
+                else:
+                    self.load_folder(current_folder)
 
                 if self.pdf_table.rowCount() > 0:
                     self.pdf_table.selectRow(0)
@@ -906,14 +912,28 @@ class MainWindowValidationMixin:
             tour_bad, ocr_bad, ws_bad = invalid[0]
             ws_txt = "" if ws_bad is None else f"{float(ws_bad):.2f}"
 
-            QMessageBox.warning(
+            resp = QMessageBox.question(
                 self,
                 "Validation impossible",
                 "Le montant HT OCR ne correspond pas au montant HT de la tournée Winsped.\n\n"
                 f"Montant HT OCR : {ocr_bad}\n"
                 f"Montant HT Winsped : {ws_txt or '(inconnu)'}\n"
-                f"pour la tournée {tour_bad}"
+                f"pour la tournée {tour_bad}\n\n"
+                "Voulez vous transferer cette facture vers les Ecarts ?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
             )
+
+            if resp == QMessageBox.Yes:
+                self._mark_current_entry_as_ecart(
+                    reason="ht_amount_mismatch",
+                    extra={
+                        "ecart_tour_nr": str(tour_bad or "").strip(),
+                        "ecart_amount_ht_ocr": str(ocr_bad or "").strip(),
+                        "ecart_amount_ht_winsped": ws_txt or "",
+                    },
+                )
+
             return False
 
         return True
@@ -1144,6 +1164,34 @@ class MainWindowValidationMixin:
             except Exception:
                 pass
 
+
+    def _mark_current_entry_as_ecart(self, reason: str = "ht_amount_mismatch", extra: dict | None = None) -> None:
+        """Met l'entrée dans le listing Ecarts + trace dans le JSON."""
+        try:
+            self.save_current_data(status="ecart", show_message=False)
+        except Exception:
+            pass
+
+        payload = {"ecart_reason": reason} if reason else {}
+        if extra:
+            payload.update(extra)
+
+        self._add_tag_to_current_json("ecart", extra=payload or None)
+
+        try:
+            self.set_left_filter("ecart")
+        except Exception:
+            try:
+                self.load_folder(self.current_folder_path)
+            except Exception:
+                pass
+
+
+
+
+    def _mark_current_entry_as_eccarts(self, reason: str = "ht_amount_mismatch", extra: dict | None = None) -> None:
+        """Compat ancien nom : redirige vers le statut ecart."""
+        self._mark_current_entry_as_ecart(reason=reason, extra=extra)
 
     def _maybe_prompt_duplicate_invoice(self) -> bool:
         """Vérifie XXARe et propose de mettre en erreur si doublon.
