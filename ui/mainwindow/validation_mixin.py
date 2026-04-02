@@ -8,6 +8,42 @@ from .workers import LinkDownloadWorker, LinkPostProcessWorker, _DownloadCancele
 
 class MainWindowValidationMixin:
 
+    def _get_validation_document_path(self) -> str | None:
+        candidates: list[str] = []
+
+        view_path = str(getattr(self, "view_pdf_path", "") or "").strip()
+        if view_path and os.path.isfile(view_path):
+            candidates.append(view_path)
+
+        try:
+            group_paths = [
+                str(p or "").strip()
+                for p in (getattr(self, "entry_pdf_paths", []) or [])
+                if str(p or "").strip() and os.path.isfile(str(p or "").strip())
+            ]
+            if group_paths:
+                rep = ""
+                if hasattr(self, "_choose_representative_pdf"):
+                    rep = str(self._choose_representative_pdf(group_paths) or "").strip()
+                if rep and os.path.isfile(rep):
+                    candidates.append(rep)
+        except Exception:
+            pass
+
+        current_path = str(getattr(self, "current_pdf_path", "") or "").strip()
+        if current_path and os.path.isfile(current_path):
+            candidates.append(current_path)
+
+        seen = set()
+        for candidate in candidates:
+            abs_candidate = os.path.abspath(candidate)
+            if abs_candidate in seen:
+                continue
+            seen.add(abs_candidate)
+            return candidate
+
+        return None
+
     def on_validate_invoice(self):
         if self._is_typing_in_input():
             return
@@ -116,7 +152,9 @@ class MainWindowValidationMixin:
             return
 
         # 1) Toujours re-sauvegarder AVANT les updates SQL
-        self.save_current_data(status="validated", show_message=False)
+        validation_pdf_path = self._get_validation_document_path() or str(getattr(self, "current_pdf_path", "") or "").strip()
+        self._last_validation_invoice_pdf_path = validation_pdf_path
+        self.save_current_data(status="validated", show_message=False, pdf_path=validation_pdf_path)
 
         aux_update_error = ""
         kundennr_for_aux = str(getattr(self, "selected_kundennr", "") or "").strip()
@@ -175,7 +213,7 @@ class MainWindowValidationMixin:
         dms_path = ""
         dms_error = ""
         try:
-            dms_path = self._copy_validated_pdf_to_dms()
+            dms_path = self._copy_validated_pdf_to_dms(pdf_path=validation_pdf_path)
         except Exception as e:
             dms_error = str(e)
 
@@ -938,8 +976,8 @@ class MainWindowValidationMixin:
 
         return True
     
-    def _copy_validated_pdf_to_dms(self):
-        pdf_path = str(getattr(self, "current_pdf_path", "") or "").strip()
+    def _copy_validated_pdf_to_dms(self, pdf_path: str | None = None):
+        pdf_path = str(pdf_path or getattr(self, "current_pdf_path", "") or "").strip()
         if not pdf_path or not os.path.isfile(pdf_path):
             raise FileNotFoundError("PDF courant introuvable.")
 
@@ -1017,7 +1055,7 @@ class MainWindowValidationMixin:
             if str(r.get("tour_nr") or "").strip()
         })
 
-        invoice_path = str(getattr(self, "current_pdf_path", "") or "").strip()
+        invoice_path = str(getattr(self, "_last_validation_invoice_pdf_path", "") or self._get_validation_document_path() or getattr(self, "current_pdf_path", "") or "").strip()
         invoice_path_copied = str(self._dms_copied_paths.get(os.path.abspath(invoice_path), invoice_path) or "").strip()
 
         for tour_nr in invoice_tours:
@@ -1115,12 +1153,13 @@ class MainWindowValidationMixin:
         return invoice_nr, kundennr
 
 
-    def _add_tag_to_current_json(self, tag: str, extra: dict | None = None) -> None:
+    def _add_tag_to_current_json(self, tag: str, extra: dict | None = None, pdf_path: str | None = None) -> None:
         """Ajoute un tag dans le JSON du document courant (sans écraser le reste)."""
-        if not self.current_pdf_path:
+        target_pdf_path = str(pdf_path or self._get_validation_document_path() or getattr(self, "current_pdf_path", "") or "").strip()
+        if not target_pdf_path:
             return
         try:
-            json_path = self._get_saved_json_path(self.current_pdf_path)
+            json_path = self._get_saved_json_path(target_pdf_path)
             if not os.path.exists(json_path):
                 return
             with open(json_path, "r", encoding="utf-8") as f:
@@ -1149,11 +1188,11 @@ class MainWindowValidationMixin:
         """Met l'entrée en ERROR (listing erreurs) + trace dans le JSON."""
         try:
             # status=error => update SQL (processing_status) + JSON
-            self.save_current_data(status="error", show_message=False)
+            self.save_current_data(status="error", show_message=False, pdf_path=self._get_validation_document_path())
         except Exception:
             pass
 
-        self._add_tag_to_current_json("duplicate_invoice", extra={"error_reason": reason} if reason else None)
+        self._add_tag_to_current_json("duplicate_invoice", extra={"error_reason": reason} if reason else None, pdf_path=self._get_validation_document_path())
 
         # refresh + se placer sur l'onglet erreurs
         try:
@@ -1168,7 +1207,7 @@ class MainWindowValidationMixin:
     def _mark_current_entry_as_ecart(self, reason: str = "ht_amount_mismatch", extra: dict | None = None) -> None:
         """Met l'entrée dans le listing Ecarts + trace dans le JSON."""
         try:
-            self.save_current_data(status="ecart", show_message=False)
+            self.save_current_data(status="ecart", show_message=False, pdf_path=self._get_validation_document_path())
         except Exception:
             pass
 
@@ -1176,7 +1215,7 @@ class MainWindowValidationMixin:
         if extra:
             payload.update(extra)
 
-        self._add_tag_to_current_json("ecart", extra=payload or None)
+        self._add_tag_to_current_json("ecart", extra=payload or None, pdf_path=self._get_validation_document_path())
 
         try:
             self.set_left_filter("ecart")

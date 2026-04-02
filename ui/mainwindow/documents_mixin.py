@@ -461,6 +461,17 @@ class MainWindowDocumentsMixin:
             if not group_paths:
                 group_paths = [rep_path]
 
+            try:
+                chosen_rep = ""
+                if hasattr(self, "_choose_representative_pdf"):
+                    chosen_rep = str(self._choose_representative_pdf(group_paths) or "").strip()
+                if chosen_rep and os.path.exists(chosen_rep):
+                    rep_path = chosen_rep
+                    stored_filename = os.path.basename(rep_path)
+                    display_filename = format_left_table_filename(stored_filename)
+            except Exception:
+                pass
+
             rows_to_add.append(
                 (
                     display_filename,

@@ -453,7 +453,7 @@ class MainWindowCoreMixin:
                 self.analyze_pdf_deep(document_path=document_path, auto_save=False)
 
             if auto_save:
-                self._auto_save_after_ocr()
+                self._auto_save_after_ocr(pdf_path=active_doc_path)
             else:
                 self.statusBar().showMessage("OCR terminé.", 3000)
         except Exception as e:
@@ -461,11 +461,11 @@ class MainWindowCoreMixin:
         if show_message:
             QMessageBox.information(...)
 
-    def _get_existing_status_for_current_pdf(self, default: str = "pending") -> str:
+    def _get_existing_status_for_current_pdf(self, default: str = "pending", pdf_path: str | None = None) -> str:
         status = str(default or "pending").strip().lower()
 
         try:
-            pdf_path = str(getattr(self, "current_pdf_path", "") or "").strip()
+            pdf_path = str(pdf_path or getattr(self, "current_pdf_path", "") or "").strip()
             if pdf_path:
                 data = self._read_saved_invoice_json(pdf_path) or {}
                 json_status = str(data.get("status") or "").strip().lower()
@@ -485,16 +485,17 @@ class MainWindowCoreMixin:
 
         return status if status in {"pending", "validated", "error", "ecart"} else "pending"
 
-    def _auto_save_after_ocr(self) -> bool:
-        if not getattr(self, "current_pdf_path", None):
+    def _auto_save_after_ocr(self, pdf_path: str | None = None) -> bool:
+        target_pdf_path = str(pdf_path or getattr(self, "current_pdf_path", "") or "").strip()
+        if not target_pdf_path:
             return False
 
-        status_to_keep = self._get_existing_status_for_current_pdf(default="pending")
-        ok = self.save_current_data(status=status_to_keep, show_message=False)
+        status_to_keep = self._get_existing_status_for_current_pdf(default="pending", pdf_path=target_pdf_path)
+        ok = self.save_current_data(status=status_to_keep, show_message=False, pdf_path=target_pdf_path)
 
         if ok:
             try:
-                self._set_left_row_status(self.current_pdf_path, status_to_keep)
+                self._set_left_row_status(target_pdf_path, status_to_keep)
             except Exception:
                 pass
             self.statusBar().showMessage("OCR terminé et sauvegardé.", 3000)
@@ -601,7 +602,7 @@ class MainWindowCoreMixin:
 
             self.highlight_missing_fields()
             if auto_save:
-                self._auto_save_after_ocr()
+                self._auto_save_after_ocr(pdf_path=active_doc_path)
             else:
                 self.statusBar().showMessage("OCR profond terminé.", 4000)
         except _DownloadCanceled:
@@ -910,13 +911,14 @@ class MainWindowCoreMixin:
 
 
 
-    def save_current_data(self, status: str = "draft", show_message: bool = True):
-        if not self.current_pdf_path:
+    def save_current_data(self, status: str = "draft", show_message: bool = True, pdf_path: str | None = None):
+        target_pdf_path = str(pdf_path or getattr(self, "current_pdf_path", "") or "").strip()
+        if not target_pdf_path:
             if show_message:
                 QMessageBox.warning(self, "Sauvegarde", "Aucun document sélectionné.")
             return False
 
-        pdf_path = str(self.current_pdf_path).strip()
+        pdf_path = target_pdf_path
         if not pdf_path:
             if show_message:
                 QMessageBox.warning(self, "Sauvegarde", "Chemin de document invalide.")
@@ -925,7 +927,7 @@ class MainWindowCoreMixin:
         json_path = self._get_saved_json_path(pdf_path)
 
         # retrouve l'entry_id même si selected_invoice_entry_id n'est pas rempli
-        current_entry_id = self._resolve_current_entry_id()
+        current_entry_id = self._resolve_current_entry_id(pdf_path)
 
         # relit l'existant pour ne rien perdre
         try:
@@ -1576,7 +1578,7 @@ class MainWindowCoreMixin:
         self.refresh_left_table_processing_claims()
 
 
-    def _resolve_current_entry_id(self) -> str:
+    def _resolve_current_entry_id(self, pdf_path: str | None = None) -> str:
         """
         Retrouve l'entry_id courant de façon robuste.
         Priorité :
@@ -1584,7 +1586,7 @@ class MainWindowCoreMixin:
         2) entry_id déjà présent dans le JSON du document courant
         3) selected_invoice_entry_id (fallback UI)
         """
-        pdf_path = str(getattr(self, "current_pdf_path", "") or "").strip()
+        pdf_path = str(pdf_path or getattr(self, "current_pdf_path", "") or "").strip()
 
         if pdf_path:
             try:
