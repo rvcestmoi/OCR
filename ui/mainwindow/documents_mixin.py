@@ -386,6 +386,9 @@ class MainWindowDocumentsMixin:
         self.current_folder_path = folder
         self.pdf_table.setRowCount(0)
 
+        current_search_query = self._get_left_search_query()
+        self._loaded_left_search_query = current_search_query
+
         mode = str(getattr(self, "left_filter_mode", "pending") or "pending").strip().lower()
         if mode == "errors":
             sql_status = "error"
@@ -727,6 +730,30 @@ class MainWindowDocumentsMixin:
         cache[key] = lkz
         return lkz
     
+
+    def _get_left_search_query(self) -> str:
+        widget = getattr(self, "left_search_input", None)
+        if widget is None:
+            return ""
+        return str(widget.text() or "").strip()
+
+    def on_left_search_text_changed(self, _text: str):
+        """Relance le chargement depuis SQL pour chercher aussi dans les lignes non chargées."""
+        timer = getattr(self, "_left_search_reload_timer", None)
+        if timer is None:
+            timer = QTimer(self)
+            timer.setSingleShot(True)
+            timer.timeout.connect(self._reload_left_table_for_search)
+            self._left_search_reload_timer = timer
+
+        timer.start(250)
+
+    def _reload_left_table_for_search(self):
+        current_folder = str(getattr(self, "current_folder_path", "") or "").strip()
+        if current_folder and os.path.isdir(current_folder):
+            self.load_folder(current_folder)
+        else:
+            self.apply_left_table_search_filter()
 
     def apply_left_table_search_filter(self):
         """Filtre combiné (statut + recherche globale + filtre pays)."""

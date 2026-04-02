@@ -97,6 +97,11 @@ class MainWindow(
         self.setCentralWidget(central_widget)
         main_layout = QHBoxLayout(central_widget)
 
+        self.main_splitter = QSplitter(Qt.Horizontal)
+        self.main_splitter.setChildrenCollapsible(False)
+        self.main_splitter.setHandleWidth(8)
+        main_layout.addWidget(self.main_splitter)
+
         # =========================
         # Panneau gauche (splitter)
         # =========================
@@ -190,7 +195,7 @@ class MainWindow(
 
         self.left_search_input = QLineEdit()
         self.left_search_input.setPlaceholderText("🔎 Rechercher fichier / date / IBAN / BIC…")
-        self.left_search_input.textChanged.connect(self.apply_left_table_search_filter)
+        self.left_search_input.textChanged.connect(self.on_left_search_text_changed)
         left_layout.addWidget(self.left_search_input)
 
         left_layout.addWidget(self.pdf_table)
@@ -218,7 +223,7 @@ class MainWindow(
         left_splitter.setStretchFactor(1, 2)
 
         left_root_layout.addWidget(left_splitter)
-        main_layout.addWidget(left_widget, 2)    
+        left_widget.setMinimumWidth(260)
 
 
         left_bottom_widget = QWidget()
@@ -243,7 +248,9 @@ class MainWindow(
         # =========================
         # Panneau central (PDF)
         # =========================
-        center_panel = QVBoxLayout()
+        center_widget = QWidget()
+        center_widget.setMinimumWidth(360)
+        center_panel = QVBoxLayout(center_widget)
 
         # --- Barre navigation PDF (docs + pages) ---
         pdf_nav = QHBoxLayout()
@@ -350,7 +357,9 @@ class MainWindow(
         # =========================
         # Panneau droit (form)
         # =========================
-        right_panel = QVBoxLayout()
+        right_widget = QWidget()
+        right_widget.setMinimumWidth(320)
+        right_panel = QVBoxLayout(right_widget)
         form_layout = QFormLayout()
 
         self.iban_input = QLineEdit()
@@ -538,9 +547,14 @@ class MainWindow(
         right_panel.addWidget(self.btn_analyze_pdf)
         right_panel.addWidget(self.btn_deep_ocr)
 
-        # Layout global
-        main_layout.addLayout(center_panel, 5)
-        main_layout.addLayout(right_panel, 3)
+        # Layout global via splitter horizontal
+        self.main_splitter.addWidget(left_widget)
+        self.main_splitter.addWidget(center_widget)
+        self.main_splitter.addWidget(right_widget)
+        self.main_splitter.setStretchFactor(0, 3)
+        self.main_splitter.setStretchFactor(1, 5)
+        self.main_splitter.setStretchFactor(2, 4)
+        self.main_splitter.setSizes([320, 520, 420])
 
         # Champs cliquables
         for field in [self.iban_input, self.bic_input, self.date_input, self.invoice_number_input]:

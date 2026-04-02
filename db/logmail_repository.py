@@ -495,7 +495,13 @@ class LogmailRepository(BaseRepository):
         return final_entry_id
 
 
-    def get_document_rows_for_folder(self, folder_path: str, status: str, limit: int | None = None) -> list[dict]:
+    def get_document_rows_for_folder(
+        self,
+        folder_path: str,
+        status: str,
+        limit: int | None = None,
+        search_query: str | None = None,
+    ) -> list[dict]:
         """
         Retourne les lignes groupées par entry_id pour alimenter le tableau de gauche.
         Le disque sert ensuite uniquement à vérifier que le fichier existe.
@@ -503,16 +509,36 @@ class LogmailRepository(BaseRepository):
         Pour la vue "pending", le tri se fait sur date_mail ASC.
         Fallback sur date_creation si date_mail est NULL ou non convertible.
         Les autres vues gardent le tri historique sur date_creation ASC.
+
+        Si `search_query` est renseigné, la recherche s'applique côté SQL sur
+        l'ensemble des lignes du statut demandé (et pas seulement sur les lignes
+        déjà limitées/chargées dans l'UI).
         """
         status = str(status or "pending").strip().lower()
         if status not in {"pending", "validated", "error", "ecart"}:
             status = "pending"
 
+        normalized_search = str(search_query or "").strip()
+
         top_clause = ""
-        if limit is not None and int(limit) > 0:
+        if limit is not None and int(limit) > 0 and not normalized_search:
             top_clause = f"TOP {int(limit)}"
 
         sort_expr = "COALESCE(TRY_CONVERT(datetime2, date_mail), date_creation)" if status == "pending" else "date_creation"
+
+        params: list[str] = [status]
+        search_filter_sql = ""
+        if normalized_search:
+            like_value = f"%{normalized_search.upper()}%"
+            params.extend([like_value, like_value, like_value, like_value])
+            search_filter_sql = """
+                AND (
+                    UPPER(COALESCE(nom_pdf, '')) LIKE ?
+                    OR UPPER(COALESCE(CONVERT(varchar(50), invoice_date), '')) LIKE ?
+                    OR UPPER(COALESCE(iban, '')) LIKE ?
+                    OR UPPER(COALESCE(bic, '')) LIKE ?
+                )
+            """
 
         query = f"""
             ;WITH base AS (
@@ -540,6 +566,7 @@ class LogmailRepository(BaseRepository):
                         WHEN LTRIM(RTRIM(COALESCE(processing_status, 'pending'))) = 'eccarts' THEN 'ecart'
                         ELSE LTRIM(RTRIM(COALESCE(processing_status, 'pending')))
                     END = ?
+                {search_filter_sql}
             )
             SELECT {top_clause}
                 entry_id,
@@ -556,7 +583,7 @@ class LogmailRepository(BaseRepository):
             ORDER BY {sort_expr} ASC,
                      nom_pdf ASC
         """
-        return self.fetch_all(query, (status,)) or []
+        return self.fetch_all(query, tuple(params)) or []
     
 
     def get_files_for_entry(self, entry_id: str) -> list[dict]:
