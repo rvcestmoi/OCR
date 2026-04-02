@@ -37,15 +37,57 @@ class MainWindowTransportTablesMixin:
         self.pdf_viewer.next_page()
         self.update_page_indicator()
 
+    def on_zoom_in(self):
+        self.pdf_viewer.zoom_in()
+        self.update_view_indicator()
+
+    def on_zoom_out(self):
+        self.pdf_viewer.zoom_out()
+        self.update_view_indicator()
+
+    def on_fit_width(self):
+        self.pdf_viewer.fit_to_width()
+        self.update_view_indicator()
+
+    def on_rotate_left(self):
+        self.pdf_viewer.rotate_left()
+        self.update_view_indicator()
+
+    def on_rotate_right(self):
+        self.pdf_viewer.rotate_right()
+        self.update_view_indicator()
+
+    def update_view_indicator(self):
+        if not hasattr(self, "lbl_view_info"):
+            return
+
+        try:
+            zoom = int(self.pdf_viewer.get_zoom_percent())
+        except Exception:
+            zoom = 100
+
+        try:
+            rotation = int(self.pdf_viewer.rotation_degrees())
+        except Exception:
+            rotation = 0
+
+        self.lbl_view_info.setText(f"{zoom}% · {rotation}°")
+
     def update_page_indicator(self):
         total = self.pdf_viewer.page_count()
         if total == 0:
             self.lbl_page_info.setText("0 / 0")
+            if hasattr(self, "btn_prev_page"):
+                self.btn_prev_page.setEnabled(False)
+            if hasattr(self, "btn_next_page"):
+                self.btn_next_page.setEnabled(False)
+            self.update_view_indicator()
             return
         current = self.pdf_viewer.current_page_index() + 1
         self.lbl_page_info.setText(f"Page {current} / {total}")
         self.btn_prev_page.setEnabled(current > 1)
         self.btn_next_page.setEnabled(current < total)
+        self.update_view_indicator()
 
     def load_related_pdfs(self):
         self.related_pdf_table.setRowCount(0)

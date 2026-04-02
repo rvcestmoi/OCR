@@ -273,8 +273,25 @@ class MainWindow(
         self.btn_next_page = QPushButton("⏭")
         self.lbl_page_info = QLabel("Page 0 / 0")
 
+        self.btn_zoom_out = QPushButton("➖")
+        self.btn_zoom_out.setToolTip("Zoom arrière")
+        self.btn_fit_width = QPushButton("↔ Ajuster")
+        self.btn_fit_width.setToolTip("Ajuster à la largeur")
+        self.btn_zoom_in = QPushButton("➕")
+        self.btn_zoom_in.setToolTip("Zoom avant")
+        self.btn_rotate_left = QPushButton("↺")
+        self.btn_rotate_left.setToolTip("Rotation gauche")
+        self.btn_rotate_right = QPushButton("↻")
+        self.btn_rotate_right.setToolTip("Rotation droite")
+        self.lbl_view_info = QLabel("100% · 0°")
+
         self.btn_prev_page.clicked.connect(self.on_prev_page)
         self.btn_next_page.clicked.connect(self.on_next_page)
+        self.btn_zoom_out.clicked.connect(self.on_zoom_out)
+        self.btn_fit_width.clicked.connect(self.on_fit_width)
+        self.btn_zoom_in.clicked.connect(self.on_zoom_in)
+        self.btn_rotate_left.clicked.connect(self.on_rotate_left)
+        self.btn_rotate_right.clicked.connect(self.on_rotate_right)
 
         pdf_nav.addStretch()
         pdf_nav.addWidget(self.btn_prev_doc)
@@ -292,6 +309,15 @@ class MainWindow(
         pdf_nav.addWidget(self.btn_prev_page)
         pdf_nav.addWidget(self.lbl_page_info)
         pdf_nav.addWidget(self.btn_next_page)
+
+        pdf_nav.addSpacing(12)
+        pdf_nav.addWidget(self.btn_zoom_out)
+        pdf_nav.addWidget(self.btn_fit_width)
+        pdf_nav.addWidget(self.btn_zoom_in)
+        pdf_nav.addSpacing(8)
+        pdf_nav.addWidget(self.btn_rotate_left)
+        pdf_nav.addWidget(self.btn_rotate_right)
+        pdf_nav.addWidget(self.lbl_view_info)
         pdf_nav.addStretch()
 
         center_panel.addLayout(pdf_nav)
@@ -301,6 +327,7 @@ class MainWindow(
         self.pdf_viewer.setMinimumSize(400, 400)
         self.pdf_viewer.text_selected.connect(self.fill_active_field)
         self.pdf_viewer.text_selected.connect(self.append_ocr_text)
+        self.pdf_viewer.view_changed.connect(self.update_view_indicator)
         center_panel.addWidget(self.pdf_viewer)
 
         # --- Clic droit sur la zone PDF ---
@@ -478,6 +505,18 @@ class MainWindow(
         self.shortcut_save_supplier = QShortcut(QKeySequence("Ctrl+M"), self)
         self.shortcut_save_supplier.setContext(Qt.ApplicationShortcut)
         self.shortcut_save_supplier.activated.connect(self.on_ctrl_m_save_supplier_model)
+
+        self.shortcut_zoom_in = QShortcut(QKeySequence.ZoomIn, self)
+        self.shortcut_zoom_in.setContext(Qt.ApplicationShortcut)
+        self.shortcut_zoom_in.activated.connect(self.on_zoom_in)
+
+        self.shortcut_zoom_out = QShortcut(QKeySequence.ZoomOut, self)
+        self.shortcut_zoom_out.setContext(Qt.ApplicationShortcut)
+        self.shortcut_zoom_out.activated.connect(self.on_zoom_out)
+
+        self.shortcut_fit_width = QShortcut(QKeySequence("Ctrl+0"), self)
+        self.shortcut_fit_width.setContext(Qt.ApplicationShortcut)
+        self.shortcut_fit_width.activated.connect(self.on_fit_width)
 
         self.btn_validate = QPushButton("✅ Valider la facture (V)")
         self.btn_validate.clicked.connect(self.on_validate_invoice)
