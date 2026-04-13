@@ -9,6 +9,18 @@ class LogmailRepository(BaseRepository):
     Accès à la table XXA_LOGMAIL_228794
     """
 
+    def get_latest_mail_date(self):
+        """
+        Récupère la dernière date_mail connue dans XXA_LOGMAIL_228794.
+        """
+        query = """
+            SELECT TOP 1 date_mail
+            FROM XXA_LOGMAIL_228794
+            ORDER BY id_log DESC
+        """
+        row = self.fetch_one(query)
+        return row["date_mail"] if row else None
+
     def get_sender_for_entry_id(self, entry_id: str) -> str | None:
         """
         Récupère l'expéditeur pour un entry_id donné.
@@ -607,6 +619,85 @@ class LogmailRepository(BaseRepository):
         """
         return self.fetch_all(query, (entry_id,)) or []
     
+
+    def get_document_rows_for_entries(
+        self,
+        entry_ids: list[str],
+        status: str | None = None,
+    ) -> list[dict]:
+        """
+        Retourne les lignes représentatives (1 ligne par entry_id) pour une liste
+        d'entry_id donnée. Utile pour compléter la recherche de gauche avec des
+        résultats trouvés hors du pool actuellement chargé.
+        """
+        clean_ids = [str(e or "").strip() for e in (entry_ids or []) if str(e or "").strip()]
+        if not clean_ids:
+            return []
+
+        normalized_status = str(status or "").strip().lower()
+        if normalized_status == "eccarts":
+            normalized_status = "ecart"
+        if normalized_status and normalized_status not in {"pending", "validated", "error", "ecart"}:
+            normalized_status = ""
+
+        rows_out: list[dict] = []
+        chunk_size = 200
+
+        for i in range(0, len(clean_ids), chunk_size):
+            chunk = clean_ids[i:i + chunk_size]
+            placeholders = ",".join(["?"] * len(chunk))
+            params: list[str] = list(chunk)
+            status_sql = ""
+            if normalized_status:
+                status_sql = """
+                    AND CASE
+                            WHEN LTRIM(RTRIM(COALESCE(processing_status, 'pending'))) = 'eccarts' THEN 'ecart'
+                            ELSE LTRIM(RTRIM(COALESCE(processing_status, 'pending')))
+                        END = ?
+                """
+                params.append(normalized_status)
+
+            query = f"""
+                ;WITH base AS (
+                    SELECT
+                        entry_id,
+                        nom_pdf,
+                        CASE
+                            WHEN LTRIM(RTRIM(COALESCE(processing_status, 'pending'))) = 'eccarts' THEN 'ecart'
+                            ELSE LTRIM(RTRIM(COALESCE(processing_status, 'pending')))
+                        END AS processing_status,
+                        invoice_date,
+                        iban,
+                        bic,
+                        doc_type,
+                        date_creation,
+                        date_mail,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY entry_id
+                            ORDER BY date_creation ASC, id_log ASC
+                        ) AS rn
+                    FROM dbo.XXA_LOGMAIL_228794
+                    WHERE entry_id IN ({placeholders})
+                    {status_sql}
+                )
+                SELECT
+                    entry_id,
+                    nom_pdf,
+                    processing_status,
+                    invoice_date,
+                    iban,
+                    bic,
+                    doc_type,
+                    date_creation,
+                    date_mail
+                FROM base
+                WHERE rn = 1
+                ORDER BY date_creation ASC, nom_pdf ASC
+            """
+            rows_out.extend(self.fetch_all(query, tuple(params)) or [])
+
+        return rows_out
+
 
     def get_files_for_entries(self, entry_ids: list[str]) -> dict[str, list[dict]]:
         out: dict[str, list[dict]] = {}

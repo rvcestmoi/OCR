@@ -42,10 +42,17 @@ class MainWindowDocumentsMixin:
             if os.path.exists(full_path) and full_path not in paths:
                 paths.append(full_path)
 
-        # s’assurer que la facture est dans la liste + en premier
-        if invoice_path in paths:
-            paths.remove(invoice_path)
-        paths.insert(0, invoice_path)
+        chosen_invoice_path = invoice_path
+        if hasattr(self, "_choose_invoice_source_document"):
+            try:
+                chosen_invoice_path = str(self._choose_invoice_source_document(paths or [invoice_path], fallback_path=invoice_path) or invoice_path).strip() or invoice_path
+            except Exception:
+                chosen_invoice_path = invoice_path
+
+        # s’assurer que le document source facture est dans la liste + en premier
+        if chosen_invoice_path in paths:
+            paths.remove(chosen_invoice_path)
+        paths.insert(0, chosen_invoice_path)
 
         self.entry_pdf_paths = paths
         self.update_doc_indicator()
@@ -386,6 +393,12 @@ class MainWindowDocumentsMixin:
         self.current_folder_path = folder
         self.pdf_table.setRowCount(0)
 
+        if hasattr(self, "refresh_last_mail_date_label"):
+            try:
+                self.refresh_last_mail_date_label()
+            except Exception:
+                pass
+
         current_search_query = self._get_left_search_query()
         self._loaded_left_search_query = current_search_query
 
@@ -418,7 +431,38 @@ class MainWindowDocumentsMixin:
             limit = None
 
         try:
-            rows = self.logmail_repo.get_document_rows_for_folder(folder, sql_status, limit=limit)
+            rows = self.logmail_repo.get_document_rows_for_folder(
+                folder,
+                sql_status,
+                limit=limit,
+                search_query=current_search_query or None,
+            )
+
+            if current_search_query and self._is_folder_like_left_search_query(current_search_query):
+                extra_entry_matches = self._find_additional_left_search_entry_matches(
+                    folder,
+                    current_search_query,
+                    sql_status,
+                )
+                if extra_entry_matches:
+                    already_loaded_entry_ids = {
+                        str(r.get("entry_id") or "").strip()
+                        for r in rows
+                        if str(r.get("entry_id") or "").strip()
+                    }
+                    missing_entry_ids = [
+                        entry_id
+                        for entry_id in extra_entry_matches.keys()
+                        if entry_id and entry_id not in already_loaded_entry_ids
+                    ]
+                    if missing_entry_ids:
+                        rows.extend(
+                            self.logmail_repo.get_document_rows_for_entries(
+                                missing_entry_ids,
+                                status=sql_status,
+                            )
+                            or []
+                        )
         except Exception as e:
             QMessageBox.warning(self, "Chargement dossier", f"Erreur lecture XXA_LOGMAIL_228794 :\n{e}")
             return
@@ -500,6 +544,14 @@ class MainWindowDocumentsMixin:
             it0.setData(Qt.UserRole + 1, status)
             it0.setData(Qt.UserRole + 4, entry_id)
             it0.setData(Qt.UserRole + 5, group_paths)
+
+            folders_for_search = self._get_saved_folder_numbers_for_pdf(rep_path)
+            it0.setData(Qt.UserRole + 7, folders_for_search)
+            if folders_for_search:
+                tooltip = real_filename + "\nDossier(s) : " + ", ".join(folders_for_search[:10])
+                if len(folders_for_search) > 10:
+                    tooltip += "…"
+                it0.setToolTip(tooltip)
 
             self.pdf_table.setItem(row_index, 0, it0)
             self.pdf_table.setItem(row_index, 1, QTableWidgetItem(invoice_date))
@@ -592,22 +644,55 @@ class MainWindowDocumentsMixin:
         return self._get_saved_json_path(pdf_path)
 
 
-    def _get_saved_date_iban_bic_for_pdf(self, pdf_path: str) -> tuple[str, str, str]:
-        # IMPORTANT: utiliser la version "préfixée" (entry_id__) si nécessaire.
-        json_path = self._get_saved_json_path(pdf_path)
-        if not os.path.exists(json_path):
-            return ("", "", "")
+    def _read_cached_json_file(self, json_path: str) -> dict:
+        json_path = str(json_path or "").strip()
+        if not json_path or not os.path.exists(json_path):
+            return {}
+
+        try:
+            stat = os.stat(json_path)
+            signature = (int(stat.st_mtime_ns), int(stat.st_size))
+        except Exception:
+            signature = None
+
+        cache = getattr(self, "_saved_json_cache", None)
+        if cache is None:
+            cache = {}
+            self._saved_json_cache = cache
+
+        cached = cache.get(json_path)
+        if cached and cached.get("signature") == signature:
+            data = cached.get("data")
+            return data if isinstance(data, dict) else {}
 
         try:
             with open(json_path, "r", encoding="utf-8") as f:
                 data = json.load(f) or {}
-            return (
-                str(data.get("invoice_date", "")).strip(),
-                str(data.get("iban", "")).strip(),
-                str(data.get("bic", "")).strip(),
-            )
         except Exception:
+            data = {}
+
+        if not isinstance(data, dict):
+            data = {}
+
+        cache[json_path] = {
+            "signature": signature,
+            "data": data,
+        }
+        return data
+
+
+    def _get_saved_date_iban_bic_for_pdf(self, pdf_path: str) -> tuple[str, str, str]:
+        # IMPORTANT: utiliser la version "préfixée" (entry_id__) si nécessaire.
+        json_path = self._get_saved_json_path(pdf_path)
+        data = self._read_cached_json_file(json_path)
+        if not data:
             return ("", "", "")
+
+        return (
+            str(data.get("invoice_date", "")).strip(),
+            str(data.get("iban", "")).strip(),
+            str(data.get("bic", "")).strip(),
+        )
 
     
 
@@ -697,6 +782,162 @@ class MainWindowDocumentsMixin:
                 it4.setText(lkz)
         self.apply_left_table_search_filter()
 
+    def _get_saved_folder_numbers_for_pdf(self, pdf_path: str) -> list[str]:
+        pdf_path = str(pdf_path or "").strip()
+        if not pdf_path:
+            return []
+
+        json_path = self._get_saved_json_path(pdf_path)
+        data = self._read_cached_json_file(json_path)
+
+        tournrs: list[str] = []
+        if isinstance(data, dict):
+            try:
+                if hasattr(self, "_extract_tournrs_from_saved"):
+                    tournrs.extend(self._extract_tournrs_from_saved(data) or [])
+            except Exception:
+                pass
+
+            for key in ("cmr_tour_nr", "ecart_tour_nr", "tour_nr", "TourNr", "tournr"):
+                val = str(data.get(key) or "").strip()
+                if val:
+                    tournrs.append(val)
+
+        return sorted({str(t).strip() for t in tournrs if str(t).strip()})
+
+    def _is_folder_like_left_search_query(self, search_query: str) -> bool:
+        raw_query = str(search_query or "").strip()
+        if not raw_query:
+            return False
+
+        compact_query = (
+            raw_query
+            .replace(" ", "")
+            .replace("\u00A0", "")
+            .replace("-", "")
+        )
+        if len(compact_query) < 5:
+            return False
+
+        if compact_query.isdigit():
+            return True
+
+        try:
+            return bool(self.DOSSIER_PATTERN.search(raw_query))
+        except Exception:
+            return False
+
+    def _get_left_search_folder_index(self, folder: str) -> dict:
+        folder = str(folder or "").strip()
+        if not folder or not os.path.isdir(folder):
+            return {"entry_to_tournrs": {}, "statuses": {}}
+
+        cache_by_folder = getattr(self, "_left_search_folder_index_cache", None)
+        if cache_by_folder is None:
+            cache_by_folder = {}
+            self._left_search_folder_index_cache = cache_by_folder
+
+        cached = cache_by_folder.get(folder)
+        if cached:
+            return cached
+
+        try:
+            filenames = sorted(os.listdir(folder))
+        except Exception:
+            filenames = []
+
+        supported_filenames: list[str] = []
+        paths_by_name: dict[str, str] = {}
+        for name in filenames:
+            full_path = os.path.join(folder, name)
+            if not os.path.isfile(full_path):
+                continue
+            try:
+                if not is_supported_document(full_path):
+                    continue
+            except Exception:
+                continue
+            supported_filenames.append(name)
+            paths_by_name[name] = full_path
+
+        entry_to_tournrs: dict[str, set[str]] = {}
+        statuses: dict[str, str] = {}
+
+        if supported_filenames:
+            try:
+                entry_ids_by_name = self.logmail_repo.get_entry_ids_for_files(supported_filenames) or {}
+            except Exception:
+                entry_ids_by_name = {}
+
+            entry_ids = sorted({str(v or "").strip() for v in entry_ids_by_name.values() if str(v or "").strip()})
+            if entry_ids:
+                try:
+                    statuses = self.logmail_repo.get_processing_status_map_for_entries(entry_ids) or {}
+                except Exception:
+                    statuses = {}
+
+            for name, pdf_path in paths_by_name.items():
+                entry_id = str(entry_ids_by_name.get(name) or "").strip()
+                if not entry_id:
+                    continue
+                try:
+                    tournrs = self._get_saved_folder_numbers_for_pdf(pdf_path)
+                except Exception:
+                    tournrs = []
+                if not tournrs:
+                    continue
+                entry_to_tournrs.setdefault(entry_id, set()).update(
+                    str(t).strip() for t in tournrs if str(t).strip()
+                )
+
+        cache_payload = {
+            "entry_to_tournrs": entry_to_tournrs,
+            "statuses": statuses,
+        }
+        cache_by_folder[folder] = cache_payload
+        return cache_payload
+
+    def _find_additional_left_search_entry_matches(self, folder: str, search_query: str, status: str) -> dict[str, set[str]]:
+        """
+        Recherche des entry_id supplémentaires hors pool déjà chargé, à partir des
+        JSON sauvegardés, pour permettre la recherche par numéro de dossier.
+        Retourne {entry_id: {tour1, tour2, ...}}.
+        """
+        folder = str(folder or "").strip()
+        query = str(search_query or "").strip().lower()
+        normalized_status = str(status or "pending").strip().lower()
+        if normalized_status == "eccarts":
+            normalized_status = "ecart"
+
+        if not folder or not os.path.isdir(folder) or not query:
+            return {}
+
+        index_data = self._get_left_search_folder_index(folder)
+        entry_to_tournrs = index_data.get("entry_to_tournrs") or {}
+        statuses = index_data.get("statuses") or {}
+
+        matches: dict[str, set[str]] = {}
+        for entry_id, tournrs in entry_to_tournrs.items():
+            clean_entry_id = str(entry_id or "").strip()
+            if not clean_entry_id:
+                continue
+
+            entry_status = str(statuses.get(clean_entry_id) or "pending").strip().lower()
+            if entry_status == "eccarts":
+                entry_status = "ecart"
+            if normalized_status and entry_status != normalized_status:
+                continue
+
+            matched_tournrs = {
+                str(t).strip()
+                for t in (tournrs or [])
+                if str(t).strip() and query in str(t).strip().lower()
+            }
+            if matched_tournrs:
+                matches[clean_entry_id] = matched_tournrs
+
+        return matches
+
     def _is_typing_in_input(self) -> bool:
         w = QApplication.focusWidget()
         return isinstance(w, (QLineEdit, QTextEdit, QPlainTextEdit))
@@ -746,7 +987,7 @@ class MainWindowDocumentsMixin:
             timer.timeout.connect(self._reload_left_table_for_search)
             self._left_search_reload_timer = timer
 
-        timer.start(250)
+        timer.start(400)
 
     def _reload_left_table_for_search(self):
         current_folder = str(getattr(self, "current_folder_path", "") or "").strip()
@@ -797,7 +1038,17 @@ class MainWindowDocumentsMixin:
                 it = self.pdf_table.item(row, col)
                 if it:
                     values.append((it.text() or "").strip().lower())
-            haystack = " | ".join(values)
+            extra_search_values = []
+            try:
+                extra_search_values = [
+                    str(v).strip().lower()
+                    for v in (it0.data(Qt.UserRole + 7) or [])
+                    if str(v).strip()
+                ]
+            except Exception:
+                extra_search_values = []
+
+            haystack = " | ".join(values + extra_search_values)
             search_visible = (not query) or (query in haystack)
 
             # 3) filtre pays (col 4)

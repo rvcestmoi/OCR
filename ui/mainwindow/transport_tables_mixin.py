@@ -730,9 +730,12 @@ class MainWindowTransportTablesMixin:
         self.folder_table.insertRow(row)
 
         dossier_le = self._make_folder_cell("Numéro de dossier")
+        dossier_le.setMinimumWidth(96)
         amount_le = self._make_folder_cell("Montant HT (OCR)")
+        amount_le.setMinimumWidth(108)
 
         vat_theo_le = self._make_folder_cell("TVA théorique (%)")
+        vat_theo_le.setMinimumWidth(92)
         vat_theo_le.setReadOnly(True)
         vat_theo_le.setFocusPolicy(Qt.NoFocus)
         vat_theo_le.setStyleSheet("background-color: #f3f3f3;")

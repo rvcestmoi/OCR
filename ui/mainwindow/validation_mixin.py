@@ -9,11 +9,8 @@ from .workers import LinkDownloadWorker, LinkPostProcessWorker, _DownloadCancele
 class MainWindowValidationMixin:
 
     def _get_validation_document_path(self) -> str | None:
-        candidates: list[str] = []
-
         view_path = str(getattr(self, "view_pdf_path", "") or "").strip()
-        if view_path and os.path.isfile(view_path):
-            candidates.append(view_path)
+        current_path = str(getattr(self, "current_pdf_path", "") or "").strip()
 
         try:
             group_paths = [
@@ -21,26 +18,18 @@ class MainWindowValidationMixin:
                 for p in (getattr(self, "entry_pdf_paths", []) or [])
                 if str(p or "").strip() and os.path.isfile(str(p or "").strip())
             ]
-            if group_paths:
-                rep = ""
-                if hasattr(self, "_choose_representative_pdf"):
-                    rep = str(self._choose_representative_pdf(group_paths) or "").strip()
-                if rep and os.path.isfile(rep):
-                    candidates.append(rep)
+            chosen = self._choose_invoice_source_document(
+                group_paths,
+                fallback_path=view_path or current_path,
+            )
+            if chosen and os.path.isfile(chosen):
+                return chosen
         except Exception:
             pass
 
-        current_path = str(getattr(self, "current_pdf_path", "") or "").strip()
-        if current_path and os.path.isfile(current_path):
-            candidates.append(current_path)
-
-        seen = set()
-        for candidate in candidates:
-            abs_candidate = os.path.abspath(candidate)
-            if abs_candidate in seen:
-                continue
-            seen.add(abs_candidate)
-            return candidate
+        for candidate in (view_path, current_path):
+            if candidate and os.path.isfile(candidate):
+                return candidate
 
         return None
 
@@ -418,6 +407,166 @@ class MainWindowValidationMixin:
 
         # unique, stable
         return sorted(set(tournrs))
+
+    def _score_invoice_source_document(self, pdf_path: str, data: dict | None = None) -> int:
+        pdf_path = str(pdf_path or "").strip()
+        if not pdf_path:
+            return -1
+
+        data = data if isinstance(data, dict) else (self._read_saved_invoice_json(pdf_path) or {})
+        score = 0
+
+        tags = data.get("tags") or []
+        if isinstance(tags, str):
+            tags = [tags]
+        tags_norm = {str(t).strip().lower() for t in tags if str(t).strip()}
+
+        explicit_source_flags = [
+            data.get("invoice_source_document"),
+            data.get("is_invoice_source_document"),
+            data.get("ocr_source_document"),
+        ]
+        if any(bool(v) for v in explicit_source_flags):
+            score += 100000
+
+        invoice_number = str(data.get("invoice_number") or "").strip()
+        invoice_date = str(data.get("invoice_date") or "").strip()
+        iban = str(data.get("iban") or "").strip()
+        bic = str(data.get("bic") or "").strip()
+        transporter = str(data.get("transporter_text") or "").strip()
+        folders = self._extract_tournrs_from_saved(data)
+        vat_lines = data.get("vat_lines") or []
+        if not isinstance(vat_lines, list):
+            vat_lines = []
+        ocr_text = str(data.get("ocr_text") or "")
+
+        if invoice_number:
+            score += 250
+        if invoice_date:
+            score += 140
+        if iban and bic:
+            score += 180
+        elif iban or bic:
+            score += 60
+        if transporter:
+            score += 40
+        if folders:
+            score += 220 + min(120, len(folders) * 12)
+        if vat_lines:
+            score += 80 + min(60, len(vat_lines) * 10)
+        if ocr_text:
+            score += min(220, max(20, len(ocr_text) // 40))
+
+        filename = os.path.basename(pdf_path).lower()
+        if any(token in filename for token in ("invoice", "facture", "fv", "fac")):
+            score += 35
+        if any(token in filename for token in ("cmr", "pod", "bl", "bonliv")):
+            score -= 120
+        if "_cmr_" in filename or filename.endswith("_cmr.pdf"):
+            score -= 250
+        if "supprime" in tags_norm:
+            score -= 1000
+
+        return score
+
+    def _choose_invoice_source_document(self, group_paths: list[str] | None, fallback_path: str | None = None) -> str:
+        clean_paths: list[str] = []
+        seen = set()
+
+        for p in (group_paths or []):
+            p = str(p or "").strip()
+            if not p or not os.path.isfile(p):
+                continue
+            ap = os.path.abspath(p)
+            if ap in seen:
+                continue
+            seen.add(ap)
+            clean_paths.append(p)
+
+        fallback_path = str(fallback_path or "").strip()
+        if fallback_path and os.path.isfile(fallback_path):
+            ap = os.path.abspath(fallback_path)
+            if ap not in seen:
+                clean_paths.append(fallback_path)
+                seen.add(ap)
+
+        if not clean_paths:
+            return fallback_path if fallback_path and os.path.isfile(fallback_path) else ""
+
+        best_path = clean_paths[0]
+        best_score = self._score_invoice_source_document(best_path)
+
+        for p in clean_paths[1:]:
+            score = self._score_invoice_source_document(p)
+            if score > best_score:
+                best_path = p
+                best_score = score
+
+        return best_path
+
+    def _set_invoice_source_document(self, pdf_path: str) -> None:
+        pdf_path = str(pdf_path or "").strip()
+        if not pdf_path:
+            return
+
+        target_abs = os.path.abspath(pdf_path)
+        entry_id = str(self._resolve_current_entry_id(pdf_path) or "").strip()
+        sibling_paths: list[str] = []
+
+        current_dir = os.path.dirname(pdf_path)
+        if entry_id:
+            try:
+                rows = self.logmail_repo.get_files_for_entry(entry_id) or []
+            except Exception:
+                rows = []
+
+            for r in rows:
+                name = str(r.get("nom_pdf") or r.get("Nom_PDF") or r.get("filename") or "").strip()
+                if not name:
+                    continue
+                candidate = os.path.join(current_dir, name)
+                if os.path.isfile(candidate):
+                    sibling_paths.append(candidate)
+
+        for p in (getattr(self, "entry_pdf_paths", []) or []):
+            p = str(p or "").strip()
+            if p and os.path.isfile(p):
+                sibling_paths.append(p)
+
+        sibling_paths.append(pdf_path)
+
+        seen = set()
+        for candidate in sibling_paths:
+            candidate = str(candidate or "").strip()
+            if not candidate or not os.path.isfile(candidate):
+                continue
+            abs_candidate = os.path.abspath(candidate)
+            if abs_candidate in seen:
+                continue
+            seen.add(abs_candidate)
+
+            data = self._read_saved_invoice_json(candidate) or {}
+            if not isinstance(data, dict):
+                data = {}
+
+            is_target = abs_candidate == target_abs
+            changed = False
+            for key in ("invoice_source_document", "is_invoice_source_document", "ocr_source_document"):
+                new_value = is_target
+                if bool(data.get(key)) != new_value:
+                    data[key] = new_value
+                    changed = True
+
+            if not changed:
+                continue
+
+            json_path = self._get_saved_json_path(candidate)
+            try:
+                os.makedirs(os.path.dirname(json_path), exist_ok=True)
+                with open(json_path, "w", encoding="utf-8") as f:
+                    json.dump(data, f, ensure_ascii=False, indent=2)
+            except Exception:
+                pass
 
     def _set_left_row_visual(self, row: int, state: str, tooltip: str = ""):
         """

@@ -495,6 +495,11 @@ class MainWindowCoreMixin:
 
         if ok:
             try:
+                if hasattr(self, "_set_invoice_source_document"):
+                    self._set_invoice_source_document(target_pdf_path)
+            except Exception:
+                pass
+            try:
                 self._set_left_row_status(target_pdf_path, status_to_keep)
             except Exception:
                 pass

@@ -114,6 +114,10 @@ class MainWindow(
         self.btn_ocr_all = QPushButton("⚙️ OCRiser")
         self.btn_ocr_all.clicked.connect(self.ocr_all_pdfs)
 
+        self.lbl_last_mail_date = QLabel("Dernier mail : chargement…")
+        self.lbl_last_mail_date.setWordWrap(True)
+        self.lbl_last_mail_date.setStyleSheet("color: #666; padding: 2px 0 6px 2px;")
+
         # Splitter vertical : tableau en haut / infos transporteur en bas
         left_splitter = QSplitter(Qt.Vertical)
 
@@ -122,6 +126,7 @@ class MainWindow(
         left_layout = QVBoxLayout(left_top_widget)
 
         left_layout.addWidget(self.btn_ocr_all)
+        left_layout.addWidget(self.lbl_last_mail_date)
 
         self.pdf_table = QTableWidget(left_top_widget)
         self.pdf_table.setObjectName("pdf_table")
@@ -194,7 +199,7 @@ class MainWindow(
         self.btn_filter_ecart.clicked.connect(lambda: self.set_left_filter("ecart"))
 
         self.left_search_input = QLineEdit()
-        self.left_search_input.setPlaceholderText("🔎 Rechercher fichier / date / IBAN / BIC…")
+        self.left_search_input.setPlaceholderText("🔎 Rechercher fichier / date / IBAN / BIC / dossier…")
         self.left_search_input.textChanged.connect(self.on_left_search_text_changed)
         left_layout.addWidget(self.left_search_input)
 
@@ -252,8 +257,9 @@ class MainWindow(
         center_widget.setMinimumWidth(360)
         center_panel = QVBoxLayout(center_widget)
 
-        # --- Barre navigation PDF (docs + pages) ---
+        # --- Barres navigation PDF ---
         pdf_nav = QHBoxLayout()
+        pdf_tools_nav = QHBoxLayout()
 
         # ✅ navigation documents (même entry_id)
         self.btn_prev_doc = QPushButton("⏪")
@@ -317,17 +323,20 @@ class MainWindow(
         pdf_nav.addWidget(self.lbl_page_info)
         pdf_nav.addWidget(self.btn_next_page)
 
-        pdf_nav.addSpacing(12)
-        pdf_nav.addWidget(self.btn_zoom_out)
-        pdf_nav.addWidget(self.btn_fit_width)
-        pdf_nav.addWidget(self.btn_zoom_in)
-        pdf_nav.addSpacing(8)
-        pdf_nav.addWidget(self.btn_rotate_left)
-        pdf_nav.addWidget(self.btn_rotate_right)
-        pdf_nav.addWidget(self.lbl_view_info)
         pdf_nav.addStretch()
 
+        pdf_tools_nav.addStretch()
+        pdf_tools_nav.addWidget(self.btn_zoom_out)
+        pdf_tools_nav.addWidget(self.btn_fit_width)
+        pdf_tools_nav.addWidget(self.btn_zoom_in)
+        pdf_tools_nav.addSpacing(8)
+        pdf_tools_nav.addWidget(self.btn_rotate_left)
+        pdf_tools_nav.addWidget(self.btn_rotate_right)
+        pdf_tools_nav.addWidget(self.lbl_view_info)
+        pdf_tools_nav.addStretch()
+
         center_panel.addLayout(pdf_nav)
+        center_panel.addLayout(pdf_tools_nav)
 
         # --- Viewer ---
         self.pdf_viewer = PdfViewer()
@@ -358,7 +367,8 @@ class MainWindow(
         # Panneau droit (form)
         # =========================
         right_widget = QWidget()
-        right_widget.setMinimumWidth(320)
+        # Garde une largeur minimale confortable pour le formulaire et la table dossiers.
+        right_widget.setMinimumWidth(420)
         right_panel = QVBoxLayout(right_widget)
         form_layout = QFormLayout()
 
@@ -430,19 +440,33 @@ class MainWindow(
         self.folder_table = QTableWidget(0, 6)
         self.folder_table.setHorizontalHeaderLabels([
             "N° Tournée",
-            "Montant HT (OCR)",
-            "TVA théorique (%)",
+            "Montant HT",
+            "TVA th. (%)",
             "CMR",
             "AB",
-            ""  # colonne 2 "après", réservée
+            ""  # colonne réservée
         ])
 
-        self.folder_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
-        self.folder_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
-        self.folder_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
-        self.folder_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeToContents)
-        self.folder_table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeToContents)
-        self.folder_table.horizontalHeader().setSectionResizeMode(5, QHeaderView.ResizeToContents)
+        folder_header = self.folder_table.horizontalHeader()
+        folder_header.setMinimumSectionSize(28)
+
+        # Colonne tournée : largeur minimale pour voir confortablement 9 chiffres.
+        folder_header.setSectionResizeMode(0, QHeaderView.Interactive)
+        self.folder_table.setColumnWidth(0, 96)
+
+        # Colonnes montant / TVA : volontairement plus compactes.
+        folder_header.setSectionResizeMode(1, QHeaderView.Interactive)
+        self.folder_table.setColumnWidth(1, 108)
+        folder_header.setSectionResizeMode(2, QHeaderView.Interactive)
+        self.folder_table.setColumnWidth(2, 92)
+
+        # Indicateurs compacts.
+        folder_header.setSectionResizeMode(3, QHeaderView.Fixed)
+        folder_header.setSectionResizeMode(4, QHeaderView.Fixed)
+        folder_header.setSectionResizeMode(5, QHeaderView.Fixed)
+        self.folder_table.setColumnWidth(3, 34)
+        self.folder_table.setColumnWidth(4, 30)
+        self.folder_table.setColumnWidth(5, 30)
 
 
         # Totaux dossiers
@@ -608,6 +632,56 @@ class MainWindow(
         # Optionnel (mais utile) : état initial boutons doc
         self.btn_prev_doc.setEnabled(False)
         self.btn_next_doc.setEnabled(False)
+
+        self.refresh_last_mail_date_label()
+
+    def _format_last_mail_date_value(self, value) -> str | None:
+        if value is None:
+            return None
+
+        if isinstance(value, datetime):
+            return value.strftime("%d/%m/%Y %H:%M")
+
+        raw = str(value).strip()
+        if not raw:
+            return None
+
+        candidates = [
+            "%Y-%m-%d %H:%M:%S.%f",
+            "%Y-%m-%d %H:%M:%S",
+            "%Y-%m-%d %H:%M",
+            "%d/%m/%Y %H:%M:%S",
+            "%d/%m/%Y %H:%M",
+            "%Y-%m-%dT%H:%M:%S.%f",
+            "%Y-%m-%dT%H:%M:%S",
+        ]
+        for fmt in candidates:
+            try:
+                dt = datetime.strptime(raw, fmt)
+                return dt.strftime("%d/%m/%Y %H:%M")
+            except Exception:
+                pass
+
+        try:
+            dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+            return dt.strftime("%d/%m/%Y %H:%M")
+        except Exception:
+            return raw
+
+    def refresh_last_mail_date_label(self):
+        label = getattr(self, "lbl_last_mail_date", None)
+        if label is None:
+            return
+
+        try:
+            value = self.logmail_repo.get_latest_mail_date()
+            formatted = self._format_last_mail_date_value(value)
+            if formatted:
+                label.setText(f"Dernier mail : {formatted}")
+            else:
+                label.setText("Dernier mail : non disponible")
+        except Exception:
+            label.setText("Dernier mail : non disponible")
 
     def closeEvent(self, event):
         try:

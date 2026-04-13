@@ -282,14 +282,16 @@ class MainWindowCmrMixin:
 
     def _choose_representative_pdf(self, group_paths: list[str]) -> str:
         """
-        Choisit le meilleur PDF pour représenter un entry_id.
-        Priorité :
-        1) JSON avec iban+bic + au moins un dossier (TourNr)
-        2) JSON avec iban+bic
-        3) premier fichier
+        Choisit en priorité le document qui porte réellement les données facture.
+        Fallback sur l'ancienne heuristique si nécessaire.
         """
         if not group_paths:
             return ""
+
+        if hasattr(self, "_choose_invoice_source_document"):
+            chosen = str(self._choose_invoice_source_document(group_paths) or "").strip()
+            if chosen:
+                return chosen
 
         best_iban_bic_and_folders = None
         best_iban_bic = None
