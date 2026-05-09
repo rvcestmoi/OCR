@@ -9,6 +9,29 @@ class LogmailRepository(BaseRepository):
     Accès à la table XXA_LOGMAIL_228794
     """
 
+    def get_latest_mail_info(self) -> dict:
+        """
+        Récupère les infos du dernier mail affichées dans le volet de gauche.
+
+        On prend la dernière ligne logmail (TOP 1 ORDER BY id_log DESC),
+        avec un fallback sur date_creation si date_mail est NULL.
+        """
+        query = """
+            SELECT TOP 1
+                date_mail,
+                date_creation,
+                LTRIM(RTRIM(COALESCE(expediteur, ''))) AS expediteur,
+                LTRIM(RTRIM(COALESCE(sujet, ''))) AS sujet
+            FROM dbo.XXA_LOGMAIL_228794
+            ORDER BY id_log DESC
+        """
+        row = self.fetch_one(query) or {}
+        return {
+            "date_mail": row.get("date_mail") or row.get("date_creation"),
+            "expediteur": row.get("expediteur") or "",
+            "sujet": row.get("sujet") or "",
+        }
+
     def get_latest_mail_date(self):
         """
         Récupère la dernière date_mail connue dans XXA_LOGMAIL_228794.
@@ -40,6 +63,7 @@ class LogmailRepository(BaseRepository):
             SELECT nom_pdf
             FROM XXA_LOGMAIL_228794
             WHERE entry_id = ?
+              AND UPPER(LTRIM(RTRIM(COALESCE(doc_type, '')))) <> 'DELETED'
             ORDER BY nom_pdf
         """
         return self.fetch_all(query, (entry_id,))
@@ -444,6 +468,21 @@ class LogmailRepository(BaseRepository):
         """
         self.execute(query, (status, entry_id))
 
+
+    def set_doc_type_for_file(self, nom_pdf: str, doc_type: str | None) -> None:
+        nom_pdf = str(nom_pdf or "").strip()
+        normalized_doc_type = str(doc_type or "").strip()
+
+        if not nom_pdf:
+            return
+
+        query = """
+            UPDATE dbo.XXA_LOGMAIL_228794
+            SET doc_type = ?
+            WHERE nom_pdf = ?
+        """
+        self.execute(query, (normalized_doc_type or None, nom_pdf))
+
     def update_document_by_filename(self, nom_pdf: str, *, entry_id: str = "", invoice_date: str = "", iban: str = "", bic: str = "", status: str | None = None) -> str:
         """Met à jour un document par nom de fichier, en créant une entrée si nécessaire.
 
@@ -574,6 +613,7 @@ class LogmailRepository(BaseRepository):
                     ) AS rn
                 FROM dbo.XXA_LOGMAIL_228794
                 WHERE LTRIM(RTRIM(COALESCE(nom_pdf, ''))) <> ''
+                AND UPPER(LTRIM(RTRIM(COALESCE(doc_type, '')))) <> 'DELETED'
                 AND CASE
                         WHEN LTRIM(RTRIM(COALESCE(processing_status, 'pending'))) = 'eccarts' THEN 'ecart'
                         ELSE LTRIM(RTRIM(COALESCE(processing_status, 'pending')))
@@ -615,6 +655,7 @@ class LogmailRepository(BaseRepository):
                 date_creation
             FROM dbo.XXA_LOGMAIL_228794
             WHERE entry_id = ?
+              AND UPPER(LTRIM(RTRIM(COALESCE(doc_type, '')))) <> 'DELETED'
             ORDER BY date_creation ASC, id_log ASC
         """
         return self.fetch_all(query, (entry_id,)) or []
@@ -678,6 +719,7 @@ class LogmailRepository(BaseRepository):
                         ) AS rn
                     FROM dbo.XXA_LOGMAIL_228794
                     WHERE entry_id IN ({placeholders})
+                      AND UPPER(LTRIM(RTRIM(COALESCE(doc_type, '')))) <> 'DELETED'
                     {status_sql}
                 )
                 SELECT
@@ -721,6 +763,7 @@ class LogmailRepository(BaseRepository):
                     date_creation
                 FROM dbo.XXA_LOGMAIL_228794
                 WHERE entry_id IN ({placeholders})
+                  AND UPPER(LTRIM(RTRIM(COALESCE(doc_type, '')))) <> 'DELETED'
                 ORDER BY entry_id ASC, date_creation ASC, id_log ASC
             """
             rows = self.fetch_all(query, tuple(chunk)) or []

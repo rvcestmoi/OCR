@@ -237,8 +237,10 @@ class MainWindowDocumentsMixin:
         action_attach_cmr.setEnabled(False)  # ✅ maintenant OK
 
         menu.addSeparator()
-        action_delete = menu.addAction("Supprimer")
-        action_delete.setEnabled(bool(pdf_path))
+        action_move_to_errors = menu.addAction("Déplacer vers les erreurs")
+        action_move_to_errors.setEnabled(bool(pdf_path))
+        action_delete_permanently = menu.addAction("Supprimer définitivement")
+        action_delete_permanently.setEnabled(bool(pdf_path))
         action_fetch_links = menu.addAction("Télécharger documents via liens (CMR)…")
         action_fetch_links.setEnabled(False)
         # --- cible = ligne actuellement sélectionnée (la facture cible)
@@ -270,8 +272,12 @@ class MainWindowDocumentsMixin:
             self.attach_cmr_to_dossier_from_right_list(pdf_path, linked_filename)
             return
 
-        if chosen == action_delete:
-            self.mark_pdf_as_deleted(pdf_path, linked_filename)
+        if chosen == action_move_to_errors:
+            self.move_pdf_to_errors(pdf_path, linked_filename)
+            return
+
+        if chosen == action_delete_permanently:
+            self.mark_pdf_as_permanently_deleted(pdf_path, linked_filename)
             return
         
         if chosen == action_relink:
@@ -317,8 +323,12 @@ class MainWindowDocumentsMixin:
 
         chosen = menu.exec(self.pdf_table.viewport().mapToGlobal(pos))
 
-        if chosen == action_delete:
-            self.mark_pdf_as_deleted(pdf_path, linked_filename)
+        if chosen == action_move_to_errors:
+            self.move_pdf_to_errors(pdf_path, linked_filename)
+            return
+
+        if chosen == action_delete_permanently:
+            self.mark_pdf_as_permanently_deleted(pdf_path, linked_filename)
             return
 
         if chosen == action_attach_cmr:

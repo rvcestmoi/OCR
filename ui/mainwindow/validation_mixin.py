@@ -748,40 +748,88 @@ class MainWindowValidationMixin:
         self._pending_tags_to_add.add("supprime")
         self.save_current_data(show_message=False)
 
-    def mark_pdf_as_deleted(self, pdf_path: str, filename: str = ""):
+    def _find_left_row_for_pdf(self, pdf_path: str) -> int:
+        pdf_path = str(pdf_path or "").strip()
+        if not pdf_path or not hasattr(self, "pdf_table") or self.pdf_table is None:
+            return -1
+
+        for row in range(self.pdf_table.rowCount()):
+            it0 = self.pdf_table.item(row, 0)
+            if it0 and str(it0.data(Qt.UserRole) or "").strip() == pdf_path:
+                return row
+        return -1
+
+    def _resolve_entry_id_for_pdf(self, pdf_path: str) -> str:
+        pdf_path = str(pdf_path or "").strip()
         if not pdf_path:
-            return
+            return ""
 
-        msg = QMessageBox(self)
-        msg.setWindowTitle("Supprimer")
-        msg.setText(
-            "Marquer ce fichier comme supprimé ?\n\n"
-            f"{filename or os.path.basename(strip_entry_prefix(os.path.basename(pdf_path)))}\n\n"
-            "→ Ajoute le tag 'supprime' au JSON et apparaîtra dans le filtre 'Erreurs'."
-        )
-        msg.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
-        if msg.exec() != QMessageBox.Yes:
-            return
+        row = self._find_left_row_for_pdf(pdf_path)
+        if row >= 0:
+            it0 = self.pdf_table.item(row, 0)
+            if it0:
+                entry_id = str(it0.data(Qt.UserRole + 4) or "").strip()
+                if entry_id:
+                    return entry_id
 
-        # si c'est le PDF ouvert, on sauvegarde aussi l'état courant de l'UI
         try:
-            if self.current_pdf_path == pdf_path:
-                self.save_current_data(show_message=False)
+            return str(self.logmail_repo.get_entry_id_for_file(os.path.basename(pdf_path)) or "").strip()
         except Exception:
-            pass
+            return ""
 
+    def _load_saved_json_for_pdf_action(self, pdf_path: str) -> tuple[str, dict]:
         json_path = self._get_saved_json_path(pdf_path)
-
-        # load existing JSON (si existe)
-        existing = {}
+        existing: dict = {}
         if os.path.exists(json_path):
             try:
                 with open(json_path, "r", encoding="utf-8") as f:
                     existing = json.load(f) or {}
             except Exception:
                 existing = {}
+        return json_path, existing
 
-        # add tag
+    def _write_saved_json_for_pdf_action(self, json_path: str, data: dict) -> None:
+        os.makedirs(os.path.dirname(json_path), exist_ok=True)
+        with open(json_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+
+    def _refresh_after_pdf_state_change(self, pdf_path: str, *, remove_row: bool = False) -> None:
+        current_folder = str(getattr(self, "current_folder_path", "") or "").strip()
+        if current_folder and os.path.isdir(current_folder):
+            self.load_folder(current_folder)
+            return
+
+        row = self._find_left_row_for_pdf(pdf_path)
+        if row >= 0:
+            if remove_row:
+                self.pdf_table.removeRow(row)
+            else:
+                self.refresh_left_row_processing_state(row)
+        self.apply_left_table_search_filter()
+
+    def move_pdf_to_errors(self, pdf_path: str, filename: str = ""):
+        if not pdf_path:
+            return
+
+        msg = QMessageBox(self)
+        msg.setWindowTitle("Déplacer vers les erreurs")
+        msg.setText(
+            "Déplacer ce fichier vers les erreurs ?\n\n"
+            f"{filename or os.path.basename(strip_entry_prefix(os.path.basename(pdf_path)))}\n\n"
+            "→ Ajoute le tag 'supprime' au JSON et le fichier apparaîtra dans le filtre 'Erreurs'."
+        )
+        msg.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
+        if msg.exec() != QMessageBox.Yes:
+            return
+
+        try:
+            if self.current_pdf_path == pdf_path:
+                self.save_current_data(show_message=False)
+        except Exception:
+            pass
+
+        json_path, existing = self._load_saved_json_for_pdf_action(pdf_path)
+
         tags = existing.get("tags") or []
         if isinstance(tags, str):
             tags = [tags]
@@ -789,53 +837,80 @@ class MainWindowValidationMixin:
             tags = []
 
         tags_set = {str(t).strip() for t in tags if str(t).strip()}
+        tags_set.discard("supprime_definitif")
         tags_set.add("supprime")
         existing["tags"] = sorted(tags_set)
-
-        # optionnel: garder une trace
         existing["deleted_at"] = datetime.now().isoformat(timespec="seconds")
+        existing.pop("deleted_permanently_at", None)
 
-        os.makedirs(os.path.dirname(json_path), exist_ok=True)
-        with open(json_path, "w", encoding="utf-8") as f:
-            json.dump(existing, f, ensure_ascii=False, indent=2)
+        self._write_saved_json_for_pdf_action(json_path, existing)
 
-
-        # met aussi le statut SQL à "error"
         try:
-            entry_id = ""
-            for r in range(self.pdf_table.rowCount()):
-                it0 = self.pdf_table.item(r, 0)
-                if it0 and it0.data(Qt.UserRole) == pdf_path:
-                    entry_id = str(it0.data(Qt.UserRole + 4) or "").strip()
-                    break
-
-            if not entry_id:
-                entry_id = str(self.logmail_repo.get_entry_id_for_file(os.path.basename(pdf_path)) or "").strip()
-
+            self.logmail_repo.set_doc_type_for_file(os.path.basename(pdf_path), None)
+            entry_id = self._resolve_entry_id_for_pdf(pdf_path)
             if entry_id:
                 self.logmail_repo.set_processing_status_for_entry(entry_id, "error")
         except Exception as e:
             QMessageBox.warning(
                 self,
-                "Suppression",
-                f"Le tag 'supprime' a été enregistré, mais impossible de passer le statut SQL à 'error' :\n{e}"
+                "Déplacer vers les erreurs",
+                f"Le tag 'supprime' a été enregistré, mais la mise à jour SQL a échoué :\n{e}"
             )
 
+        self._refresh_after_pdf_state_change(pdf_path)
+        self.statusBar().showMessage("Fichier déplacé vers les erreurs.", 2500)
 
-        # refresh la ligne dans la table gauche + refiltre
-        # recharge le dossier courant pour refléter le statut SQL
-        current_folder = str(getattr(self, "current_folder_path", "") or "").strip()
-        if current_folder and os.path.isdir(current_folder):
-            self.load_folder(current_folder)
-        else:
-            for r in range(self.pdf_table.rowCount()):
-                it0 = self.pdf_table.item(r, 0)
-                if it0 and it0.data(Qt.UserRole) == pdf_path:
-                    self.refresh_left_row_processing_state(r)
-                    break
-            self.apply_left_table_search_filter()
+    def mark_pdf_as_deleted(self, pdf_path: str, filename: str = ""):
+        self.move_pdf_to_errors(pdf_path, filename)
 
-        self.statusBar().showMessage("Fichier marqué comme supprimé.", 2500)
+    def mark_pdf_as_permanently_deleted(self, pdf_path: str, filename: str = ""):
+        if not pdf_path:
+            return
+
+        msg = QMessageBox(self)
+        msg.setWindowTitle("Suppression définitive")
+        msg.setText(
+            "Supprimer définitivement ce fichier de l'application ?\n\n"
+            f"{filename or os.path.basename(strip_entry_prefix(os.path.basename(pdf_path)))}\n\n"
+            "→ Le fichier sera marqué comme supprimé définitivement et n'apparaîtra plus dans le filtre 'Erreurs'."
+        )
+        msg.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
+        if msg.exec() != QMessageBox.Yes:
+            return
+
+        try:
+            if self.current_pdf_path == pdf_path:
+                self.save_current_data(show_message=False)
+        except Exception:
+            pass
+
+        json_path, existing = self._load_saved_json_for_pdf_action(pdf_path)
+
+        tags = existing.get("tags") or []
+        if isinstance(tags, str):
+            tags = [tags]
+        if not isinstance(tags, list):
+            tags = []
+
+        tags_set = {str(t).strip() for t in tags if str(t).strip()}
+        tags_set.discard("supprime")
+        tags_set.add("supprime_definitif")
+        existing["tags"] = sorted(tags_set)
+        existing["deleted_permanently_at"] = datetime.now().isoformat(timespec="seconds")
+
+        self._write_saved_json_for_pdf_action(json_path, existing)
+
+        try:
+            self.logmail_repo.set_doc_type_for_file(os.path.basename(pdf_path), "deleted")
+        except Exception as e:
+            QMessageBox.warning(
+                self,
+                "Suppression définitive",
+                f"Le tag local a été enregistré, mais le type SQL n'a pas pu être mis à jour :\n{e}"
+            )
+
+        self._refresh_after_pdf_state_change(pdf_path, remove_row=True)
+        self.statusBar().showMessage("Fichier supprimé définitivement de l'application.", 2500)
 
     def _refresh_transporter_after_bank_autofill(self):
         # équivalent au clic sur IBAN/BIC : on repasse en recherche par banque
@@ -1475,12 +1550,13 @@ class MainWindowValidationMixin:
 
     def _resolve_lisinvoice_taux(self, tour_nrs: list[str]) -> Decimal:
         """
-        1) on préfère le taux saisi/extrait dans la zone TVA
-        2) sinon fallback sur la TVA théorique BDD des tournées
-        3) on refuse s'il y a plusieurs taux distincts
-        """
-        rates: set[Decimal] = set()
+        1) on préfère le premier taux saisi/extrait dans la zone TVA
+        2) sinon fallback sur le premier taux TVA théorique BDD des tournées
 
+        LISINVOICE_EDTRANS ne contient qu'une seule colonne Taux : en cas de
+        plusieurs taux détectés, on conserve volontairement le premier taux
+        exploitable au lieu de bloquer l'alimentation.
+        """
         for row in (self.get_vat_rows() or []):
             rate = self._to_sql_decimal_2(row.get("rate"))
             base = self._to_sql_decimal_2(row.get("base"))
@@ -1490,18 +1566,7 @@ class MainWindowValidationMixin:
                 continue
 
             if rate is not None:
-                rates.add(rate)
-
-        if len(rates) == 1:
-            return next(iter(rates))
-
-        if len(rates) > 1:
-            raise ValueError(
-                "Plusieurs taux TVA détectés dans la facture : impossible d'alimenter "
-                "LISINVOICE_EDTRANS car la colonne Taux est unique."
-            )
-
-        theo_rates: set[Decimal] = set()
+                return rate
 
         for tour_nr in tour_nrs:
             try:
@@ -1511,19 +1576,9 @@ class MainWindowValidationMixin:
 
             dec = self._to_sql_decimal_2(val)
             if dec is not None:
-                theo_rates.add(dec)
-
-        if len(theo_rates) == 1:
-            return next(iter(theo_rates))
-
-        if len(theo_rates) > 1:
-            raise ValueError(
-                "Plusieurs taux TVA théoriques trouvés sur les tournées : impossible "
-                "d'alimenter LISINVOICE_EDTRANS car la colonne Taux est unique."
-            )
+                return dec
 
         raise ValueError("Aucun taux TVA exploitable trouvé pour LISINVOICE_EDTRANS.")
-
     def _build_lisinvoice_rows(self) -> list[dict]:
         invoice_nr, kundennr = self._get_invoice_number_and_kundennr_for_dupecheck()
 

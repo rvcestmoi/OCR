@@ -116,7 +116,15 @@ class MainWindow(
 
         self.lbl_last_mail_date = QLabel("Dernier mail : chargement…")
         self.lbl_last_mail_date.setWordWrap(True)
-        self.lbl_last_mail_date.setStyleSheet("color: #666; padding: 2px 0 6px 2px;")
+        self.lbl_last_mail_date.setStyleSheet("color: #666; padding: 2px 0 0 2px;")
+
+        self.lbl_last_mail_sender = QLabel("Expéditeur : chargement…")
+        self.lbl_last_mail_sender.setWordWrap(True)
+        self.lbl_last_mail_sender.setStyleSheet("color: #666; padding: 0 0 0 2px;")
+
+        self.lbl_last_mail_subject = QLabel("Sujet : chargement…")
+        self.lbl_last_mail_subject.setWordWrap(True)
+        self.lbl_last_mail_subject.setStyleSheet("color: #666; padding: 0 0 6px 2px;")
 
         # Splitter vertical : tableau en haut / infos transporteur en bas
         left_splitter = QSplitter(Qt.Vertical)
@@ -127,6 +135,8 @@ class MainWindow(
 
         left_layout.addWidget(self.btn_ocr_all)
         left_layout.addWidget(self.lbl_last_mail_date)
+        left_layout.addWidget(self.lbl_last_mail_sender)
+        left_layout.addWidget(self.lbl_last_mail_subject)
 
         self.pdf_table = QTableWidget(left_top_widget)
         self.pdf_table.setObjectName("pdf_table")
@@ -669,19 +679,35 @@ class MainWindow(
             return raw
 
     def refresh_last_mail_date_label(self):
-        label = getattr(self, "lbl_last_mail_date", None)
-        if label is None:
+        date_label = getattr(self, "lbl_last_mail_date", None)
+        sender_label = getattr(self, "lbl_last_mail_sender", None)
+        subject_label = getattr(self, "lbl_last_mail_subject", None)
+        if date_label is None:
             return
 
         try:
-            value = self.logmail_repo.get_latest_mail_date()
-            formatted = self._format_last_mail_date_value(value)
-            if formatted:
-                label.setText(f"Dernier mail : {formatted}")
-            else:
-                label.setText("Dernier mail : non disponible")
+            row = self.logmail_repo.get_latest_mail_info() or {}
+            formatted = self._format_last_mail_date_value(row.get("date_mail"))
+            sender = str(row.get("expediteur") or "").strip()
+            subject = str(row.get("sujet") or "").strip()
+
+            date_label.setText(
+                f"Dernier mail : {formatted}" if formatted else "Dernier mail : non disponible"
+            )
+            if sender_label is not None:
+                sender_label.setText(
+                    f"Expéditeur : {sender}" if sender else "Expéditeur : non disponible"
+                )
+            if subject_label is not None:
+                subject_label.setText(
+                    f"Sujet : {subject}" if subject else "Sujet : non disponible"
+                )
         except Exception:
-            label.setText("Dernier mail : non disponible")
+            date_label.setText("Dernier mail : non disponible")
+            if sender_label is not None:
+                sender_label.setText("Expéditeur : non disponible")
+            if subject_label is not None:
+                subject_label.setText("Sujet : non disponible")
 
     def closeEvent(self, event):
         try:
