@@ -168,26 +168,35 @@ class MainWindowValidationMixin:
                 )
 
         # 3) Déterminer la valeur à appliquer selon blocage
-        doc_name = os.path.basename(self.current_pdf_path)
-        blocked = bool((self.block_options.get(doc_name, {}) or {}).get("blocked", False))
-        value = 601 if blocked else 600
-        comment = str((self.block_options.get(doc_name, {}) or {}).get("comment", "") or "").strip()
+        doc_name = os.path.basename(validation_pdf_path or self.current_pdf_path or "")
+        if hasattr(self, "_get_effective_block_state_for_database"):
+            blocked, comment = self._get_effective_block_state_for_database(
+                getattr(self, "block_options", {}) or {},
+                preferred_doc_name=doc_name,
+            )
+        else:
+            blocked = bool((self.block_options.get(doc_name, {}) or {}).get("blocked", False))
+            comment = str((self.block_options.get(doc_name, {}) or {}).get("comment", "") or "").strip()
 
         # 4) Updates SQL
-        errors = []
-        ocr_user = str(getattr(self, "current_username", "") or "").strip()
-        for t in tournrs:
-            try:
-                self.tour_repo.set_infosymbol18_for_tournr(t, value=value)
-                self.tour_repo.set_ocr_user_for_tournr(t, ocr_user=ocr_user)
-                self.tour_repo.set_block_status_for_tournr(
-                    t,
-                    is_blocked=blocked,
-                    motif=comment,
-                    ocr_user=ocr_user,
-                )
-            except Exception as e:
-                errors.append(f"{t} : {e}")
+        if hasattr(self, "_apply_block_state_to_database"):
+            errors = self._apply_block_state_to_database(tournrs, blocked=blocked, comment=comment)
+        else:
+            errors = []
+            value = 601 if blocked else 600
+            ocr_user = str(getattr(self, "current_username", "") or "").strip()
+            for t in tournrs:
+                try:
+                    self.tour_repo.set_infosymbol18_for_tournr(t, value=value)
+                    self.tour_repo.set_ocr_user_for_tournr(t, ocr_user=ocr_user)
+                    self.tour_repo.set_block_status_for_tournr(
+                        t,
+                        is_blocked=blocked,
+                        motif=comment,
+                        ocr_user=ocr_user,
+                    )
+                except Exception as e:
+                    errors.append(f"{t} : {e}")
 
 
         # 4 bis) Alimentation LISINVOICE_EDTRANS
