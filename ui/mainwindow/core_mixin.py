@@ -186,6 +186,8 @@ class MainWindowCoreMixin:
         self._pending_saved_transporter_aux_kundennr = ""
         self._transporter_aux_match_ok = None
         self._transporter_aux_locked = True
+        self.pallet_details = {}
+        self.block_options = {}
 
         # champs facture
         for field in [self.iban_input, self.bic_input, self.date_input, self.invoice_number_input]:
@@ -251,34 +253,45 @@ class MainWindowCoreMixin:
         # ✅ Charger les données sauvegardées depuis le JSON si elles existent
         try:
             saved_data = self._read_saved_invoice_json(self.current_pdf_path) or {}
+            self.pallet_details = saved_data.get("pallet_details", {}) or {}
+            self.block_options = saved_data.get("block_options", {}) or {}
         except Exception:
             saved_data = {}
 
-        # Remplir les champs facture si pas déjà remplis depuis BDD
-        if not self.iban_input.text().strip() and saved_data.get("iban"):
-            self.iban_input.setText(saved_data["iban"])
-        if not self.bic_input.text().strip() and saved_data.get("bic"):
-            self.bic_input.setText(saved_data["bic"])
-        if not self.date_input.text().strip() and saved_data.get("invoice_date"):
-            self.date_input.setText(normalize_date_format(saved_data["invoice_date"]))
-        if not self.invoice_number_input.text().strip() and saved_data.get("invoice_number"):
-            self.invoice_number_input.setText(saved_data["invoice_number"])
+        # ✅ Le fichier JSON de sauvegarde est la source la plus récente.
+        # Important en multi-utilisateur : la liste de gauche peut contenir des
+        # valeurs SQL déjà chargées en mémoire avant la sauvegarde d'un collègue.
+        # On doit donc appliquer le JSON même si les champs sont déjà remplis,
+        # et même si une valeur a été volontairement vidée puis sauvegardée.
+        if "iban" in saved_data:
+            self.iban_input.setText(str(saved_data.get("iban") or "").strip())
+        if "bic" in saved_data:
+            self.bic_input.setText(str(saved_data.get("bic") or "").strip())
+        if "invoice_date" in saved_data:
+            saved_invoice_date = str(saved_data.get("invoice_date") or "").strip()
+            self.date_input.setText(normalize_date_format(saved_invoice_date) if saved_invoice_date else "")
+        if "invoice_number" in saved_data:
+            self.invoice_number_input.setText(str(saved_data.get("invoice_number") or "").strip())
 
-        # Transporteur
-        if saved_data.get("transporter_text"):
-            self.transporter_input.setText(saved_data["transporter_text"])
-        saved_aux_account = str(saved_data.get("transporter_aux_account") or "").strip()
-        if saved_aux_account:
+        # Transporteur : même logique, une valeur vide sauvegardée doit vider l'écran.
+        if "transporter_text" in saved_data:
+            self.transporter_input.setText(str(saved_data.get("transporter_text") or "").strip())
+
+        if "transporter_aux_account" in saved_data:
+            saved_aux_account = str(saved_data.get("transporter_aux_account") or "").strip()
             self.transporter_aux_input.setText(saved_aux_account)
             self._pending_saved_transporter_aux = saved_aux_account
+        else:
+            saved_aux_account = ""
 
-        saved_kundennr = str(
-            saved_data.get("transporter_kundennr")
-            or saved_data.get("selected_kundennr")
-            or ""
-        ).strip()
-        if saved_kundennr:
-            self.selected_kundennr = saved_kundennr
+        if "transporter_kundennr" in saved_data or "selected_kundennr" in saved_data:
+            saved_kundennr = str(
+                saved_data.get("transporter_kundennr")
+                or saved_data.get("selected_kundennr")
+                or ""
+            ).strip()
+            self.selected_kundennr = saved_kundennr or None
+            self.transporter_selected_mode = bool(self.selected_kundennr)
             self._pending_saved_transporter_aux_kundennr = saved_kundennr
 
         # Dossiers
@@ -990,6 +1003,8 @@ class MainWindowCoreMixin:
         data["tags"] = sorted(set(tags))
         data["blocked"] = blocked
         data["block_comment"] = block_comment
+        data["saved_by"] = str(getattr(self, "current_username", "") or "").strip()
+        data["saved_at"] = datetime.now().isoformat(timespec="seconds")
 
         # si tu stockes déjà les CMR agrégées sur la facture, on conserve la fonctionnalité
         try:
@@ -1034,6 +1049,12 @@ class MainWindowCoreMixin:
             os.makedirs(os.path.dirname(json_path), exist_ok=True)
             with open(json_path, "w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
+            try:
+                cache = getattr(self, "_saved_json_cache", None)
+                if isinstance(cache, dict):
+                    cache.pop(json_path, None)
+            except Exception:
+                pass
         except Exception as e:
             # si le SQL est passé mais pas le fichier, on le dit clairement
             if show_message:
@@ -1121,6 +1142,12 @@ class MainWindowCoreMixin:
                 os.makedirs(os.path.dirname(json_path), exist_ok=True)
                 with open(json_path, "w", encoding="utf-8") as f:
                     json.dump(data, f, ensure_ascii=False, indent=2)
+                try:
+                    cache = getattr(self, "_saved_json_cache", None)
+                    if isinstance(cache, dict):
+                        cache.pop(json_path, None)
+                except Exception:
+                    pass
         except Exception:
             pass
 
@@ -1156,16 +1183,17 @@ class MainWindowCoreMixin:
             bic = str(data.get("bic", "") or "").strip()
             invoice_number = str(data.get("invoice_number", "") or "").strip()
 
-            # ✅ Ne pas écraser les champs SQL (pré-remplis) par du vide JSON
-            if iban:
+            # ✅ Le JSON est prioritaire quand il existe : il peut être plus récent
+            # que les valeurs SQL déjà chargées dans l'interface d'un autre utilisateur.
+            # On applique aussi les valeurs vides pour propager une suppression.
+            if "iban" in data:
                 self.iban_input.setText(iban)
-            if bic:
+            if "bic" in data:
                 self.bic_input.setText(bic)
-            if invoice_date:
-                self.date_input.setText(normalize_date_format(invoice_date))
-
-
-            self.invoice_number_input.setText(invoice_number)
+            if "invoice_date" in data:
+                self.date_input.setText(normalize_date_format(invoice_date) if invoice_date else "")
+            if "invoice_number" in data:
+                self.invoice_number_input.setText(invoice_number)
 
 
             self._update_left_table_date_iban_bic(
@@ -1181,9 +1209,8 @@ class MainWindowCoreMixin:
 
 
             saved_aux = str(data.get("transporter_aux_account") or "").strip()
-            if saved_aux and not self.transporter_aux_input.text().strip():
+            if "transporter_aux_account" in data:
                 self.transporter_aux_input.setText(saved_aux)
-            if saved_aux:
                 self._pending_saved_transporter_aux = saved_aux
 
 
@@ -1198,9 +1225,10 @@ class MainWindowCoreMixin:
             self._pending_saved_transporter_aux_kundennr = kundennr
 
             # restaurer l'affichage tel quel (même si la BDD ne répond pas)
-            self.transporter_input.blockSignals(True)
-            self.transporter_input.setText(saved_text)
-            self.transporter_input.blockSignals(False)
+            if "transporter_text" in data:
+                self.transporter_input.blockSignals(True)
+                self.transporter_input.setText(saved_text)
+                self.transporter_input.blockSignals(False)
             #self.transporter_vat_input.setText(saved_vat)
 
             # puis, si possible, rafraîchir depuis la BDD
