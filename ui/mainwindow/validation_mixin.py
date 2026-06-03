@@ -808,12 +808,27 @@ class MainWindowValidationMixin:
             self.load_folder(current_folder)
             return
 
-        row = self._find_left_row_for_pdf(pdf_path)
-        if row >= 0:
-            if remove_row:
-                self.pdf_table.removeRow(row)
-            else:
-                self.refresh_left_row_processing_state(row)
+        entry_id = ""
+        if remove_row:
+            try:
+                entry_id = self._resolve_entry_id_for_pdf(pdf_path)
+            except Exception:
+                entry_id = ""
+
+        if remove_row and entry_id and hasattr(self, "pdf_table") and self.pdf_table is not None:
+            for row in range(self.pdf_table.rowCount() - 1, -1, -1):
+                it0 = self.pdf_table.item(row, 0)
+                row_entry_id = str(it0.data(Qt.UserRole + 4) or "").strip() if it0 else ""
+                if row_entry_id == entry_id:
+                    self.pdf_table.removeRow(row)
+        else:
+            row = self._find_left_row_for_pdf(pdf_path)
+            if row >= 0:
+                if remove_row:
+                    self.pdf_table.removeRow(row)
+                else:
+                    self.refresh_left_row_processing_state(row)
+
         self.apply_left_table_search_filter()
 
     def move_pdf_to_errors(self, pdf_path: str, filename: str = ""):
@@ -872,27 +887,68 @@ class MainWindowValidationMixin:
     def mark_pdf_as_deleted(self, pdf_path: str, filename: str = ""):
         self.move_pdf_to_errors(pdf_path, filename)
 
-    def mark_pdf_as_permanently_deleted(self, pdf_path: str, filename: str = ""):
-        if not pdf_path:
-            return
+    def _collect_permanent_delete_documents_for_entry(self, pdf_path: str, entry_id: str = "") -> list[tuple[str, str]]:
+        """Retourne les documents à supprimer pour le même entry_id que pdf_path.
 
-        msg = QMessageBox(self)
-        msg.setWindowTitle("Suppression définitive")
-        msg.setText(
-            "Supprimer définitivement ce fichier de l'application ?\n\n"
-            f"{filename or os.path.basename(strip_entry_prefix(os.path.basename(pdf_path)))}\n\n"
-            "→ Le fichier sera marqué comme supprimé définitivement et n'apparaîtra plus dans le filtre 'Erreurs'."
-        )
-        msg.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
-        if msg.exec() != QMessageBox.Yes:
-            return
+        Chaque élément est un tuple (nom_pdf, chemin_probable). Le chemin peut
+        pointer vers un fichier qui n'existe plus ; il sert aussi à retrouver le
+        JSON de sauvegarde associé au document.
+        """
+        pdf_path = str(pdf_path or "").strip()
+        entry_id = str(entry_id or "").strip()
+        base_dir = os.path.dirname(pdf_path) if pdf_path else ""
 
+        documents: dict[str, str] = {}
+
+        def add_document(name: str = "", path: str = "") -> None:
+            path = str(path or "").strip()
+            name = os.path.basename(str(name or "").strip())
+            if not name and path:
+                name = os.path.basename(path)
+            if not name:
+                return
+            if not path and base_dir:
+                path = os.path.join(base_dir, name)
+            documents.setdefault(name, path)
+
+        # 1) Groupe déjà connu par la ligne de gauche : c'est la source la plus
+        # fidèle à ce que l'utilisateur voit à l'écran.
         try:
-            if self.current_pdf_path == pdf_path:
-                self.save_current_data(show_message=False)
+            row = self._find_left_row_for_pdf(pdf_path)
+            if row >= 0:
+                it0 = self.pdf_table.item(row, 0)
+                if it0:
+                    group_paths = it0.data(Qt.UserRole + 5) or []
+                    if isinstance(group_paths, (list, tuple, set)):
+                        for group_path in group_paths:
+                            add_document(path=str(group_path or ""))
         except Exception:
             pass
 
+        # 2) Tous les fichiers SQL du même entry_id. Cela couvre les documents du
+        # groupe qui ne seraient pas dans la ligne représentative affichée.
+        if entry_id:
+            try:
+                rows = self.logmail_repo.get_files_for_entry(entry_id) or []
+            except Exception:
+                rows = []
+
+            for r in rows:
+                if isinstance(r, dict):
+                    name = r.get("nom_pdf") or r.get("Nom_PDF") or r.get("filename") or ""
+                else:
+                    name = str(r or "")
+                name = str(name or "").strip()
+                if not name:
+                    continue
+                add_document(name=name, path=os.path.join(base_dir, name) if base_dir else name)
+
+        # 3) Fallback obligatoire : au minimum le document sélectionné.
+        add_document(path=pdf_path)
+
+        return [(name, path) for name, path in documents.items()]
+
+    def _mark_saved_json_as_permanently_deleted(self, pdf_path: str, deleted_at: str) -> None:
         json_path, existing = self._load_saved_json_for_pdf_action(pdf_path)
 
         tags = existing.get("tags") or []
@@ -905,12 +961,73 @@ class MainWindowValidationMixin:
         tags_set.discard("supprime")
         tags_set.add("supprime_definitif")
         existing["tags"] = sorted(tags_set)
-        existing["deleted_permanently_at"] = datetime.now().isoformat(timespec="seconds")
+        existing["deleted_permanently_at"] = deleted_at
 
         self._write_saved_json_for_pdf_action(json_path, existing)
 
+    def mark_pdf_as_permanently_deleted(self, pdf_path: str, filename: str = ""):
+        if not pdf_path:
+            return
+
+        entry_id = self._resolve_entry_id_for_pdf(pdf_path)
+        documents = self._collect_permanent_delete_documents_for_entry(pdf_path, entry_id)
+        if not documents:
+            documents = [(os.path.basename(pdf_path), pdf_path)]
+
+        display_names = [format_left_table_filename(name) for name, _path in documents if str(name or "").strip()]
+        preview_names = display_names[:10]
+        preview = "\n".join(f"• {name}" for name in preview_names)
+        if len(display_names) > 10:
+            preview += f"\n• … +{len(display_names) - 10} autre(s) document(s)"
+
+        if entry_id and len(documents) > 1:
+            question = (
+                f"Supprimer définitivement les {len(documents)} documents rattachés au même entry_id ?\n\n"
+                f"entry_id : {entry_id}\n\n"
+                f"{preview}\n\n"
+                "→ Tous ces documents seront marqués comme supprimés définitivement "
+                "et n'apparaîtront plus dans le filtre 'Erreurs'."
+            )
+        else:
+            question = (
+                "Supprimer définitivement ce fichier de l'application ?\n\n"
+                f"{filename or os.path.basename(strip_entry_prefix(os.path.basename(pdf_path)))}\n\n"
+                "→ Le fichier sera marqué comme supprimé définitivement et n'apparaîtra plus dans le filtre 'Erreurs'."
+            )
+
+        msg = QMessageBox(self)
+        msg.setWindowTitle("Suppression définitive")
+        msg.setText(question)
+        msg.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
+        if msg.exec() != QMessageBox.Yes:
+            return
+
         try:
-            self.logmail_repo.set_doc_type_for_file(os.path.basename(pdf_path), "deleted")
+            current_path = os.path.abspath(str(getattr(self, "current_pdf_path", "") or ""))
+            document_paths = {
+                os.path.abspath(str(path or ""))
+                for _name, path in documents
+                if str(path or "").strip()
+            }
+            if current_path and current_path in document_paths:
+                self.save_current_data(show_message=False)
+        except Exception:
+            pass
+
+        deleted_at = datetime.now().isoformat(timespec="seconds")
+        json_errors: list[str] = []
+        for name, path in documents:
+            try:
+                self._mark_saved_json_as_permanently_deleted(path or os.path.join(os.path.dirname(pdf_path), name), deleted_at)
+            except Exception as e:
+                json_errors.append(f"{name or os.path.basename(str(path or ''))} : {e}")
+
+        try:
+            if entry_id and hasattr(self.logmail_repo, "set_doc_type_for_entry"):
+                self.logmail_repo.set_doc_type_for_entry(entry_id, "deleted")
+            else:
+                for name, path in documents:
+                    self.logmail_repo.set_doc_type_for_file(name or os.path.basename(path), "deleted")
         except Exception as e:
             QMessageBox.warning(
                 self,
@@ -918,8 +1035,21 @@ class MainWindowValidationMixin:
                 f"Le tag local a été enregistré, mais le type SQL n'a pas pu être mis à jour :\n{e}"
             )
 
+        if json_errors:
+            QMessageBox.warning(
+                self,
+                "Suppression définitive",
+                "Certains JSON locaux n'ont pas pu être mis à jour :\n" + "\n".join(json_errors[:10])
+            )
+
         self._refresh_after_pdf_state_change(pdf_path, remove_row=True)
-        self.statusBar().showMessage("Fichier supprimé définitivement de l'application.", 2500)
+        if len(documents) > 1:
+            self.statusBar().showMessage(
+                f"{len(documents)} documents du même entry_id supprimés définitivement de l'application.",
+                2500,
+            )
+        else:
+            self.statusBar().showMessage("Fichier supprimé définitivement de l'application.", 2500)
 
     def _refresh_transporter_after_bank_autofill(self):
         # équivalent au clic sur IBAN/BIC : on repasse en recherche par banque

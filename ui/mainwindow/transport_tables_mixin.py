@@ -6,6 +6,48 @@ from .workers import LinkDownloadWorker, LinkPostProcessWorker, _DownloadCancele
 
 class MainWindowTransportTablesMixin:
 
+    def _is_tour_already_in_lisinvoice(self, tour_nr: str) -> tuple[bool, str]:
+        """Retourne si le dossier est déjà présent dans LISINVOICE_EDTRANS.
+
+        Le résultat est mis en cache pour éviter de relancer la requête SQL à
+        chaque repaint / recalcul de la ligne. La validation garde son contrôle
+        SQL direct, donc ce cache ne remplace pas la sécurité métier finale.
+        """
+        tour_nr = str(tour_nr or "").strip()
+        if not tour_nr:
+            return False, ""
+
+        cache = getattr(self, "_lisinvoice_tour_exists_cache", None)
+        if cache is None:
+            cache = {}
+            self._lisinvoice_tour_exists_cache = cache
+
+        if tour_nr in cache:
+            return bool(cache[tour_nr]), ""
+
+        try:
+            exists = bool(self.lisinvoice_repo.tour_exists(tour_nr))
+            cache[tour_nr] = exists
+            return exists, ""
+        except Exception as e:
+            return False, str(e)
+
+    def _apply_tour_invoicing_style(self, dossier_le: QLineEdit, tour_nr: str) -> bool:
+        """Affiche le n° de dossier en rouge s'il est déjà en facturation."""
+        already_invoiced, err = self._is_tour_already_in_lisinvoice(tour_nr)
+
+        if err:
+            dossier_le.setToolTip(f"Erreur contrôle facturation LISINVOICE_EDTRANS : {err}")
+            return False
+
+        if already_invoiced:
+            dossier_le.setStyleSheet("color:#dc3545;")
+            dossier_le.setToolTip("Le dossier est déjà en facturation (LISINVOICE_EDTRANS).")
+            return True
+
+        dossier_le.setToolTip("")
+        return False
+
     def _set_transporter_aux_locked(self, locked: bool, value: str = ""):
         self._transporter_aux_locked = bool(locked)
         self.transporter_aux_input.blockSignals(True)
@@ -908,6 +950,7 @@ class MainWindowTransportTablesMixin:
         amount_ocr = self._parse_amount(amount_le.text())
 
         dossier_le.setStyleSheet("")
+        dossier_le.setToolTip("")
         amount_le.setStyleSheet("")
         amount_le.setToolTip("")
 
@@ -916,6 +959,8 @@ class MainWindowTransportTablesMixin:
             vat_theo_le.setText("")
             vat_theo_le.setToolTip("")
             return
+
+        already_invoiced = self._apply_tour_invoicing_style(dossier_le, tour_nr)
         
         # TVA théorique (BDD)
         try:
@@ -944,7 +989,12 @@ class MainWindowTransportTablesMixin:
             return
 
         if db_kosten is None:
-            dossier_le.setStyleSheet("background-color: #ffe6e6;")
+            if already_invoiced:
+                dossier_le.setStyleSheet("background-color:#ffe6e6; color:#dc3545; font-weight:bold;")
+                dossier_le.setToolTip("Le dossier est déjà en facturation (LISINVOICE_EDTRANS), mais la tournée est introuvable dans xxatour.")
+            else:
+                dossier_le.setStyleSheet("background-color: #ffe6e6;")
+                dossier_le.setToolTip("Tour non trouvée en base (xxatour).")
             amount_le.setStyleSheet("background-color: #ffe6e6;")
             amount_le.setToolTip("Tour non trouvée en base (xxatour).")
             return
