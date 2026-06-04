@@ -188,6 +188,7 @@ class MainWindowCoreMixin:
         self._transporter_aux_locked = True
         self.pallet_details = {}
         self.block_options = {}
+        self._supplier_kundennr_by_tour_cache = {}
 
         # champs facture
         for field in [self.iban_input, self.bic_input, self.date_input, self.invoice_number_input]:
@@ -361,6 +362,164 @@ class MainWindowCoreMixin:
         )
         return reply == QMessageBox.Yes
 
+    def _resolve_supplier_kundennr_from_folders(self) -> tuple[str, str]:
+        """Retourne (KundenNr, TourNr source) depuis un des dossiers saisis.
+
+        Dans WinSped, le transporteur du dossier est porté par xxatour.FFNR.
+        On l'utilise comme KundenNr transporteur pour les modèles supplier.
+        """
+        try:
+            folders = self.get_folder_numbers() if hasattr(self, "get_folder_numbers") else []
+        except Exception:
+            folders = []
+
+        cache = getattr(self, "_supplier_kundennr_by_tour_cache", None)
+        if cache is None:
+            cache = {}
+            self._supplier_kundennr_by_tour_cache = cache
+
+        for tour_nr in folders or []:
+            tour_nr = str(tour_nr or "").strip()
+            if not tour_nr:
+                continue
+
+            if tour_nr in cache:
+                kundennr = str(cache.get(tour_nr) or "").strip()
+            else:
+                try:
+                    kundennr = str(self.tour_repo.get_ffnr_for_tour(tour_nr) or "").strip()
+                except Exception:
+                    kundennr = ""
+                cache[tour_nr] = kundennr
+
+            if kundennr:
+                return kundennr, tour_nr
+
+        return "", ""
+
+    def _extract_kundennr_from_transporter_input(self) -> str:
+        try:
+            m = re.search(r"\((\d+)\)\s*$", self.transporter_input.text() or "")
+            if m:
+                return m.group(1).strip()
+        except Exception:
+            pass
+        return ""
+
+    def _get_supplier_model_context(self, iban: str = "", bic: str = "") -> dict:
+        iban = str(iban or self.iban_input.text() or "").strip()
+        bic = str(bic or self.bic_input.text() or "").strip()
+
+        kundennr, source_tour_nr = self._resolve_supplier_kundennr_from_folders()
+        source = "tour" if kundennr else ""
+
+        if not kundennr:
+            kundennr = str(getattr(self, "selected_kundennr", "") or "").strip()
+            source = "selected" if kundennr else ""
+
+        if not kundennr:
+            kundennr = self._extract_kundennr_from_transporter_input()
+            source = "transporter_input" if kundennr else ""
+
+        primary_key = build_supplier_key_by_kundennr(kundennr) if kundennr else None
+        legacy_key = build_supplier_key(iban, bic)
+
+        return {
+            "kundennr": kundennr,
+            "kundennr_source": source,
+            "source_tour_nr": source_tour_nr,
+            "primary_key": primary_key,
+            "legacy_key": legacy_key,
+            "iban": iban,
+            "bic": bic,
+        }
+
+    def _load_supplier_model_for_current_context(self, *, allow_legacy: bool = True) -> tuple[dict | None, dict]:
+        ctx = self._get_supplier_model_context()
+        candidates = []
+
+        if ctx.get("primary_key"):
+            candidates.append((ctx["primary_key"], "kundennr"))
+
+        legacy_key = ctx.get("legacy_key")
+        if allow_legacy and legacy_key and legacy_key != ctx.get("primary_key"):
+            candidates.append((legacy_key, "bank"))
+
+        for key, key_type in candidates:
+            try:
+                model = load_supplier_model(key)
+            except Exception:
+                model = None
+            if model:
+                ctx["loaded_key"] = key
+                ctx["loaded_key_type"] = key_type
+                return model, ctx
+
+        return None, ctx
+
+    def _merge_vat_lines_from_supplier_model(self, model: dict) -> None:
+        if not model or not model.get("patterns"):
+            return
+
+        ocr_text = self.ocr_text_view.toPlainText() or ""
+        if not ocr_text.strip():
+            return
+
+        try:
+            from ocr.invoice_parser import parse_vat_lines
+            rows = parse_vat_lines(ocr_text, model=model) or []
+        except Exception:
+            return
+
+        existing_vat = {
+            (
+                str(row.get("rate") or "").strip(),
+                str(row.get("base") or "").strip(),
+                str(row.get("vat") or "").strip(),
+            )
+            for row in (self.get_vat_rows() if hasattr(self, "get_vat_rows") else [])
+        }
+
+        changed = False
+        for row in rows:
+            candidate = (
+                str(row.get("rate") or "").strip(),
+                str(row.get("base") or "").strip(),
+                str(row.get("vat") or "").strip(),
+            )
+            if not any(candidate) or candidate in existing_vat:
+                continue
+            if not self._fill_first_empty_vat_row(*candidate):
+                self._add_vat_row(*candidate)
+            existing_vat.add(candidate)
+            changed = True
+
+        if changed:
+            self._ensure_empty_vat_row()
+            self.update_vat_total()
+
+    def _apply_supplier_model_for_current_context(self) -> dict | None:
+        model, ctx = self._load_supplier_model_for_current_context(allow_legacy=True)
+        if not model:
+            return None
+
+        try:
+            self.apply_supplier_model(model)
+            self._merge_vat_lines_from_supplier_model(model)
+        except Exception:
+            pass
+
+        # Si le modèle a été trouvé grâce au dossier, on mémorise aussi le KundenNr
+        # côté écran pour les sauvegardes JSON et les contrôles suivants.
+        try:
+            if ctx.get("kundennr"):
+                self.selected_kundennr = str(ctx.get("kundennr") or "").strip() or None
+                self.transporter_selected_mode = bool(self.selected_kundennr)
+        except Exception:
+            pass
+
+        return model
+
     def on_analyze_pdf_clicked(self, checked: bool = False):
         if self._confirm_relaunch_ocr_data("Analyser le PDF (OCR)"):
             self.analyze_pdf(checked=checked)
@@ -418,13 +577,7 @@ class MainWindowCoreMixin:
             self.update_folder_totals()
             self.check_bank_information()
             self.load_transporter_information()
-            iban = self.iban_input.text().strip()
-            bic = self.bic_input.text().strip()
-            supplier_key = build_supplier_key(iban, bic)
-            model = load_supplier_model(supplier_key)
-
-            if model:
-                self.apply_supplier_model(model)
+            self._apply_supplier_model_for_current_context()
 
             self.highlight_missing_fields()
             ocr_text = self.ocr_text_view.toPlainText() or ""
@@ -448,14 +601,7 @@ class MainWindowCoreMixin:
             ):
                 self.bic_input.setText(best["bic"])
 
-            supplier_key = build_supplier_key(
-                self.iban_input.text().strip(),
-                self.bic_input.text().strip(),
-            )
-            if supplier_key:
-                model = load_supplier_model(supplier_key)
-                if model:
-                    self.apply_supplier_model(model)
+            self._apply_supplier_model_for_current_context()
 
             # ✅ Si aucun IBAN ou BIC valide n'est trouvé, lancer OCR profond automatiquement
             final_iban = self.iban_input.text().strip()
@@ -609,14 +755,7 @@ class MainWindowCoreMixin:
             ):
                 self.bic_input.setText(best["bic"])
 
-            supplier_key = build_supplier_key(
-                self.iban_input.text().strip(),
-                self.bic_input.text().strip(),
-            )
-            if supplier_key:
-                model = load_supplier_model(supplier_key)
-                if model:
-                    self.apply_supplier_model(model)
+            self._apply_supplier_model_for_current_context()
 
             self.highlight_missing_fields()
             if auto_save:
@@ -981,16 +1120,16 @@ class MainWindowCoreMixin:
         data["transporter_aux_account"] = (self.transporter_aux_input.text() or "").strip()
 
         # --- Transporteur : clé canonique + compat ---
-        kundennr = str(getattr(self, "selected_kundennr", "") or "").strip()
+        # Priorité au transporteur du dossier (xxatour.FFNR), plus fiable que
+        # l'IBAN/BIC OCRisé. Si aucun dossier ne permet de le retrouver, on garde
+        # les anciens fallbacks.
+        kundennr, _source_tour_nr = self._resolve_supplier_kundennr_from_folders()
+        if not kundennr:
+            kundennr = str(getattr(self, "selected_kundennr", "") or "").strip()
 
         # fallback si le champ contient "Nom (12345)"
         if not kundennr:
-            try:
-                m = re.search(r"\((\d+)\)\s*$", self.transporter_input.text() or "")
-                if m:
-                    kundennr = m.group(1)
-            except Exception:
-                pass
+            kundennr = self._extract_kundennr_from_transporter_input()
 
         # clé canonique (utilisée par load_saved_data)
         data["transporter_kundennr"] = kundennr
@@ -1408,7 +1547,9 @@ class MainWindowCoreMixin:
     def save_supplier_model(self, checked: bool = False, show_message: bool = True) -> bool:
         ocr_text = self.ocr_text_view.toPlainText() or ""
 
-        # 1) récupérer IBAN/BIC robustes depuis l’OCR (validation + scoring)
+        # 1) récupérer IBAN/BIC robustes depuis l’OCR si possible.
+        # Ils restent stockés dans le modèle pour compatibilité et transition,
+        # mais la clé principale devient le KundenNr trouvé via un dossier.
         best = extract_best_bank_ids(
             ocr_text,
             prefer_iban=self.iban_input.text().strip(),
@@ -1425,16 +1566,20 @@ class MainWindowCoreMixin:
             if bic:
                 self.bic_input.setText(bic)
 
-        supplier_key = build_supplier_key(iban, bic)
+        ctx = self._get_supplier_model_context(iban=iban, bic=bic)
+        supplier_key = ctx.get("primary_key") or ctx.get("legacy_key")
+        key_type = "kundennr" if ctx.get("primary_key") else "bank"
+
         if not supplier_key:
             msg = (
-                "Impossible de sauvegarder le modèle : IBAN/BIC non fiables.\n"
-                "Corrige IBAN/BIC puis réessaie."
+                "Impossible de sauvegarder le modèle : aucun KundenNr trouvé via les dossiers "
+                "et IBAN/BIC non fiables.\n"
+                "Renseigne au moins un dossier valide ou corrige IBAN/BIC puis réessaie."
             )
             if show_message:
                 QMessageBox.warning(self, "Modèle transporteur", msg)
             else:
-                self.statusBar().showMessage("Modèle transporteur non mis à jour (IBAN/BIC non fiables).", 4000)
+                self.statusBar().showMessage("Modèle transporteur non mis à jour (KundenNr/IBAN/BIC introuvables).", 4000)
             return False
 
         # 2) extraire les données TVA pour apprentissage
@@ -1451,14 +1596,20 @@ class MainWindowCoreMixin:
             from ocr.invoice_parser import parse_vat_lines
             vat_lines = parse_vat_lines(ocr_text)
 
-        # 3) charger l’existant
+        # 3) charger l’existant.
+        # Rétrocompatibilité : si le nouveau modèle KundenNr n'existe pas encore,
+        # on repart de l'ancien modèle IBAN_BIC lorsqu'il existe, puis on sauvegarde
+        # sous la nouvelle clé KUNDENNR_xxx.
         existing = load_supplier_model(supplier_key) or {}
+        legacy_key = ctx.get("legacy_key")
+        if not existing and ctx.get("primary_key") and legacy_key:
+            existing = load_supplier_model(legacy_key) or {}
 
         # Supprimer les anciens champs d'exemple pour éviter la confusion
         for old_field in ["invoice_number_example", "date_example", "folder_number_example"]:
             existing.pop(old_field, None)
 
-        # 3) apprendre / merger les patterns
+        # 4) apprendre / merger les patterns
         new_patterns = learn_supplier_patterns(
             ocr_text,
             iban=iban,
@@ -1469,24 +1620,28 @@ class MainWindowCoreMixin:
         )
         merged = merge_patterns(existing.get("patterns") or {}, new_patterns)
 
-        folders = self.get_folder_numbers()
-
-        # 4) construire data
+        # 5) construire data
         data = dict(existing)
         data.update({
             "supplier_key": supplier_key,
-            "iban": iban,
-            "bic": bic,
+            "supplier_key_type": key_type,
+            "supplier_kundennr": ctx.get("kundennr") or existing.get("supplier_kundennr", ""),
+            "supplier_kundennr_source": ctx.get("kundennr_source") or existing.get("supplier_kundennr_source", ""),
+            "source_tour_nr": ctx.get("source_tour_nr") or existing.get("source_tour_nr", ""),
+            "legacy_supplier_key": legacy_key or existing.get("legacy_supplier_key", ""),
+            "iban": iban or existing.get("iban", ""),
+            "bic": bic or existing.get("bic", ""),
             "updated_at": datetime.now().isoformat(timespec="seconds"),
             "patterns": merged,
-            "model_version": 2,
+            "model_version": 3,
         })
 
-        # 5) sauver le fichier
+        # 6) sauver le fichier
         try:
             save_supplier_model(supplier_key, data)
             if show_message:
-                QMessageBox.information(self, "Modèle transporteur", "Modèle transporteur sauvegardé / mis à jour.")
+                detail = "KundenNr" if key_type == "kundennr" else "IBAN/BIC"
+                QMessageBox.information(self, "Modèle transporteur", f"Modèle transporteur sauvegardé / mis à jour ({detail}).")
             else:
                 self.statusBar().showMessage("Modèle transporteur mis à jour.", 3000)
             return True
@@ -1504,11 +1659,17 @@ class MainWindowCoreMixin:
         ocr_text = self.ocr_text_view.toPlainText() or ""
         found = extract_fields_with_model(ocr_text, model)
 
-        # IBAN/BIC : valeur trouvée via patterns, sinon valeur stockée modèle
-        self.iban_input.setText(found.get("iban") or model.get("iban", ""))
+        # IBAN/BIC : valeur trouvée via patterns, sinon valeur stockée modèle.
+        # Important avec les modèles KundenNr : ne pas vider un IBAN/BIC déjà OCRisé
+        # si le nouveau modèle n'en contient pas encore.
+        model_iban = (found.get("iban") or model.get("iban", "") or "").strip()
+        if model_iban:
+            self.iban_input.setText(model_iban)
 
-        if not self.bic_input.text().strip():
-            self.bic_input.setText(found.get("bic") or model.get("bic", ""))
+        model_bic = (found.get("bic") or model.get("bic", "") or "").strip()
+        current_bic = self.bic_input.text().strip()
+        if model_bic and (not current_bic or not validate_bic(current_bic)):
+            self.bic_input.setText(model_bic)
 
         cur = (self.invoice_number_input.text() or "").strip()
         is_date_like = bool(re.fullmatch(r"\d{1,2}[./-]\d{1,2}[./-]\d{2,4}", cur)) or bool(re.fullmatch(r"\d{4}-\d{2}-\d{2}", cur))

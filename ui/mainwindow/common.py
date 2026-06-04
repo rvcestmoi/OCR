@@ -39,10 +39,11 @@ except ImportError:
     
     OCR_ENGINE_AVAILABLE = False
 from ocr.document_classifier import classify_document_text
-from ocr.supplier_model import (build_supplier_key, extract_best_bank_ids,
-                                extract_fields_with_model, learn_supplier_patterns,
-                                load_supplier_model, merge_patterns,
-                                save_supplier_model, validate_bic, validate_iban)
+from ocr.supplier_model import (build_supplier_key, build_supplier_key_by_kundennr,
+                                extract_best_bank_ids, extract_fields_with_model,
+                                learn_supplier_patterns, load_supplier_model,
+                                merge_patterns, save_supplier_model,
+                                validate_bic, validate_iban)
 from ui.block_options_dialog import BlockOptionsDialog
 from ui.folder_select_dialog import FolderSelectDialog
 from ui.pdf_viewer import PdfViewer
