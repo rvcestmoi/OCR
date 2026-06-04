@@ -37,6 +37,21 @@ def build_supplier_key(iban: str, bic: str) -> Optional[str]:
     return f"{iban}_{bic}"
 
 
+def build_supplier_key_by_kundennr(kundennr: str) -> Optional[str]:
+    """Clé canonique des modèles transporteurs basée sur le KundenNr/FFNR.
+
+    Historiquement les modèles étaient nommés avec IBAN_BIC. Pour éviter les
+    erreurs dues à un IBAN/BIC mal OCRisé ou absent, les nouveaux modèles sont
+    maintenant rattachés au transporteur WinSped trouvé via le dossier
+    (xxatour.FFNR). Le préfixe évite toute collision avec les anciens fichiers.
+    """
+    value = str(kundennr or "").replace(" ", "").replace("\u00A0", "").strip().upper()
+    value = re.sub(r"[^A-Z0-9_-]", "", value)
+    if not value:
+        return None
+    return f"KUNDENNR_{value}"
+
+
 def _model_path(supplier_key: str) -> str:
     os.makedirs(MODEL_DIR, exist_ok=True)
     return os.path.join(MODEL_DIR, f"{supplier_key}.json")
