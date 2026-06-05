@@ -43,6 +43,8 @@ class MainWindowValidationMixin:
             return
         if not self._block_validate_if_transporter_not_matching_tours():
             return
+        if not self._block_validate_if_iban_not_matching_transporter():
+            return
         if not self._block_validate_if_ht_amounts_not_matching_tours():
             return
 
@@ -357,7 +359,7 @@ class MainWindowValidationMixin:
     def update_transporter_vs_dossiers_status(self):
         """
         Règle demandée :
-        - si IBAN/BIC => transporteur trouvé en base
+        - le transporteur vient du premier dossier (xxatour.FFNR)
         - et si TOUS les dossiers sont trouvés via :
             SELECT tournr FROM xxatour WHERE tournr IN (...)
         => VERT
@@ -635,26 +637,36 @@ class MainWindowValidationMixin:
             self._set_left_row_visual(row, "error", "Tag 'supprime' : fichier marqué comme supprimé.")
             return
 
-        iban = str(data.get("iban") or "").strip()
-        bic = str(data.get("bic") or "").strip()
         tournrs = self._extract_tournrs_from_saved(data)
 
-        if not iban or not bic:
-            self._set_left_row_visual(row, "error", "IBAN/BIC manquant dans le JSON.")
-            return
         if not tournrs:
             self._set_left_row_visual(row, "error", "Aucun dossier (TourNr) dans le JSON.")
             return
 
-        # 1) transporteur trouvé par iban/bic ?
+        first_tour = ""
+        folders_saved = data.get("folders") or []
+        if isinstance(folders_saved, list):
+            for f in folders_saved:
+                if isinstance(f, dict):
+                    first_tour = str(f.get("tour_nr") or f.get("TourNr") or f.get("tournr") or "").strip()
+                else:
+                    first_tour = str(f or "").strip()
+                if first_tour:
+                    break
+        if not first_tour:
+            first_tour = str(data.get("folder_number") or "").strip()
+        if not first_tour:
+            first_tour = str(tournrs[0] or "").strip()
+
+        # 1) transporteur déterminé par le premier dossier ?
         try:
-            rec = self.transporter_repo.find_transporter_by_bank(iban, bic)
+            kundennr = str(self.tour_repo.get_ffnr_for_tour(first_tour) or "").strip()
         except Exception as e:
-            self._set_left_row_visual(row, "error", f"Erreur SQL transporteur: {e}")
+            self._set_left_row_visual(row, "error", f"Erreur SQL transporteur via dossier {first_tour}: {e}")
             return
 
-        if not rec:
-            self._set_left_row_visual(row, "error", "Transporteur introuvable en base pour cet IBAN/BIC.")
+        if not kundennr:
+            self._set_left_row_visual(row, "error", f"Aucun KundenNr transporteur sur le premier dossier {first_tour} (xxatour.FFNR vide).")
             return
 
         # 2) tous les dossiers existent dans xxatour ?
@@ -670,7 +682,24 @@ class MainWindowValidationMixin:
             self._set_left_row_visual(row, "error", f"Dossier(s) manquant(s) en xxatour: {', '.join(missing[:6])}{more}")
             return
 
-        self._set_left_row_visual(row, "ok", "OK : transporteur trouvé + tous les dossiers présents en base.")
+        # 3) tous les dossiers doivent porter le même FFNR que le premier.
+        try:
+            matching = self.tour_repo.get_tournrs_matching_ffnr(tournrs, kundennr)
+            invalid = [t for t in tournrs if t not in matching]
+        except Exception as e:
+            self._set_left_row_visual(row, "error", f"Erreur SQL cohérence transporteur/dossiers: {e}")
+            return
+
+        if invalid:
+            more = "" if len(invalid) <= 6 else f" (+{len(invalid)-6})"
+            self._set_left_row_visual(
+                row,
+                "error",
+                f"Dossier(s) avec un autre transporteur que {kundennr}: {', '.join(invalid[:6])}{more}"
+            )
+            return
+
+        self._set_left_row_visual(row, "ok", f"OK : transporteur {kundennr} depuis le premier dossier + dossiers présents en base.")
 
     def refresh_left_table_processing_states(self):
         if not hasattr(self, "pdf_table") or self.pdf_table is None:
@@ -1052,16 +1081,13 @@ class MainWindowValidationMixin:
             self.statusBar().showMessage("Fichier supprimé définitivement de l'application.", 2500)
 
     def _refresh_transporter_after_bank_autofill(self):
-        # équivalent au clic sur IBAN/BIC : on repasse en recherche par banque
-        self.transporter_selected_mode = False
-        self.selected_kundennr = None
-
+        # IBAN/BIC restent utiles pour contrôler la banque, mais ils ne doivent
+        # plus déterminer le transporteur. Le transporteur reste celui du
+        # premier dossier (xxatour.FFNR).
         iban = self.iban_input.text().strip()
         bic = self.bic_input.text().strip()
-        if not iban or not bic:
-            return  # on attend d'avoir les deux
-
-        self.check_bank_information()
+        if iban and bic:
+            self.check_bank_information()
         self.load_transporter_information(force_by_kundennr=False)
 
     def compact_folder_rows(self):
@@ -1090,6 +1116,8 @@ class MainWindowValidationMixin:
 
             # refresh totaux / statuts
             self.update_folder_totals()
+            self._last_transporter_source_tour_nr = self._get_first_folder_number() if hasattr(self, "_get_first_folder_number") else None
+            self.load_transporter_information(force_by_kundennr=False)
             self.update_transporter_vs_dossiers_status()
 
         finally:
@@ -1259,6 +1287,156 @@ class MainWindowValidationMixin:
             return False
 
         return True
+
+    def _get_validation_block_options(self) -> dict:
+        """Retourne les motifs de blocage connus au moment de la validation."""
+        block_options = getattr(self, "block_options", {}) or {}
+        if isinstance(block_options, dict) and block_options:
+            return block_options
+
+        # Fallback : si l'état mémoire n'est pas encore rempli, on relit le JSON
+        # courant. Cela évite de valider à tort après un rechargement partiel.
+        try:
+            pdf_path = self._get_validation_document_path() or str(getattr(self, "current_pdf_path", "") or "").strip()
+            if pdf_path and hasattr(self, "_read_saved_invoice_json"):
+                data = self._read_saved_invoice_json(pdf_path) or {}
+                loaded = data.get("block_options", {}) or {}
+                if isinstance(loaded, dict):
+                    return loaded
+        except Exception:
+            pass
+
+        return {}
+
+    def _has_active_iban_block_reason(self) -> bool:
+        """Vrai si un document du groupe a un blocage actif avec motif IBAN."""
+        block_options = self._get_validation_block_options()
+        if not isinstance(block_options, dict):
+            return False
+
+        for info in block_options.values():
+            if not isinstance(info, dict) or not bool(info.get("blocked", False)):
+                continue
+
+            reason = str(info.get("reason") or "").strip()
+            comment = str(info.get("comment") or "").strip()
+
+            # Le dialogue stocke normalement reason="IBAN". On garde aussi le
+            # fallback sur comment pour compatibilité avec d'anciens JSON.
+            if reason.upper() == "IBAN":
+                return True
+            if re.search(r"\bIBAN\b", comment, flags=re.IGNORECASE):
+                return True
+
+        return False
+
+    def _block_validate_if_iban_not_matching_transporter(self) -> bool:
+        """Bloque la validation si l'IBAN OCR ne correspond pas à XXAKunBank.
+
+        Exception métier : la validation reste possible si la facture est
+        volontairement bloquée avec le motif IBAN. Dans ce cas les tournées
+        partent en état bloqué, ce qui permet de traiter le litige sans perdre
+        la facture.
+        """
+        iban = self.iban_input.text().strip() if hasattr(self, "iban_input") else ""
+
+        # Le contrôle demandé porte sur un IBAN OCRisé valide. Les champs vides
+        # ou invalides sont déjà visibles dans l'UI et ne doivent pas provoquer
+        # un faux écart transporteur/banque.
+        if not iban or not validate_iban(iban):
+            try:
+                if hasattr(self, "check_bank_information"):
+                    self.check_bank_information()
+            except Exception:
+                pass
+            return True
+
+        kundennr = str(getattr(self, "selected_kundennr", "") or "").strip()
+
+        if not kundennr:
+            try:
+                kundennr, _source_tour_nr = self._resolve_supplier_kundennr_from_folders()
+                kundennr = str(kundennr or "").strip()
+            except Exception:
+                kundennr = ""
+
+        # Le contrôle transporteur juste avant celui-ci affichera déjà un message
+        # clair si aucun KundenNr n'est déterminable.
+        if not kundennr:
+            return True
+
+        try:
+            banks = self.bank_repo.get_all_bank_infos_by_kundennr(kundennr) or []
+        except Exception as e:
+            QMessageBox.warning(
+                self,
+                "Validation impossible",
+                "Erreur lors du contrôle IBAN du transporteur dans XXAKunBank.\n\n"
+                f"Transporteur : {kundennr}\n"
+                f"Détail : {e}"
+            )
+            return False
+
+        db_pairs = [
+            (
+                str((b or {}).get("iban") or "").strip(),
+                str((b or {}).get("bic") or "").strip(),
+            )
+            for b in banks
+            if str((b or {}).get("iban") or "").strip() or str((b or {}).get("bic") or "").strip()
+        ]
+
+        # On met à jour l'état UI pour rester cohérent avec le fond rouge déjà
+        # utilisé à l'affichage.
+        self.current_db_bank_pairs = db_pairs
+        if db_pairs:
+            self.current_db_iban = db_pairs[0][0]
+            self.current_db_bic = db_pairs[0][1]
+        else:
+            self.current_db_iban = ""
+            self.current_db_bic = ""
+
+        try:
+            if hasattr(self, "check_bank_information"):
+                self.check_bank_information()
+            if hasattr(self, "_refresh_transporter_bank_transfer_button"):
+                self._refresh_transporter_bank_transfer_button()
+        except Exception:
+            pass
+
+        iban_matches = False
+        try:
+            iban_matches = bool(self._transporter_has_iban(iban))
+        except Exception:
+            iban_norm = str(iban or "").replace(" ", "").replace("\u00A0", "").replace("-", "").upper().strip()
+            iban_matches = any(
+                iban_norm == str(db_iban or "").replace(" ", "").replace("\u00A0", "").replace("-", "").upper().strip()
+                for db_iban, _db_bic in db_pairs
+            )
+
+        if iban_matches:
+            return True
+
+        if self._has_active_iban_block_reason():
+            return True
+
+        db_values = "aucun IBAN en base"
+        try:
+            if hasattr(self, "_format_current_transporter_bank_values"):
+                db_values = self._format_current_transporter_bank_values()
+        except Exception:
+            pass
+
+        QMessageBox.warning(
+            self,
+            "Validation impossible",
+            "L'IBAN OCR ne correspond pas à l'IBAN enregistré sur la fiche banque du transporteur.\n\n"
+            f"Transporteur : {kundennr}\n"
+            f"IBAN OCR : {iban}\n"
+            f"IBAN/BIC XXAKunBank : {db_values}\n\n"
+            "Validation bloquée. Pour valider malgré cet écart, ajoute un motif de blocage IBAN."
+        )
+        return False
 
     def _block_validate_if_ht_amounts_not_matching_tours(self) -> bool:
         rows = self.get_folder_rows()

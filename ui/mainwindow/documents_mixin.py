@@ -786,7 +786,7 @@ class MainWindowDocumentsMixin:
 
                 invoice_date, iban, bic = new_date, new_iban, new_bic
 
-            # Pays (dépend souvent du transporteur trouvé via IBAN/BIC)
+            # Pays : dépend du transporteur du premier dossier, pas d'IBAN/BIC.
             lkz = self._get_country_for_document(rep_path, iban, bic)
             self.pdf_table.setItem(row_index, 4, QTableWidgetItem(lkz))
 
@@ -904,15 +904,13 @@ class MainWindowDocumentsMixin:
         iban = (iban or "").strip()
         bic = (bic or "").strip()
 
-        # Pays (LKZ) : priorité au transporteur sélectionné, sinon déduction via IBAN/BIC
+        # Pays (LKZ) : uniquement depuis le transporteur du dossier.
         lkz = ""
         try:
             if getattr(self, "selected_kundennr", None):
                 lkz = str(self.transporter_repo.get_lkz_by_kundennr(str(self.selected_kundennr)) or "").strip()
         except Exception:
             lkz = ""
-        if not lkz:
-            lkz = self._get_country_for_bank(iban, bic)
 
         for row in range(self.pdf_table.rowCount()):
             it0 = self.pdf_table.item(row, 0)
@@ -1260,21 +1258,40 @@ class MainWindowDocumentsMixin:
     def _get_country_for_document(self, pdf_path: str, iban: str | None, bic: str | None) -> str:
         """Pays (LKZ) affiché dans la liste de gauche.
 
-        Priorité :
-        1) si le JSON sauvegardé contient transporter_kundennr => on lit LKZ dans XXAKun
-        2) sinon fallback sur la recherche par banque (IBAN/BIC)
+        Le pays suit la nouvelle règle transporteur : on part du KundenNr du
+        premier dossier sauvegardé. IBAN/BIC ne servent plus à déterminer le
+        transporteur ni le pays.
         """
+        kundennr = ""
         try:
             data = self._read_saved_invoice_json(pdf_path) or {}
-            kundennr = str(data.get("transporter_kundennr") or "").strip()
+            kundennr = str(data.get("transporter_kundennr") or data.get("selected_kundennr") or "").strip()
+            if not kundennr:
+                folders = data.get("folders") or []
+                first_tour = ""
+                if isinstance(folders, list):
+                    for row in folders:
+                        if isinstance(row, dict):
+                            first_tour = str(row.get("tour_nr") or "").strip()
+                        else:
+                            first_tour = str(row or "").strip()
+                        if first_tour:
+                            break
+                if not first_tour:
+                    folder_numbers = data.get("folder_numbers") or []
+                    if isinstance(folder_numbers, list) and folder_numbers:
+                        first_tour = str(folder_numbers[0] or "").strip()
+                    else:
+                        first_tour = str(data.get("folder_number") or "").strip()
+                if first_tour:
+                    kundennr = str(self.tour_repo.get_ffnr_for_tour(first_tour) or "").strip()
+
             if kundennr:
-                lkz = str(self.transporter_repo.get_lkz_by_kundennr(kundennr) or "").strip()
-                if lkz:
-                    return lkz
+                return str(self.transporter_repo.get_lkz_by_kundennr(kundennr) or "").strip()
         except Exception:
             pass
 
-        return self._get_country_for_bank(iban, bic)
+        return ""
 
     def _update_left_row_for_entry(self, entry_id: str, invoice_date: str, iban: str, bic: str, country: str = ""):
         """Met à jour la ligne 'groupe' (1 ligne par entry_id) dans la table de gauche."""

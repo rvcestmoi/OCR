@@ -20,14 +20,14 @@ class MainWindowCoreMixin:
         # ✅ Volet info selon champ actif
         # ✅ Volet info selon champ actif
         if field in (self.iban_input, self.bic_input):
-            # IBAN/BIC -> toujours par banque
-            self.transporter_selected_mode = False
+            # IBAN/BIC : contrôle banque uniquement. Le transporteur reste celui du premier dossier.
+            self.check_bank_information()
             self.load_transporter_information(force_by_kundennr=False)
             return
 
         if field == self.transporter_input:
-            # Transporteur -> si on a sélectionné un transporteur avant, on recharge par kundennr
-            self.load_transporter_information(force_by_kundennr=self.transporter_selected_mode)
+            # Transporteur verrouillé : il est déterminé par le premier dossier.
+            self.load_transporter_information(force_by_kundennr=False)
             return
 
         for r in range(self.folder_table.rowCount()):
@@ -181,6 +181,7 @@ class MainWindowCoreMixin:
         self.selected_kundennr = None
         self.current_db_iban = None
         self.current_db_bic = None
+        self.current_db_bank_pairs = []
         self.transporter_selected_mode = False
         self._pending_saved_transporter_aux = ""
         self._pending_saved_transporter_aux_kundennr = ""
@@ -189,6 +190,9 @@ class MainWindowCoreMixin:
         self.pallet_details = {}
         self.block_options = {}
         self._supplier_kundennr_by_tour_cache = {}
+        self._last_transporter_source_tour_nr = None
+        self._bank_transporter_mismatch = False
+        self._bank_transporter_mismatch_fields = set()
 
         # champs facture
         for field in [self.iban_input, self.bic_input, self.date_input, self.invoice_number_input]:
@@ -198,9 +202,16 @@ class MainWindowCoreMixin:
             field.blockSignals(False)
 
         # transporteur
-        self.transporter_input.blockSignals(True)
-        self.transporter_input.clear()
-        self.transporter_input.blockSignals(False)
+        if hasattr(self, "_set_transporter_input_locked"):
+            self._set_transporter_input_locked("")
+        else:
+            self.transporter_input.blockSignals(True)
+            self.transporter_input.clear()
+            self.transporter_input.setReadOnly(True)
+            self.transporter_input.setFocusPolicy(Qt.ClickFocus)
+            self.transporter_input.setClearButtonEnabled(False)
+            self.transporter_input.setStyleSheet("background-color: #f3f3f3;")
+            self.transporter_input.blockSignals(False)
         if hasattr(self, "_set_transporter_aux_locked"):
             self._set_transporter_aux_locked(True, "")
         else:
@@ -274,10 +285,8 @@ class MainWindowCoreMixin:
         if "invoice_number" in saved_data:
             self.invoice_number_input.setText(str(saved_data.get("invoice_number") or "").strip())
 
-        # Transporteur : même logique, une valeur vide sauvegardée doit vider l'écran.
-        if "transporter_text" in saved_data:
-            self.transporter_input.setText(str(saved_data.get("transporter_text") or "").strip())
-
+        # Transporteur : le texte sauvegardé n'est plus restauré directement.
+        # Il est recalculé depuis le premier dossier via xxatour.FFNR.
         if "transporter_aux_account" in saved_data:
             saved_aux_account = str(saved_data.get("transporter_aux_account") or "").strip()
             self.transporter_aux_input.setText(saved_aux_account)
@@ -285,15 +294,14 @@ class MainWindowCoreMixin:
         else:
             saved_aux_account = ""
 
+        # Ancienne valeur JSON conservée uniquement pour faire le lien avec le
+        # compte auxiliaire si elle correspond encore au KundenNr du dossier.
         if "transporter_kundennr" in saved_data or "selected_kundennr" in saved_data:
-            saved_kundennr = str(
+            self._pending_saved_transporter_aux_kundennr = str(
                 saved_data.get("transporter_kundennr")
                 or saved_data.get("selected_kundennr")
                 or ""
             ).strip()
-            self.selected_kundennr = saved_kundennr or None
-            self.transporter_selected_mode = bool(self.selected_kundennr)
-            self._pending_saved_transporter_aux_kundennr = saved_kundennr
 
         # Dossiers
         folders = saved_data.get("folders") or []
@@ -330,13 +338,13 @@ class MainWindowCoreMixin:
         self.update_vat_total()
         self._ensure_empty_vat_row()
 
-        # Vérifier les informations bancaires si IBAN/BIC remplis
+        # Vérifier les informations bancaires si IBAN/BIC remplis, mais le
+        # transporteur vient uniquement du premier dossier.
         iban = self.iban_input.text().strip()
         bic = self.bic_input.text().strip()
         if iban and bic:
             self.check_bank_information()
-        if self.transporter_input.text().strip():
-            self.load_transporter_information()
+        self.load_transporter_information(force_by_kundennr=False)
 
         # Charger l'expéditeur depuis logmail
         entry_id = getattr(self, "selected_invoice_entry_id", None)
@@ -363,39 +371,43 @@ class MainWindowCoreMixin:
         return reply == QMessageBox.Yes
 
     def _resolve_supplier_kundennr_from_folders(self) -> tuple[str, str]:
-        """Retourne (KundenNr, TourNr source) depuis un des dossiers saisis.
+        """Retourne (KundenNr, TourNr source) depuis le premier dossier.
 
-        Dans WinSped, le transporteur du dossier est porté par xxatour.FFNR.
-        On l'utilise comme KundenNr transporteur pour les modèles supplier.
+        Le transporteur et les modèles supplier sont désormais rattachés au
+        premier TourNr de la facture. On ne cherche plus un transporteur en
+        parcourant IBAN/BIC ou une sélection manuelle.
         """
+        try:
+            if hasattr(self, "_resolve_transporter_from_first_folder"):
+                kundennr, source_tour_nr, _err = self._resolve_transporter_from_first_folder()
+                return str(kundennr or "").strip(), str(source_tour_nr or "").strip()
+        except Exception:
+            pass
+
         try:
             folders = self.get_folder_numbers() if hasattr(self, "get_folder_numbers") else []
         except Exception:
             folders = []
+
+        source_tour_nr = str((folders or [""])[0] or "").strip()
+        if not source_tour_nr:
+            return "", ""
 
         cache = getattr(self, "_supplier_kundennr_by_tour_cache", None)
         if cache is None:
             cache = {}
             self._supplier_kundennr_by_tour_cache = cache
 
-        for tour_nr in folders or []:
-            tour_nr = str(tour_nr or "").strip()
-            if not tour_nr:
-                continue
+        if source_tour_nr in cache:
+            kundennr = str(cache.get(source_tour_nr) or "").strip()
+        else:
+            try:
+                kundennr = str(self.tour_repo.get_ffnr_for_tour(source_tour_nr) or "").strip()
+            except Exception:
+                kundennr = ""
+            cache[source_tour_nr] = kundennr
 
-            if tour_nr in cache:
-                kundennr = str(cache.get(tour_nr) or "").strip()
-            else:
-                try:
-                    kundennr = str(self.tour_repo.get_ffnr_for_tour(tour_nr) or "").strip()
-                except Exception:
-                    kundennr = ""
-                cache[tour_nr] = kundennr
-
-            if kundennr:
-                return kundennr, tour_nr
-
-        return "", ""
+        return kundennr, source_tour_nr
 
     def _extract_kundennr_from_transporter_input(self) -> str:
         try:
@@ -412,14 +424,6 @@ class MainWindowCoreMixin:
 
         kundennr, source_tour_nr = self._resolve_supplier_kundennr_from_folders()
         source = "tour" if kundennr else ""
-
-        if not kundennr:
-            kundennr = str(getattr(self, "selected_kundennr", "") or "").strip()
-            source = "selected" if kundennr else ""
-
-        if not kundennr:
-            kundennr = self._extract_kundennr_from_transporter_input()
-            source = "transporter_input" if kundennr else ""
 
         primary_key = build_supplier_key_by_kundennr(kundennr) if kundennr else None
         legacy_key = build_supplier_key(iban, bic)
@@ -442,7 +446,10 @@ class MainWindowCoreMixin:
             candidates.append((ctx["primary_key"], "kundennr"))
 
         legacy_key = ctx.get("legacy_key")
-        if allow_legacy and legacy_key and legacy_key != ctx.get("primary_key"):
+        # Rétrocompatibilité uniquement si le KundenNr du premier dossier existe :
+        # on peut migrer un ancien modèle IBAN/BIC vers KUNDENNR_xxx, mais on ne
+        # charge plus un transporteur/modèle uniquement depuis IBAN/BIC.
+        if ctx.get("primary_key") and allow_legacy and legacy_key and legacy_key != ctx.get("primary_key"):
             candidates.append((legacy_key, "bank"))
 
         for key, key_type in candidates:
@@ -576,31 +583,32 @@ class MainWindowCoreMixin:
 
             self.update_folder_totals()
             self.check_bank_information()
-            self.load_transporter_information()
+            self.load_transporter_information(force_by_kundennr=False)
             self._apply_supplier_model_for_current_context()
 
             self.highlight_missing_fields()
             ocr_text = self.ocr_text_view.toPlainText() or ""
-            best = extract_best_bank_ids(
-                ocr_text,
-                prefer_iban=self.iban_input.text().strip(),
-                prefer_bic=self.bic_input.text().strip(),
-            )
+            # Ici on laisse l'OCR choisir réellement l'IBAN/BIC du document.
+            # Ne pas booster la valeur déjà présente : elle peut venir d'un ancien
+            # modèle transporteur KundenNr et empêcherait la bonne valeur OCR de remonter.
+            best = extract_best_bank_ids(ocr_text)
 
             current_iban = self.iban_input.text().strip()
             current_bic = self.bic_input.text().strip()
             bic_scores = dict(best.get("bic_candidates") or [])
             best_bic_score = int(bic_scores.get(best.get("bic") or "", 0) or 0)
             current_bic_score = int(bic_scores.get(current_bic.replace(" ", "").upper(), 0) or 0)
-            if best["iban"] and (not current_iban or not validate_iban(current_iban)):
+            if best["iban"] and best["iban"] != current_iban.replace(" ", "").replace("-", "").upper():
                 self.iban_input.setText(best["iban"])
             if best["bic"] and (
                 not current_bic
                 or not validate_bic(current_bic)
-                or (best["bic"] != current_bic.replace(" ", "").upper() and best_bic_score > current_bic_score)
+                or (best["bic"] != current_bic.replace(" ", "").upper() and best_bic_score >= current_bic_score)
             ):
                 self.bic_input.setText(best["bic"])
 
+            self.check_bank_information()
+            self.enable_transporter_update()
             self._apply_supplier_model_for_current_context()
 
             # ✅ Si aucun IBAN ou BIC valide n'est trouvé, lancer OCR profond automatiquement
@@ -734,27 +742,27 @@ class MainWindowCoreMixin:
             self.autofill_folder_amounts_from_ocr(merged_text)
             self.update_folder_totals()
             self.check_bank_information()
-            self.load_transporter_information()
+            self.load_transporter_information(force_by_kundennr=False)
 
-            best = extract_best_bank_ids(
-                merged_text,
-                prefer_iban=self.iban_input.text().strip(),
-                prefer_bic=self.bic_input.text().strip(),
-            )
+            # OCR profond : même règle, la valeur trouvée dans le document prime
+            # sur une ancienne valeur déjà présente à l'écran.
+            best = extract_best_bank_ids(merged_text)
             current_iban = self.iban_input.text().strip()
             current_bic = self.bic_input.text().strip()
             bic_scores = dict(best.get("bic_candidates") or [])
             best_bic_score = int(bic_scores.get(best.get("bic") or "", 0) or 0)
             current_bic_score = int(bic_scores.get(current_bic.replace(" ", "").upper(), 0) or 0)
-            if best["iban"] and (not current_iban or not validate_iban(current_iban)):
+            if best["iban"] and best["iban"] != current_iban.replace(" ", "").replace("-", "").upper():
                 self.iban_input.setText(best["iban"])
             if best["bic"] and (
                 not current_bic
                 or not validate_bic(current_bic)
-                or (best["bic"] != current_bic.replace(" ", "").upper() and best_bic_score > current_bic_score)
+                or (best["bic"] != current_bic.replace(" ", "").upper() and best_bic_score >= current_bic_score)
             ):
                 self.bic_input.setText(best["bic"])
 
+            self.check_bank_information()
+            self.enable_transporter_update()
             self._apply_supplier_model_for_current_context()
 
             self.highlight_missing_fields()
@@ -927,8 +935,14 @@ class MainWindowCoreMixin:
     def highlight_missing_fields(self):
         fields = [self.iban_input, self.bic_input, self.date_input, self.invoice_number_input]
         for field in fields:
-            if field in (self.iban_input, self.bic_input) and self.bank_valid is not None:
-                continue
+            if field in (self.iban_input, self.bic_input):
+                mismatch_fields = getattr(self, "_bank_transporter_mismatch_fields", set()) or set()
+                if self.bank_valid is not None:
+                    continue
+                if field == self.iban_input and "iban" in mismatch_fields:
+                    continue
+                if field == self.bic_input and "bic" in mismatch_fields:
+                    continue
             field.setStyleSheet("background-color: #ffe6e6;" if not field.text().strip() else "background-color: #e6ffe6;")
 
         rows = self.get_folder_rows()
@@ -950,6 +964,15 @@ class MainWindowCoreMixin:
             field.clear()
             field.setStyleSheet("")
         self.clear_folder_fields()
+        self.selected_kundennr = None
+        self.transporter_selected_mode = False
+        self._last_transporter_source_tour_nr = None
+        if hasattr(self, "_set_transporter_input_locked"):
+            self._set_transporter_input_locked("")
+        else:
+            self.transporter_input.clear()
+        if hasattr(self, "_set_transporter_aux_locked"):
+            self._set_transporter_aux_locked(True, "")
 
     def append_ocr_text(self, text: str):
         if not text.strip():
@@ -1120,16 +1143,9 @@ class MainWindowCoreMixin:
         data["transporter_aux_account"] = (self.transporter_aux_input.text() or "").strip()
 
         # --- Transporteur : clé canonique + compat ---
-        # Priorité au transporteur du dossier (xxatour.FFNR), plus fiable que
-        # l'IBAN/BIC OCRisé. Si aucun dossier ne permet de le retrouver, on garde
-        # les anciens fallbacks.
+        # Le transporteur est imposé par le premier dossier (xxatour.FFNR).
+        # On ne retombe plus sur IBAN/BIC ou une sélection manuelle pour le déterminer.
         kundennr, _source_tour_nr = self._resolve_supplier_kundennr_from_folders()
-        if not kundennr:
-            kundennr = str(getattr(self, "selected_kundennr", "") or "").strip()
-
-        # fallback si le champ contient "Nom (12345)"
-        if not kundennr:
-            kundennr = self._extract_kundennr_from_transporter_input()
 
         # clé canonique (utilisée par load_saved_data)
         data["transporter_kundennr"] = kundennr
@@ -1344,37 +1360,19 @@ class MainWindowCoreMixin:
 
 
             # --- Transporteur ---
-            saved_text = str(data.get("transporter_text") or "").strip()
-
-
+            # Le texte transporteur sauvegardé n'est plus restauré directement :
+            # il est recalculé après reconstruction des dossiers, depuis le
+            # premier TourNr via xxatour.FFNR.
             saved_aux = str(data.get("transporter_aux_account") or "").strip()
             if "transporter_aux_account" in data:
                 self.transporter_aux_input.setText(saved_aux)
                 self._pending_saved_transporter_aux = saved_aux
 
-
-            kundennr = str(
+            self._pending_saved_transporter_aux_kundennr = str(
                 data.get("transporter_kundennr")
                 or data.get("selected_kundennr")
                 or ""
             ).strip()
-
-            self.selected_kundennr = kundennr or None
-            self.transporter_selected_mode = bool(self.selected_kundennr)
-            self._pending_saved_transporter_aux_kundennr = kundennr
-
-            # restaurer l'affichage tel quel (même si la BDD ne répond pas)
-            if "transporter_text" in data:
-                self.transporter_input.blockSignals(True)
-                self.transporter_input.setText(saved_text)
-                self.transporter_input.blockSignals(False)
-            #self.transporter_vat_input.setText(saved_vat)
-
-            # puis, si possible, rafraîchir depuis la BDD
-            if self.selected_kundennr:
-                self.load_transporter_information(force_by_kundennr=True)
-            elif iban and bic:
-                self.load_transporter_information(force_by_kundennr=False)
 
             # --- OCR texte ---
             ocr_text = data.get("ocr_text", "")
@@ -1382,6 +1380,9 @@ class MainWindowCoreMixin:
 
             # ✅ dossiers + TVA (ta fonction rebuild gère déjà tout proprement)
             self.rebuild_folder_fields_from_json(data)
+
+            # Transporteur recalculé depuis le premier dossier seulement.
+            self.load_transporter_information(force_by_kundennr=False)
             return True
 
         except Exception as e:
@@ -1567,19 +1568,18 @@ class MainWindowCoreMixin:
                 self.bic_input.setText(bic)
 
         ctx = self._get_supplier_model_context(iban=iban, bic=bic)
-        supplier_key = ctx.get("primary_key") or ctx.get("legacy_key")
-        key_type = "kundennr" if ctx.get("primary_key") else "bank"
+        supplier_key = ctx.get("primary_key")
+        key_type = "kundennr"
 
         if not supplier_key:
             msg = (
-                "Impossible de sauvegarder le modèle : aucun KundenNr trouvé via les dossiers "
-                "et IBAN/BIC non fiables.\n"
-                "Renseigne au moins un dossier valide ou corrige IBAN/BIC puis réessaie."
+                "Impossible de sauvegarder le modèle : aucun KundenNr trouvé via le premier dossier.\n"
+                "Renseigne au moins un dossier valide, présent dans xxatour avec FFNR, puis réessaie."
             )
             if show_message:
                 QMessageBox.warning(self, "Modèle transporteur", msg)
             else:
-                self.statusBar().showMessage("Modèle transporteur non mis à jour (KundenNr/IBAN/BIC introuvables).", 4000)
+                self.statusBar().showMessage("Modèle transporteur non mis à jour (KundenNr du premier dossier introuvable).", 4000)
             return False
 
         # 2) extraire les données TVA pour apprentissage
@@ -1663,7 +1663,10 @@ class MainWindowCoreMixin:
         # Important avec les modèles KundenNr : ne pas vider un IBAN/BIC déjà OCRisé
         # si le nouveau modèle n'en contient pas encore.
         model_iban = (found.get("iban") or model.get("iban", "") or "").strip()
-        if model_iban:
+        current_iban = self.iban_input.text().strip()
+        # Ne pas écraser un IBAN déjà OCRisé / saisi valide avec l'IBAN stocké
+        # dans le modèle KundenNr. Le modèle sert de secours, l'OCR du document prime.
+        if model_iban and (not current_iban or not validate_iban(current_iban)):
             self.iban_input.setText(model_iban)
 
         model_bic = (found.get("bic") or model.get("bic", "") or "").strip()

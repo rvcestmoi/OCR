@@ -102,33 +102,135 @@ class TransporterRepository(BaseRepository):
         return self.fetch_one(query, (kundennr,))
 
 
-    def update_bank(self, kundennr: str, iban: str, bic: str):
-        # Vérifier si ligne existe
-        check_query = """
-            SELECT COUNT(*) AS cnt
+    def _same_bank_pair(self, iban_a: str, bic_a: str, iban_b: str, bic_b: str) -> bool:
+        ia = self._normalize_bank_value(iban_a)
+        ib = self._normalize_bank_value(iban_b)
+        if not ia or ia != ib:
+            return False
+
+        ba = self._normalize_bank_value(bic_a)
+        bb = self._normalize_bank_value(bic_b)
+        if not ba or not bb:
+            return ba == bb
+
+        # Le BIC peut être enregistré en 8 ou 11 caractères selon les fiches.
+        return ba == bb or ba[:8] == bb[:8]
+
+    def update_bank(self, kundennr: str, iban: str, bic: str) -> dict:
+        """Met à jour/insère l'IBAN-BIC principal du transporteur.
+
+        La méthode précédente lançait l'UPDATE/INSERT sans contrôler qu'une ligne
+        avait réellement été touchée. Ici on :
+          1. normalise les valeurs OCR ;
+          2. met à jour la ligne banque principale si elle existe ;
+          3. insère une ligne LfdNr=1 si aucune banque n'existe ;
+          4. relit SQL Server pour confirmer la présence effective de l'IBAN/BIC.
+        """
+        kundennr = str(kundennr or "").strip()
+        iban = self._normalize_bank_value(iban)
+        bic = self._normalize_bank_value(bic)
+
+        if not kundennr:
+            raise ValueError("KundenNr vide : mise à jour banque impossible.")
+        if not iban or not bic:
+            raise ValueError("IBAN/BIC vides : mise à jour banque impossible.")
+
+        existing_pair = self.fetch_one(
+            """
+            SELECT TOP 1 IBAN, SWIFT, LfdNr
             FROM xxakunbank
             WHERE KundenNr = ?
-        """
+              AND REPLACE(REPLACE(REPLACE(UPPER(COALESCE(IBAN, '')), ' ', ''), '-', ''), CHAR(160), '') = ?
+              AND (
+                    REPLACE(REPLACE(REPLACE(UPPER(COALESCE(SWIFT, '')), ' ', ''), '-', ''), CHAR(160), '') = ?
+                    OR LEFT(REPLACE(REPLACE(REPLACE(UPPER(COALESCE(SWIFT, '')), ' ', ''), '-', ''), CHAR(160), ''), 8) = ?
+                  )
+            ORDER BY ISNULL(LfdNr, 999999)
+            """,
+            (kundennr, iban, bic, bic[:8]),
+        )
+        if existing_pair:
+            return {
+                "action": "already_exists",
+                "rows_affected": 0,
+                "iban": str(existing_pair.get("IBAN") or "").strip(),
+                "bic": str(existing_pair.get("SWIFT") or "").strip(),
+                "lfdnr": existing_pair.get("LfdNr"),
+            }
 
-        result = self.fetch_one(check_query, (kundennr,))
-        exists = result and result.get("cnt", 0) > 0
-
-        if exists:
-            query = """
-                UPDATE xxakunbank
-                SET IBAN = ?, SWIFT = ?, LfdNr = 1  
-                WHERE KundenNr = ?
+        main_bank = self.fetch_one(
             """
-            self.execute(query, (iban, bic, kundennr))
-            print("UPDATE effectué")
+            SELECT TOP 1 IBAN, SWIFT, LfdNr
+            FROM xxakunbank
+            WHERE KundenNr = ?
+            ORDER BY ISNULL(LfdNr, 999999)
+            """,
+            (kundennr,),
+        )
 
+        action = "inserted"
+        rows_affected = 0
+
+        if main_bank:
+            lfdnr = main_bank.get("LfdNr")
+            if lfdnr is None:
+                rows_affected = self.execute_rowcount(
+                    """
+                    UPDATE xxakunbank
+                    SET IBAN = ?, SWIFT = ?
+                    WHERE KundenNr = ?
+                      AND LfdNr IS NULL
+                    """,
+                    (iban, bic, kundennr),
+                )
+            else:
+                rows_affected = self.execute_rowcount(
+                    """
+                    UPDATE xxakunbank
+                    SET IBAN = ?, SWIFT = ?
+                    WHERE KundenNr = ?
+                      AND LfdNr = ?
+                    """,
+                    (iban, bic, kundennr, lfdnr),
+                )
+            action = "updated"
         else:
-            query = """
+            rows_affected = self.execute_rowcount(
+                """
                 INSERT INTO xxakunbank (KundenNr, IBAN, SWIFT, LfdNr)
-                VALUES (?, ?, ?,1)
+                VALUES (?, ?, ?, 1)
+                """,
+                (kundennr, iban, bic),
+            )
+
+        if rows_affected <= 0:
+            raise RuntimeError(
+                f"Aucune ligne XXAKunBank modifiée pour le transporteur {kundennr}."
+            )
+
+        saved = self.fetch_one(
             """
-            self.execute(query, (kundennr, iban, bic))
-            print("INSERT effectué")
+            SELECT TOP 1 IBAN, SWIFT, LfdNr
+            FROM xxakunbank
+            WHERE KundenNr = ?
+            ORDER BY ISNULL(LfdNr, 999999)
+            """,
+            (kundennr,),
+        )
+
+        if not saved or not self._same_bank_pair(iban, bic, saved.get("IBAN"), saved.get("SWIFT")):
+            raise RuntimeError(
+                "La mise à jour SQL a été exécutée, mais la relecture XXAKunBank "
+                "ne retrouve pas l'IBAN/BIC attendu."
+            )
+
+        return {
+            "action": action,
+            "rows_affected": rows_affected,
+            "iban": str(saved.get("IBAN") or "").strip(),
+            "bic": str(saved.get("SWIFT") or "").strip(),
+            "lfdnr": saved.get("LfdNr"),
+        }
 
 
 

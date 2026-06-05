@@ -49,3 +49,19 @@ class BaseRepository:
             cursor = conn.cursor()
             cursor.execute(query, self._normalize_params(params))
             conn.commit()
+
+    def execute_rowcount(self, query: str, params: tuple = ()) -> int:
+        """Exécute une requête d'écriture et retourne le nombre de lignes touchées.
+
+        Utile pour éviter d'afficher un succès alors qu'un UPDATE n'a en réalité
+        rien modifié côté SQL Server.
+        """
+        with self._connection.connect() as conn:
+            cursor = conn.cursor()
+            cursor.execute(query, self._normalize_params(params))
+            rowcount = cursor.rowcount
+            conn.commit()
+            try:
+                return int(rowcount or 0)
+            except Exception:
+                return 0

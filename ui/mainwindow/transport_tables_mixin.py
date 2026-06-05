@@ -71,6 +71,203 @@ class MainWindowTransportTablesMixin:
 
         self.transporter_aux_input.setStyleSheet(f"background-color: {bg}; {extra}")
 
+    def _normalize_iban_for_compare(self, value: str) -> str:
+        return (
+            str(value or "")
+            .replace(" ", "")
+            .replace("\u00A0", "")
+            .replace("-", "")
+            .upper()
+            .strip()
+        )
+
+    def _normalize_bic_for_compare(self, value: str) -> str:
+        return (
+            str(value or "")
+            .replace(" ", "")
+            .replace("\u00A0", "")
+            .replace("-", "")
+            .upper()
+            .strip()
+        )
+
+    def _same_bank_pair(self, iban_a: str, bic_a: str, iban_b: str, bic_b: str) -> bool:
+        """Compare IBAN/BIC en tenant compte des BIC 8 ou 11 caractères."""
+        ia = self._normalize_iban_for_compare(iban_a)
+        ib = self._normalize_iban_for_compare(iban_b)
+        if not ia or ia != ib:
+            return False
+
+        ba = self._normalize_bic_for_compare(bic_a)
+        bb = self._normalize_bic_for_compare(bic_b)
+        if not ba or not bb:
+            return ba == bb
+
+        return ba == bb or ba[:8] == bb[:8]
+
+    def _transporter_has_bank_pair(self, iban: str, bic: str) -> bool:
+        for db_iban, db_bic in getattr(self, "current_db_bank_pairs", []) or []:
+            if self._same_bank_pair(iban, bic, db_iban, db_bic):
+                return True
+        return False
+
+    def _transporter_has_iban(self, iban: str) -> bool:
+        iban_norm = self._normalize_iban_for_compare(iban)
+        if not iban_norm:
+            return False
+
+        for db_iban, _db_bic in getattr(self, "current_db_bank_pairs", []) or []:
+            if iban_norm == self._normalize_iban_for_compare(db_iban):
+                return True
+        return False
+
+    def _transporter_has_bic_for_iban(self, iban: str, bic: str) -> bool:
+        iban_norm = self._normalize_iban_for_compare(iban)
+        bic_norm = self._normalize_bic_for_compare(bic)
+        if not iban_norm or not bic_norm:
+            return False
+
+        for db_iban, db_bic in getattr(self, "current_db_bank_pairs", []) or []:
+            if iban_norm != self._normalize_iban_for_compare(db_iban):
+                continue
+
+            db_bic_norm = self._normalize_bic_for_compare(db_bic)
+            if not db_bic_norm:
+                continue
+
+            if bic_norm == db_bic_norm or bic_norm[:8] == db_bic_norm[:8]:
+                return True
+
+        return False
+
+    def _format_current_transporter_bank_values(self) -> str:
+        pairs = []
+        seen = set()
+        for db_iban, db_bic in getattr(self, "current_db_bank_pairs", []) or []:
+            db_iban = str(db_iban or "").strip()
+            db_bic = str(db_bic or "").strip()
+            if not db_iban and not db_bic:
+                continue
+            key = (db_iban, db_bic)
+            if key in seen:
+                continue
+            seen.add(key)
+            pairs.append(f"{db_iban or '(IBAN vide)'} | {db_bic or '(BIC vide)'}")
+
+        return "; ".join(pairs) if pairs else "aucun IBAN/BIC en base"
+
+    def _apply_bank_field_styles(self):
+        """Style IBAN/BIC selon la banque OCR et la banque du transporteur courant.
+
+        Ancien comportement conservé : vert si l'IBAN/BIC existe quelque part en
+        base, jaune sinon. Nouveau comportement prioritaire : rouge si l'IBAN
+        OCR ne correspond pas aux coordonnées XXAKunBank du transporteur imposé
+        par le premier dossier.
+        """
+        if not hasattr(self, "iban_input") or not hasattr(self, "bic_input"):
+            return
+
+        iban = self.iban_input.text().strip()
+        bic = self.bic_input.text().strip()
+
+        green = "background-color: #e6ffe6;"
+        yellow = "background-color: #fff3cd;"
+        red = "background-color: #f8d7da; border: 2px solid #dc3545;"
+
+        # On ne force pas de couleur sur les champs vides : highlight_missing_fields
+        # continue à gérer les champs obligatoires manquants.
+        iban_style = ""
+        bic_style = ""
+        iban_tooltip = ""
+        bic_tooltip = ""
+        transporter_mismatch_fields = set()
+
+        if iban or bic:
+            if self.bank_valid is True:
+                iban_style = green if iban else ""
+                bic_style = green if bic else ""
+            elif self.bank_valid is False:
+                iban_style = yellow if iban else ""
+                bic_style = yellow if bic else ""
+
+        kundennr = str(getattr(self, "selected_kundennr", "") or "").strip()
+        db_pairs = list(getattr(self, "current_db_bank_pairs", []) or [])
+
+        # Contrôle fort uniquement quand un transporteur est effectivement
+        # déterminé depuis le dossier et que l'IBAN OCR est valide.
+        if kundennr and iban and validate_iban(iban):
+            db_values = self._format_current_transporter_bank_values()
+
+            if not db_pairs:
+                transporter_mismatch_fields.add("iban")
+                iban_style = red
+                iban_tooltip = (
+                    f"L'IBAN OCR ne peut pas être retrouvé dans XXAKunBank pour "
+                    f"le transporteur {kundennr}. Valeur BD : {db_values}."
+                )
+            elif not self._transporter_has_iban(iban):
+                transporter_mismatch_fields.add("iban")
+                iban_style = red
+                iban_tooltip = (
+                    f"IBAN OCR différent de l'IBAN XXAKunBank du transporteur "
+                    f"{kundennr}. Valeur BD : {db_values}."
+                )
+            elif bic and validate_bic(bic) and not self._transporter_has_bic_for_iban(iban, bic):
+                transporter_mismatch_fields.add("bic")
+                # L'IBAN est bon, mais le BIC OCR ne correspond pas à la même
+                # ligne banque du transporteur. On laisse l'IBAN vert/jaune et
+                # on signale uniquement le BIC.
+                bic_style = red
+                bic_tooltip = (
+                    f"BIC OCR différent du SWIFT XXAKunBank pour cet IBAN "
+                    f"sur le transporteur {kundennr}. Valeur BD : {db_values}."
+                )
+
+        self._bank_transporter_mismatch_fields = transporter_mismatch_fields
+        self._bank_transporter_mismatch = bool(transporter_mismatch_fields)
+        self.iban_input.setStyleSheet(iban_style)
+        self.bic_input.setStyleSheet(bic_style)
+        self.iban_input.setToolTip(iban_tooltip)
+        self.bic_input.setToolTip(bic_tooltip)
+
+    def _refresh_transporter_bank_transfer_button(self):
+        """Active le bouton ➡ uniquement si l'IBAN/BIC OCR peut corriger la fiche transporteur.
+
+        Le transporteur reste verrouillé et vient toujours du premier dossier.
+        Ce bouton ne change que les coordonnées bancaires XXAKunBank du KundenNr
+        déjà déterminé par la tournée.
+        """
+        if not hasattr(self, "btn_transporter_action") or self.btn_transporter_action is None:
+            return
+
+        enabled = False
+        tooltip = ""
+        kundennr = str(getattr(self, "selected_kundennr", "") or "").strip()
+        iban = self.iban_input.text().strip() if hasattr(self, "iban_input") else ""
+        bic = self.bic_input.text().strip() if hasattr(self, "bic_input") else ""
+
+        if not kundennr:
+            tooltip = "Aucun transporteur déterminé par le dossier."
+        elif not iban or not bic:
+            tooltip = "IBAN/BIC OCR incomplets : transfert impossible."
+        elif not validate_iban(iban):
+            tooltip = "IBAN OCR invalide : transfert impossible."
+        elif not validate_bic(bic):
+            tooltip = "BIC OCR invalide : transfert impossible."
+        elif self._transporter_has_bank_pair(iban, bic):
+            tooltip = "Cet IBAN/BIC est déjà présent sur la fiche transporteur."
+        else:
+            enabled = True
+            old_iban = str(getattr(self, "current_db_iban", "") or "").strip()
+            old_bic = str(getattr(self, "current_db_bic", "") or "").strip()
+            if old_iban or old_bic:
+                tooltip = f"Transférer l'IBAN/BIC OCR vers le transporteur {kundennr}. Valeur BD actuelle : {old_iban} | {old_bic}"
+            else:
+                tooltip = f"Créer l'IBAN/BIC OCR sur le transporteur {kundennr}."
+
+        self.btn_transporter_action.setEnabled(enabled)
+        self.btn_transporter_action.setToolTip(tooltip)
+
     def on_prev_page(self):
         self.pdf_viewer.previous_page()
         self.update_page_indicator()
@@ -182,67 +379,162 @@ class MainWindowTransportTablesMixin:
         bic = self.bic_input.text().strip()
         self.bank_valid = None
 
-        if not iban or not bic:
+        if iban and bic:
+            record = self.bank_repo.find_by_iban_bic(iban, bic)
+            self.bank_valid = bool(record)
+
+        self._apply_bank_field_styles()
+
+    def _set_transporter_input_locked(self, value: str = ""):
+        """Affiche le transporteur en lecture seule.
+
+        Le transporteur n'est plus une donnée OCR / banque modifiable : il est
+        imposé par le KundenNr (FFNR) du premier dossier de la facture.
+        """
+        if not hasattr(self, "transporter_input") or self.transporter_input is None:
             return
 
-        record = self.bank_repo.find_by_iban_bic(iban, bic)
-        if record:
-            self.bank_valid = True
-            self.iban_input.setStyleSheet("background-color: #e6ffe6;")
-            self.bic_input.setStyleSheet("background-color: #e6ffe6;")
-        else:
-            self.bank_valid = False
-            self.iban_input.setStyleSheet("background-color: #fff3cd;")
-            self.bic_input.setStyleSheet("background-color: #fff3cd;")
+        self.transporter_input.blockSignals(True)
+        self.transporter_input.setText(str(value or "").strip())
+        self.transporter_input.setReadOnly(True)
+        self.transporter_input.setFocusPolicy(Qt.ClickFocus)
+        self.transporter_input.setClearButtonEnabled(False)
+        try:
+            self.transporter_input.setCompleter(None)
+        except Exception:
+            pass
+        self.transporter_input.setStyleSheet("background-color: #f3f3f3;")
+        self.transporter_input.blockSignals(False)
 
+    def _get_first_folder_number(self) -> str:
+        try:
+            for row in self.get_folder_rows() or []:
+                tour_nr = str((row or {}).get("tour_nr") or "").strip()
+                if tour_nr:
+                    return tour_nr
+        except Exception:
+            pass
+        return ""
+
+    def _resolve_transporter_from_first_folder(self) -> tuple[str, str, str]:
+        """Retourne (kundennr, tour_nr_source, erreur) depuis le premier dossier.
+
+        On ne parcourt plus les dossiers pour chercher un transporteur par IBAN/BIC.
+        Le premier TourNr renseigné est la source métier unique du transporteur.
+        """
+        tour_nr = self._get_first_folder_number()
+        if not tour_nr:
+            return "", "", ""
+
+        try:
+            if not re.fullmatch(self.DOSSIER_PATTERN, tour_nr):
+                return "", tour_nr, f"Numéro de dossier invalide : {tour_nr}"
+        except Exception:
+            pass
+
+        cache = getattr(self, "_supplier_kundennr_by_tour_cache", None)
+        if cache is None:
+            cache = {}
+            self._supplier_kundennr_by_tour_cache = cache
+
+        if tour_nr in cache:
+            kundennr = str(cache.get(tour_nr) or "").strip()
+        else:
+            try:
+                kundennr = str(self.tour_repo.get_ffnr_for_tour(tour_nr) or "").strip()
+            except Exception as e:
+                return "", tour_nr, str(e)
+            cache[tour_nr] = kundennr
+
+        return kundennr, tour_nr, ""
+
+    def _refresh_transporter_from_first_folder(self):
+        self.load_transporter_information(force_by_kundennr=False)
 
     def load_transporter_information(self, force_by_kundennr: bool = False):
+        """Charge le transporteur depuis le premier dossier uniquement.
+
+        Ancienne logique supprimée côté UI : on ne recherche plus le transporteur
+        depuis IBAN/BIC et on ne le laisse plus modifiable manuellement. Le
+        KundenNr est lu dans xxatour.FFNR à partir du premier TourNr saisi.
+        """
         try:
-            self.transporter_info.clear()
+            if hasattr(self, "transporter_info") and self.transporter_info is not None:
+                self.transporter_info.clear()
 
-            kundennr = ""
-            transporter = None
+            kundennr, source_tour_nr, err = self._resolve_transporter_from_first_folder()
 
-            if force_by_kundennr:
-                kundennr = str(getattr(self, "selected_kundennr", "") or "").strip()
-                if not kundennr:
-                    self.transporter_info.setPlainText("ℹ️ Aucun transporteur sélectionné.")
-                    self.transporter_input.clear()
-                    self._set_transporter_aux_locked(True, "")
-                    return
-
-                transporter = self.transporter_repo.find_transporter_by_kundennr(kundennr)
-
-            else:
-                iban = self.iban_input.text().strip()
-                bic = self.bic_input.text().strip()
-
-                if not iban or not bic:
-                    self.transporter_info.setPlainText("ℹ️ Aucun IBAN/BIC renseigné.")
-                    self.transporter_input.clear()
-                    self._set_transporter_aux_locked(True, "")
-                    return
-
-                transporter = self.transporter_repo.find_transporter_by_bank(iban, bic)
-                if transporter:
-                    kundennr = str(transporter.get("KundenNr") or "").strip()
-                    self.selected_kundennr = kundennr
-                else:
-                    self.selected_kundennr = None
-
-            if not transporter:
-                if force_by_kundennr and kundennr:
-                    self.transporter_info.setPlainText(f"❌ Transporteur introuvable : {kundennr}")
-                else:
-                    self.transporter_info.setPlainText("❌ Aucun transporteur trouvé pour cet IBAN / SWIFT.")
-                self.transporter_input.clear()
+            if err:
+                self.selected_kundennr = None
+                self.transporter_selected_mode = False
+                self._set_transporter_input_locked("")
                 self._set_transporter_aux_locked(True, "")
+                self.current_db_iban = ""
+                self.current_db_bic = ""
+                self.current_db_bank_pairs = []
+                self.check_bank_information()
+                self._refresh_transporter_bank_transfer_button()
+                self.transporter_info.setPlainText(f"❌ Transporteur non déterminé depuis le dossier {source_tour_nr or ''} :\n{err}")
+                return
+
+            if not source_tour_nr:
+                self.selected_kundennr = None
+                self.transporter_selected_mode = False
+                self._set_transporter_input_locked("")
+                self._set_transporter_aux_locked(True, "")
+                self.current_db_iban = ""
+                self.current_db_bic = ""
+                self.current_db_bank_pairs = []
+                self.check_bank_information()
+                self._refresh_transporter_bank_transfer_button()
+                self.transporter_info.setPlainText("ℹ️ Aucun dossier renseigné : transporteur non déterminé.")
                 return
 
             if not kundennr:
-                kundennr = str(transporter.get("KundenNr") or "").strip()
+                self.selected_kundennr = None
+                self.transporter_selected_mode = False
+                self._set_transporter_input_locked("")
+                self._set_transporter_aux_locked(True, "")
+                self.current_db_iban = ""
+                self.current_db_bic = ""
+                self.current_db_bank_pairs = []
+                self.check_bank_information()
+                self._refresh_transporter_bank_transfer_button()
+                self.transporter_info.setPlainText(
+                    f"❌ Aucun KundenNr transporteur trouvé sur le dossier {source_tour_nr} (xxatour.FFNR vide)."
+                )
+                return
 
+            # Le KundenNr vient du dossier : il devient la référence métier même
+            # si la fiche transporteur détaillée n'est pas trouvée.
             self.selected_kundennr = kundennr
+            self.transporter_selected_mode = True
+
+            try:
+                transporter = self.transporter_repo.find_transporter_by_kundennr(kundennr)
+            except Exception as e:
+                transporter = None
+                self.transporter_info.setPlainText(f"Erreur chargement fiche transporteur {kundennr} :\n{e}")
+
+            if not transporter:
+                self._set_transporter_input_locked(kundennr)
+                self._set_transporter_aux_locked(True, "")
+                self.current_db_iban = ""
+                self.current_db_bic = ""
+                self.current_db_bank_pairs = []
+                self.check_bank_information()
+                self._refresh_transporter_bank_transfer_button()
+                if not self.transporter_info.toPlainText().strip():
+                    self.transporter_info.setPlainText(
+                        f"Transporteur déterminé par le dossier {source_tour_nr}.\n"
+                        f"KundenNr : {kundennr}\n"
+                        "❌ Fiche transporteur introuvable."
+                    )
+                try:
+                    self.update_transporter_vs_dossiers_status()
+                except Exception:
+                    pass
+                return
 
             aux_row = self.transporter_repo.get_ktoKreA_by_kundennr(kundennr)
             db_aux = str((aux_row or {}).get("KtoKreA") or "").strip()
@@ -256,20 +548,19 @@ class MainWindowTransportTablesMixin:
                 self._set_transporter_aux_locked(False, candidate_aux)
 
             transporter_name = str(transporter.get("name1", "") or "").strip()
-            vat_no = str(transporter.get("USTIDNR", "") or "").strip()
-
             if transporter_name and kundennr:
-                self.transporter_input.setText(f"{transporter_name} ({kundennr})")
+                display_text = f"{transporter_name} ({kundennr})"
             elif transporter_name:
-                self.transporter_input.setText(transporter_name)
-            elif kundennr:
-                self.transporter_input.setText(kundennr)
-
-            #self.transporter_vat_input.setText(vat_no)
+                display_text = transporter_name
+            else:
+                display_text = kundennr
+            self._set_transporter_input_locked(display_text)
 
             banks = self.bank_repo.get_all_bank_infos_by_kundennr(kundennr)
 
             lines = []
+            lines.append(f"Transporteur déterminé par le dossier : {source_tour_nr}")
+            lines.append(f"KundenNr : {kundennr}")
             lines.append(f"Transporteur : {str(transporter.get('name1', '') or '').strip()}")
 
             address_line = [
@@ -280,7 +571,7 @@ class MainWindowTransportTablesMixin:
             ]
             address_line = [p for p in address_line if p]
 
-            ustid = str(transporter.get("UstId", "") or "").strip()
+            ustid = str(transporter.get("UstId", "") or transporter.get("USTIDNR", "") or "").strip()
 
             if address_line:
                 lines.append("Adresse : " + ", ".join(address_line))
@@ -310,129 +601,129 @@ class MainWindowTransportTablesMixin:
 
             self.transporter_info.setPlainText("\n".join(lines))
 
-            # MAJ colonne 'Pays' (LKZ) dans la liste de gauche dès qu'un transporteur est trouvé
-            try:
-                if getattr(self, "current_pdf_path", None):
-                    self._update_left_table_date_iban_bic(
-                        self.current_pdf_path,
-                        (self.date_input.text() if hasattr(self, "date_input") else ""),
-                        (self.iban_input.text() if hasattr(self, "iban_input") else ""),
-                        (self.bic_input.text() if hasattr(self, "bic_input") else ""),
-                    )
-            except Exception:
-                pass
-
-            # mémorise la banque actuellement affichée pour le bouton de mise à jour
-            if force_by_kundennr:
-                first_bank = banks[0] if banks else {}
-                self.current_db_iban = str(first_bank.get("iban", "") or "").strip()
-                self.current_db_bic = str(first_bank.get("bic", "") or "").strip()
-            else:
-                self.current_db_iban = str(transporter.get("IBAN", "") or "").strip()
-                self.current_db_bic = str(transporter.get("SWIFT", "") or "").strip()
-
+            self.current_db_bank_pairs = [
+                (
+                    str(b.get("iban", "") or "").strip(),
+                    str(b.get("bic", "") or "").strip(),
+                )
+                for b in (banks or [])
+                if str(b.get("iban", "") or "").strip() or str(b.get("bic", "") or "").strip()
+            ]
+            first_bank = banks[0] if banks else {}
+            self.current_db_iban = str(first_bank.get("iban", "") or "").strip()
+            self.current_db_bic = str(first_bank.get("bic", "") or "").strip()
+            self.check_bank_information()
+            self._refresh_transporter_bank_transfer_button()
             self._pending_saved_transporter_aux = ""
             self._pending_saved_transporter_aux_kundennr = ""
 
+            try:
+                self.update_transporter_vs_dossiers_status()
+            except Exception:
+                pass
+
+            try:
+                self._maybe_prompt_duplicate_invoice()
+            except Exception:
+                pass
+
         except Exception as e:
-            self.transporter_info.setPlainText(f"Erreur chargement transporteur :\n{e}")
-
-
+            self.selected_kundennr = None
+            self.transporter_selected_mode = False
+            try:
+                self._set_transporter_input_locked("")
+                self._set_transporter_aux_locked(True, "")
+                self.current_db_bank_pairs = []
+                self.check_bank_information()
+                self._refresh_transporter_bank_transfer_button()
+            except Exception:
+                pass
+            self.transporter_info.setPlainText(f"Erreur chargement transporteur depuis le dossier :\n{e}")
 
     def on_bank_fields_changed(self):
+        # IBAN/BIC restent contrôlés pour information, mais ne déterminent plus
+        # le transporteur. Le bouton ➡ reste disponible pour corriger la banque
+        # du transporteur déjà imposé par le premier dossier.
         self.check_bank_information()
-        self.load_transporter_information()
+        self._refresh_transporter_bank_transfer_button()
 
     def search_transporters(self, text: str):
-        # si déjà format "Name (123)" on ne relance pas de recherche
-        if "(" in text and ")" in text:
-            return
-        if len(text.strip()) < 2:
+        # Le transporteur est imposé par le premier dossier, il n'est plus
+        # recherchable / modifiable manuellement.
+        try:
             self.transporter_model.setStringList([])
-            return
-
-        try:
-            rows = self.transporter_repo.search_transporters_by_name(text.strip())
-            suggestions = [f"{r['name1']} ({r['kundennr']})" for r in rows]
-            self.transporter_model.setStringList(suggestions)
-        except Exception as e:
-            print("Erreur recherche transporteur:", e)
-
-    def on_transporter_selected(self, text: str):
-        self.transporter_input.setText(text)
-
-        if "(" in text and ")" in text:
-            self.selected_kundennr = text.split("(")[-1].replace(")", "").strip()
-        else:
-            self.selected_kundennr = None
-
-        # ✅ On passe en mode "transporteur choisi"
-        self.transporter_selected_mode = bool(self.selected_kundennr)
-
-        # ✅ Charger le transporteur par KundenNr (pas par IBAN/BIC)
-        self._pending_saved_transporter_aux = ""
-        self._pending_saved_transporter_aux_kundennr = ""
-        self.load_transporter_information(force_by_kundennr=True)
-
-        self.enable_transporter_update()
-        # ✅ si un n° de facture est déjà saisi, on vérifie tout de suite le doublon
-        try:
-            self._maybe_prompt_duplicate_invoice()
         except Exception:
             pass
 
+    def on_transporter_selected(self, text: str):
+        # Sélection manuelle désactivée : on recharge depuis le dossier pour
+        # annuler toute tentative venant d'un ancien completer encore présent.
+        self.load_transporter_information(force_by_kundennr=False)
+
     def on_transporter_action(self):
-        if not self.selected_kundennr:
+        kundennr = str(getattr(self, "selected_kundennr", "") or "").strip()
+        iban = self.iban_input.text().strip()
+        bic = self.bic_input.text().strip()
+
+        if not kundennr:
+            QMessageBox.warning(self, "Transfert IBAN/BIC", "Aucun transporteur déterminé par le premier dossier.")
+            self._refresh_transporter_bank_transfer_button()
             return
 
-        kundennr = self.selected_kundennr
-        new_iban = self.iban_input.text().strip()
-        new_bic = self.bic_input.text().strip()
+        if not iban or not bic or not validate_iban(iban) or not validate_bic(bic):
+            QMessageBox.warning(self, "Transfert IBAN/BIC", "IBAN/BIC OCR incomplets ou invalides.")
+            self._refresh_transporter_bank_transfer_button()
+            return
 
-        old_record = self.transporter_repo.get_bank_by_kundennr(kundennr)
-        old_iban = old_record.get("IBAN", "") if old_record else ""
-        old_bic = old_record.get("SWIFT", "") if old_record else ""
+        if self._transporter_has_bank_pair(iban, bic):
+            QMessageBox.information(self, "Transfert IBAN/BIC", "Cet IBAN/BIC est déjà présent sur la fiche transporteur.")
+            self._refresh_transporter_bank_transfer_button()
+            return
 
-        msg = QMessageBox(self)
-        msg.setWindowTitle("Mise à jour banque")
-        msg.setText(
-            "Voulez-vous mettre à jour les coordonnées bancaires ?\n\n"
-            f"Ancien IBAN : {old_iban}\n"
-            f"Ancien BIC  : {old_bic}\n\n"
-            f"Nouveau IBAN : {new_iban}\n"
-            f"Nouveau BIC  : {new_bic}"
+        old_iban = str(getattr(self, "current_db_iban", "") or "").strip()
+        old_bic = str(getattr(self, "current_db_bic", "") or "").strip()
+        msg = (
+            f"Mettre à jour les coordonnées bancaires du transporteur {kundennr} ?\n\n"
+            f"Valeur BD actuelle : {old_iban or '(vide)'} | {old_bic or '(vide)'}\n"
+            f"Valeur OCR à transférer : {iban} | {bic}"
         )
-        msg.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
+        resp = QMessageBox.question(
+            self,
+            "Transfert IBAN/BIC",
+            msg,
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if resp != QMessageBox.Yes:
+            return
 
-        if msg.exec() == QMessageBox.Yes:
-            self.transporter_repo.update_bank(kundennr, new_iban, new_bic)
+        try:
+            result = self.transporter_repo.update_bank(kundennr, iban, bic)
 
-            # IMPORTANT: on ne relance PAS load_transporter_information() ici,
-            # sinon ça risque de re-lire la BDD (pas encore commit/latence) et
-            # de recalculer un état qui te “regrise”.
-            self.current_db_iban = new_iban
-            self.current_db_bic = new_bic
+            saved_iban = str((result or {}).get("iban") or iban).strip()
+            saved_bic = str((result or {}).get("bic") or bic).strip()
+            self.current_db_iban = saved_iban
+            self.current_db_bic = saved_bic
+            self.current_db_bank_pairs = [(saved_iban, saved_bic)]
 
-            QMessageBox.information(self, "Succès", "Coordonnées mises à jour.")
+            self.check_bank_information()
+            self.load_transporter_information(force_by_kundennr=False)
+            self._refresh_transporter_bank_transfer_button()
 
-        self.enable_transporter_update()
+            action = str((result or {}).get("action") or "updated")
+            if action == "already_exists":
+                msg_ok = "Cet IBAN/BIC était déjà présent sur la fiche transporteur."
+            elif action == "inserted":
+                msg_ok = "IBAN/BIC créés sur la fiche transporteur et vérifiés en base."
+            else:
+                msg_ok = "IBAN/BIC mis à jour sur la fiche transporteur et vérifiés en base."
+            QMessageBox.information(self, "Transfert IBAN/BIC", msg_ok)
+        except Exception as e:
+            QMessageBox.critical(self, "Transfert IBAN/BIC", f"Erreur pendant la mise à jour :\n{e}")
+            self._refresh_transporter_bank_transfer_button()
 
     def enable_transporter_update(self):
-        new_iban = self.iban_input.text().strip()
-        new_bic = self.bic_input.text().strip()
-
-        if not self.selected_kundennr:
-            self.btn_transporter_action.setEnabled(False)
-            return
-
-        # Activer uniquement si modif réelle par rapport aux valeurs de référence
-        base_iban = (self.current_db_iban or "").strip()
-        base_bic = (self.current_db_bic or "").strip()
-
-        if new_iban and new_bic and (new_iban != base_iban or new_bic != base_bic):
-            self.btn_transporter_action.setEnabled(True)
-        else:
-            self.btn_transporter_action.setEnabled(False)
+        self._refresh_transporter_bank_transfer_button()
 
     def load_tour_information(self, tour_nr: str):
         self.last_loaded_tour_nr = (tour_nr or "").strip()
@@ -834,6 +1125,16 @@ class MainWindowTransportTablesMixin:
         self._update_folder_row_status(row)
         self.update_folder_totals()
         self._ensure_empty_folder_row()
+
+        # Le transporteur dépend uniquement du premier dossier : dès que les
+        # dossiers changent, on le recalcule depuis xxatour.FFNR.
+        try:
+            first_tour = self._get_first_folder_number()
+            if first_tour != getattr(self, "_last_transporter_source_tour_nr", None):
+                self._last_transporter_source_tour_nr = first_tour
+                self._refresh_transporter_from_first_folder()
+        except Exception:
+            pass
 
         # si le champ actif est le dossier de cette ligne, refresh le volet tour
         dossier_le, _, vat_theo_le = self._get_row_widgets(row)

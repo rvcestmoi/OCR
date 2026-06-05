@@ -619,26 +619,15 @@ def parse_vat_lines(text: str, allowed_vat_rates: set[float] | None = None, mode
 # =========================
 
 def parse_invoice(text: str) -> InvoiceData:
-    # Extraire IBAN/BIC d'abord pour charger le modèle fournisseur
+    # Extraire IBAN/BIC pour information uniquement. Le modèle transporteur
+    # n'est plus chargé depuis IBAN/BIC : l'UI l'applique ensuite via le
+    # KundenNr du premier dossier (xxatour.FFNR).
     iban = extract_iban(text)
     bic = extract_bic(text)
-    
-    # Charger modèle fournisseur si possible
-    supplier_key = None
-    allowed_vat_rates = None
-    model = None
-    if iban or bic:
-        from .supplier_model import build_supplier_key, load_supplier_model
-        supplier_key = build_supplier_key(iban, bic)
-        if supplier_key:
-            model = load_supplier_model(supplier_key)
-            if model and "patterns" in model:
-                vat_rates_patterns = model["patterns"].get("vat_rates", [])
-                if vat_rates_patterns:
-                    allowed_vat_rates = {p["rate"] for p in vat_rates_patterns}
-    
-    # Parser TVA avec filtrage par modèle fournisseur
-    vat_lines = parse_vat_lines(text, allowed_vat_rates=allowed_vat_rates, model=model)
+
+    # Parser TVA sans modèle bancaire legacy. Les patterns supplier KundenNr
+    # seront fusionnés côté écran lorsque le premier dossier sera connu.
+    vat_lines = parse_vat_lines(text, allowed_vat_rates=None, model=None)
     
     vat_total = 0.0
     has_any = False

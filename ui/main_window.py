@@ -397,8 +397,11 @@ class MainWindow(
 
         # ----- Transporteur + completer -----
         self.transporter_input = QLineEdit()
-        self.transporter_input.setPlaceholderText("Rechercher transporteur…")
-        self.transporter_input.setClearButtonEnabled(True)
+        self.transporter_input.setPlaceholderText("Déterminé par le premier dossier")
+        self.transporter_input.setClearButtonEnabled(False)
+        self.transporter_input.setReadOnly(True)
+        self.transporter_input.setFocusPolicy(Qt.ClickFocus)
+        self.transporter_input.setStyleSheet("background-color: #f3f3f3;")
 
         self.transporter_model = QStringListModel()
         self.transporter_completer = QCompleter()
@@ -406,13 +409,16 @@ class MainWindow(
         self.transporter_completer.setCompletionMode(QCompleter.PopupCompletion)
         self.transporter_completer.setFilterMode(Qt.MatchContains)
         self.transporter_completer.setCaseSensitivity(Qt.CaseInsensitive)
-        self.transporter_input.setCompleter(self.transporter_completer)
+        # Transporteur non modifiable : il est chargé depuis xxatour.FFNR à
+        # partir du premier dossier. Le completer est conservé en attribut pour
+        # compatibilité, mais il n'est plus attaché au champ.
+        # self.transporter_input.setCompleter(self.transporter_completer)
 
-        self.transporter_input.textChanged.connect(self.search_transporters)
         self.transporter_completer.activated.connect(self.on_transporter_selected)
 
         self.btn_transporter_action = QPushButton("➡")
         self.btn_transporter_action.setFixedWidth(30)
+        self.btn_transporter_action.setEnabled(False)
         self.btn_transporter_action.clicked.connect(self.on_transporter_action)
 
         transporter_layout = QHBoxLayout()
@@ -595,7 +601,6 @@ class MainWindow(
             field.mousePressEvent = lambda e, f=field: self.set_active_field(f)
             field.textChanged.connect(lambda _, f=field: f.setStyleSheet(""))
             self.transporter_input.mousePressEvent = lambda e, f=self.transporter_input: self.set_active_field(f)
-            self.transporter_input.textChanged.connect(lambda _: self.transporter_input.setStyleSheet(""))
 
         # =========================
         # Recherche dans texte OCR
@@ -637,7 +642,7 @@ class MainWindow(
         # =========================
         self.iban_input.textChanged.connect(self.enable_transporter_update)
         self.bic_input.textChanged.connect(self.enable_transporter_update)
-        self.transporter_input.textChanged.connect(self.enable_transporter_update)
+        # Mise à jour transporteur désactivée : champ imposé par le premier dossier.
 
         # Optionnel (mais utile) : état initial boutons doc
         self.btn_prev_doc.setEnabled(False)

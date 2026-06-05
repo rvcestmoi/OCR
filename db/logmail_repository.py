@@ -483,6 +483,21 @@ class LogmailRepository(BaseRepository):
         """
         self.execute(query, (normalized_doc_type or None, nom_pdf))
 
+    def set_doc_type_for_entry(self, entry_id: str, doc_type: str | None) -> None:
+        """Met à jour le type de tous les documents rattachés au même entry_id."""
+        entry_id = str(entry_id or "").strip()
+        normalized_doc_type = str(doc_type or "").strip()
+
+        if not entry_id:
+            return
+
+        query = """
+            UPDATE dbo.XXA_LOGMAIL_228794
+            SET doc_type = ?
+            WHERE entry_id = ?
+        """
+        self.execute(query, (normalized_doc_type or None, entry_id))
+
     def update_document_by_filename(self, nom_pdf: str, *, entry_id: str = "", invoice_date: str = "", iban: str = "", bic: str = "", status: str | None = None) -> str:
         """Met à jour un document par nom de fichier, en créant une entrée si nécessaire.
 
