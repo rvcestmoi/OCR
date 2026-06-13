@@ -702,10 +702,96 @@ class MainWindowValidationMixin:
         self._set_left_row_visual(row, "ok", f"OK : transporteur {kundennr} depuis le premier dossier + dossiers présents en base.")
 
     def refresh_left_table_processing_states(self):
+        """Met à jour les couleurs du volet gauche avec des requêtes groupées.
+
+        L'ancienne version appelait refresh_left_row_processing_state(row), qui
+        pouvait relire un JSON puis faire 2 à 3 requêtes SQL par ligne. Sur un
+        client avec des milliers de factures, c'était très coûteux. Ici on
+        réutilise les numéros de dossier stockés dans la ligne (issus de
+        XXA_OCR_SEARCH_INDEX quand possible) et on récupère tous les FFNR en une
+        seule requête batch. Les lignes anciennes sans données indexées gardent
+        l'ancien fallback, donc aucune fonctionnalité n'est retirée.
+        """
         if not hasattr(self, "pdf_table") or self.pdf_table is None:
             return
-        for row in range(self.pdf_table.rowCount()):
-            self.refresh_left_row_processing_state(row)    
+
+        table = self.pdf_table
+        row_payloads: list[tuple[int, list[str], str]] = []
+        all_tours: set[str] = set()
+        fallback_rows: list[int] = []
+
+        for row in range(table.rowCount()):
+            it0 = table.item(row, 0)
+            if not it0:
+                fallback_rows.append(row)
+                continue
+
+            tours = []
+            try:
+                tours = [str(t).strip() for t in (it0.data(Qt.UserRole + 9) or []) if str(t).strip()]
+            except Exception:
+                tours = []
+
+            # Fallback rétrocompatible : si la ligne n'a pas encore les dossiers
+            # en mémoire, on utilise l'ancien contrôle unitaire.
+            if not tours:
+                fallback_rows.append(row)
+                continue
+
+            kundennr = ""
+            try:
+                kundennr = str(it0.data(Qt.UserRole + 10) or "").strip()
+            except Exception:
+                kundennr = ""
+
+            row_payloads.append((row, tours, kundennr))
+            all_tours.update(tours)
+
+        try:
+            ffnr_by_tour = self.tour_repo.get_ffnr_map_for_tournrs(sorted(all_tours)) if all_tours else {}
+        except Exception:
+            ffnr_by_tour = None
+
+        if ffnr_by_tour is None:
+            # Erreur SQL globale : on retombe sur l'ancien comportement, qui
+            # affichera l'erreur précise par ligne.
+            for row in range(table.rowCount()):
+                self.refresh_left_row_processing_state(row)
+            return
+
+        for row, tours, kundennr in row_payloads:
+            if not tours:
+                self._set_left_row_visual(row, "error", "Aucun dossier (TourNr) dans l'index.")
+                continue
+
+            first_tour = tours[0]
+            if not kundennr:
+                kundennr = str(ffnr_by_tour.get(first_tour) or "").strip()
+
+            if not kundennr:
+                self._set_left_row_visual(row, "error", f"Aucun KundenNr transporteur sur le premier dossier {first_tour} (xxatour.FFNR vide).")
+                continue
+
+            missing = [t for t in tours if t not in ffnr_by_tour]
+            if missing:
+                more = "" if len(missing) <= 6 else f" (+{len(missing)-6})"
+                self._set_left_row_visual(row, "error", f"Dossier(s) manquant(s) en xxatour: {', '.join(missing[:6])}{more}")
+                continue
+
+            invalid = [t for t in tours if str(ffnr_by_tour.get(t) or "").strip() != kundennr]
+            if invalid:
+                more = "" if len(invalid) <= 6 else f" (+{len(invalid)-6})"
+                self._set_left_row_visual(
+                    row,
+                    "error",
+                    f"Dossier(s) avec un autre transporteur que {kundennr}: {', '.join(invalid[:6])}{more}",
+                )
+                continue
+
+            self._set_left_row_visual(row, "ok", f"OK : transporteur {kundennr} depuis le premier dossier + dossiers présents en base.")
+
+        for row in fallback_rows:
+            self.refresh_left_row_processing_state(row)
 
 
 

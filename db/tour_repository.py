@@ -365,6 +365,37 @@ class TourRepository(BaseRepository):
             ),
         )
 
+    def get_ffnr_map_for_tournrs(self, tournrs: List[str]) -> Dict[str, str]:
+        """Retourne {TourNr: FFNR} en une seule requête.
+
+        Utilisé par le refresh du volet gauche pour éviter plusieurs requêtes SQL
+        par ligne affichée quand il y a beaucoup de factures.
+        """
+        tournrs = [str(t).strip() for t in (tournrs or []) if str(t).strip()]
+        if not tournrs:
+            return {}
+
+        out: Dict[str, str] = {}
+        chunk_size = 200
+        for i in range(0, len(tournrs), chunk_size):
+            chunk = tournrs[i:i + chunk_size]
+            placeholders = ",".join(["?"] * len(chunk))
+            query = f"""
+                SELECT
+                    LTRIM(RTRIM(CAST(TourNr AS VARCHAR(20)))) AS TourNr,
+                    LTRIM(RTRIM(CAST(FFNR AS VARCHAR(50)))) AS FFNR
+                FROM xxatour
+                WHERE LTRIM(RTRIM(CAST(TourNr AS VARCHAR(20)))) IN ({placeholders})
+            """
+            rows = self.fetch_all(query, tuple(chunk)) or []
+            for r in rows:
+                tour = str(r.get("TourNr") or r.get("tournr") or "").strip()
+                ffnr = str(r.get("FFNR") or r.get("ffnr") or "").strip()
+                if tour:
+                    out[tour] = ffnr
+        return out
+
+
     def get_tournrs_matching_ffnr(self, tournrs: List[str], kundennr: str) -> Set[str]:
         tournrs = [str(t).strip() for t in (tournrs or []) if str(t).strip()]
         kundennr = str(kundennr or "").strip()

@@ -551,7 +551,6 @@ class MainWindowDocumentsMixin:
             return
 
         self.current_folder_path = folder
-        self.pdf_table.setRowCount(0)
 
         if hasattr(self, "refresh_last_mail_date_label"):
             try:
@@ -572,7 +571,6 @@ class MainWindowDocumentsMixin:
         else:
             sql_status = mode
 
-        # Charger les paramètres UI depuis settings
         from app.settings import load_settings, get_ui_value
         settings = load_settings()
         max_pages_pending = int(get_ui_value(settings, "max_pages_pending", 100))
@@ -580,44 +578,153 @@ class MainWindowDocumentsMixin:
         max_pages_validated = int(get_ui_value(settings, "max_pages_validated", 200))
         max_pages_ecart = int(get_ui_value(settings, "max_pages_ecart", max_pages_error))
 
-        # Déterminer la limite selon le mode
         if sql_status == "pending":
-            limit = max_pages_pending
+            display_limit = max_pages_pending
         elif sql_status == "error":
-            limit = max_pages_error
+            display_limit = max_pages_error
         elif sql_status == "validated":
-            limit = max_pages_validated
+            display_limit = max_pages_validated
         elif sql_status == "ecart":
-            limit = max_pages_ecart
+            display_limit = max_pages_ecart
         else:
-            limit = None
+            display_limit = None
 
         try:
+            display_limit = int(display_limit) if display_limit else None
+        except Exception:
+            display_limit = None
 
-            # IMPORTANT :
-            # Le setting max_pages_* doit limiter l'affichage final,
-            # pas les lignes SQL brutes, car certaines lignes SQL pointent vers
-            # des fichiers supprimés ou introuvables.
-            display_limit = limit
+        rows_to_add = []
+        lkz_cache: dict[str, str] = {}
+        seen_entry_ids: set[str] = set()
 
-            rows = self.logmail_repo.get_document_rows_for_folder(
-                folder,
-                sql_status,
-                limit=None,
-                search_query=current_search_query or None,
-                date_mail_from=date_mail_from,
-                date_mail_to=date_mail_to,
-            )
+        def _split_index_tours(value) -> list[str]:
+            if not value:
+                return []
+            if isinstance(value, (list, tuple, set)):
+                raw = list(value)
+            else:
+                raw = re.split(r"[\s,;|]+", str(value or ""))
+            out = []
+            for t in raw:
+                t = str(t or "").strip()
+                if t and t not in out:
+                    out.append(t)
+            return out
 
-            # Recherche rapide via l'index SQL alimenté à la sauvegarde.
-            # Elle complète la recherche standard XXA_LOGMAIL et évite de relire
-            # tous les JSON ou de dépendre d'un cache mémoire périmé.
+        def _append_rows_from_sql(rows: list[dict]) -> None:
+            nonlocal rows_to_add
+            if not rows:
+                return
+
+            entry_ids = [
+                str(r.get("entry_id") or "").strip()
+                for r in rows
+                if str(r.get("entry_id") or "").strip()
+            ]
+            entry_ids = [e for i, e in enumerate(entry_ids) if e and e not in entry_ids[:i]]
+
+            try:
+                files_by_entry = self.logmail_repo.get_files_for_entries(entry_ids) or {}
+            except Exception:
+                files_by_entry = {}
+
+            try:
+                index_by_entry = self.logmail_repo.get_search_index_rows_for_entries(entry_ids) or {}
+            except Exception:
+                index_by_entry = {}
+
+            for r in rows:
+                if display_limit and len(rows_to_add) >= display_limit:
+                    break
+
+                entry_id = str(r.get("entry_id") or "").strip()
+                if not entry_id or entry_id in seen_entry_ids:
+                    continue
+                seen_entry_ids.add(entry_id)
+
+                stored_filename = str(r.get("nom_pdf") or "").strip()
+                if not stored_filename:
+                    continue
+
+                files = files_by_entry.get(entry_id) or []
+
+                candidate_names = []
+                if stored_filename:
+                    candidate_names.append(stored_filename)
+
+                for f in files:
+                    name = str(f.get("nom_pdf") or "").strip()
+                    if name and name not in candidate_names:
+                        candidate_names.append(name)
+
+                group_paths = []
+                for name in candidate_names:
+                    p = os.path.join(folder, name)
+                    if not os.path.exists(p):
+                        continue
+                    try:
+                        if not is_supported_document(p):
+                            continue
+                    except Exception:
+                        continue
+                    if p not in group_paths:
+                        group_paths.append(p)
+
+                if not group_paths:
+                    continue
+
+                rep_path = group_paths[0]
+                try:
+                    chosen_rep = ""
+                    if hasattr(self, "_choose_representative_pdf"):
+                        chosen_rep = str(self._choose_representative_pdf(group_paths) or "").strip()
+                    if chosen_rep and os.path.exists(chosen_rep):
+                        rep_path = chosen_rep
+                except Exception:
+                    pass
+
+                idx = index_by_entry.get(entry_id) or {}
+                indexed_tours = _split_index_tours(idx.get("tour_numbers"))
+                transporter_kundennr = str(idx.get("transporter_kundennr") or "").strip()
+                transporter_name = str(idx.get("transporter_name") or r.get("transporter_name") or "").strip()
+                date_mail = r.get("date_mail") or idx.get("date_mail")
+                expediteur = str(r.get("expediteur") or idx.get("expediteur") or "").strip()
+
+                rows_to_add.append(
+                    (
+                        format_left_table_filename(os.path.basename(rep_path)),
+                        rep_path,
+                        entry_id,
+                        group_paths,
+                        (
+                            "ecart"
+                            if str(r.get("processing_status") or "pending").strip().lower() == "eccarts"
+                            else str(r.get("processing_status") or "pending").strip().lower()
+                        ),
+                        str(r.get("invoice_date") or "").strip(),
+                        str(r.get("iban") or "").strip(),
+                        str(r.get("bic") or "").strip(),
+                        date_mail,
+                        expediteur,
+                        str(r.get("sujet") or "").strip(),
+                        transporter_name,
+                        indexed_tours,
+                        transporter_kundennr,
+                    )
+                )
+
+        try:
+            # Recherche : on privilégie l'index SQL. Si l'index n'est pas encore
+            # disponible ou ne trouve rien, l'ancien chemin SQL/JSON reste en fallback.
+            used_index_for_search = False
             if current_search_query:
                 try:
+                    idx_limit = max(1000, (display_limit or 200) * 8)
                     index_entry_ids = self.logmail_repo.search_entry_ids_in_index(
                         current_search_query,
                         status=sql_status,
-                        limit=1000,
+                        limit=idx_limit,
                         date_mail_from=date_mail_from,
                         date_mail_to=date_mail_to,
                     ) or []
@@ -626,247 +733,189 @@ class MainWindowDocumentsMixin:
                     index_entry_ids = []
 
                 if index_entry_ids:
-                    already_loaded_entry_ids = {
-                        str(r.get("entry_id") or "").strip()
-                        for r in rows
-                        if str(r.get("entry_id") or "").strip()
-                    }
-                    missing_index_entry_ids = [
-                        entry_id
-                        for entry_id in index_entry_ids
-                        if entry_id and entry_id not in already_loaded_entry_ids
-                    ]
-                    if missing_index_entry_ids:
-                        rows.extend(
+                    used_index_for_search = True
+                    chunk_size = 200
+                    for i in range(0, len(index_entry_ids), chunk_size):
+                        if display_limit and len(rows_to_add) >= display_limit:
+                            break
+                        chunk = index_entry_ids[i:i + chunk_size]
+                        _append_rows_from_sql(
                             self.logmail_repo.get_document_rows_for_entries(
-                                missing_index_entry_ids,
+                                chunk,
                                 status=sql_status,
                                 date_mail_from=date_mail_from,
                                 date_mail_to=date_mail_to,
-                            )
-                            or []
+                            ) or []
                         )
 
-            if current_search_query and self._is_folder_like_left_search_query(current_search_query):
-                extra_entry_matches = self._find_additional_left_search_entry_matches(
-                    folder,
-                    current_search_query,
-                    sql_status,
-                )
-                if extra_entry_matches:
-                    already_loaded_entry_ids = {
-                        str(r.get("entry_id") or "").strip()
-                        for r in rows
-                        if str(r.get("entry_id") or "").strip()
-                    }
-                    missing_entry_ids = [
-                        entry_id
-                        for entry_id in extra_entry_matches.keys()
-                        if entry_id and entry_id not in already_loaded_entry_ids
-                    ]
-                    if missing_entry_ids:
-                        rows.extend(
-                            self.logmail_repo.get_document_rows_for_entries(
-                                missing_entry_ids,
-                                status=sql_status,
-                                date_mail_from=date_mail_from,
-                                date_mail_to=date_mail_to,
-                            )
-                            or []
-                        )
+            if not current_search_query or not used_index_for_search:
+                fetch_size = max(250, (display_limit or 100) * 4)
+                offset = 0
+                while True:
+                    if display_limit and len(rows_to_add) >= display_limit:
+                        break
+                    rows_page = self.logmail_repo.get_document_rows_for_folder_page(
+                        folder,
+                        sql_status,
+                        offset=offset,
+                        fetch=fetch_size,
+                        search_query=current_search_query or None,
+                        date_mail_from=date_mail_from,
+                        date_mail_to=date_mail_to,
+                    ) or []
+                    if not rows_page:
+                        break
+                    offset += len(rows_page)
+                    _append_rows_from_sql(rows_page)
+                    # Sans limite UI, on garde une pagination mais on s'arrête quand SQL n'a plus rien.
+                    if len(rows_page) < fetch_size:
+                        break
+
+            # Fallback rétrocompatible pour les anciens JSON non encore indexés,
+            # uniquement si la recherche ressemble à un numéro de dossier.
+            if (
+                current_search_query
+                and self._is_folder_like_left_search_query(current_search_query)
+                and (not display_limit or len(rows_to_add) < display_limit)
+            ):
+                try:
+                    extra_entry_matches = self._find_additional_left_search_entry_matches(
+                        folder,
+                        current_search_query,
+                        sql_status,
+                    )
+                except Exception:
+                    extra_entry_matches = {}
+
+                missing_entry_ids = [
+                    entry_id
+                    for entry_id in (extra_entry_matches or {}).keys()
+                    if entry_id and entry_id not in seen_entry_ids
+                ]
+                if missing_entry_ids:
+                    _append_rows_from_sql(
+                        self.logmail_repo.get_document_rows_for_entries(
+                            missing_entry_ids,
+                            status=sql_status,
+                            date_mail_from=date_mail_from,
+                            date_mail_to=date_mail_to,
+                        ) or []
+                    )
         except Exception as e:
             QMessageBox.warning(self, "Chargement dossier", f"Erreur lecture XXA_LOGMAIL_228794 :\n{e}")
             return
 
-        rows_to_add = []
-
-        entry_ids = [str(r.get("entry_id") or "").strip() for r in rows if str(r.get("entry_id") or "").strip()]
+        table = self.pdf_table
+        old_updates = table.updatesEnabled()
+        table.setUpdatesEnabled(False)
+        table.blockSignals(True)
         try:
-            files_by_entry = self.logmail_repo.get_files_for_entries(entry_ids) or {}
-        except Exception:
-            files_by_entry = {}
+            table.setRowCount(0)
+            table.setRowCount(len(rows_to_add))
 
-        
-        for r in rows:
-            entry_id = str(r.get("entry_id") or "").strip()
+            for row_index, (rep_filename, rep_path, entry_id, group_paths, status, invoice_date, iban, bic, date_mail, expediteur, sujet, transporter_name, indexed_tours, transporter_kundennr) in enumerate(rows_to_add):
+                real_filename = os.path.basename(rep_path)
+                display_filename = format_left_table_filename(real_filename)
+                it0 = QTableWidgetItem(display_filename)
+                it0.setToolTip(real_filename)
+                it0.setData(Qt.UserRole, rep_path)
+                it0.setData(Qt.UserRole + 6, real_filename)
+                it0.setData(Qt.UserRole + 1, status)
+                it0.setData(Qt.UserRole + 4, entry_id)
+                it0.setData(Qt.UserRole + 5, group_paths)
+                it0.setData(Qt.UserRole + 8, self._normalize_left_mail_date_value(date_mail))
 
-            stored_filename = str(r.get("nom_pdf") or "").strip()
-            if not stored_filename:
-                continue
+                # Les numéros de dossier viennent d'abord de l'index SQL. On ne
+                # relit le JSON que pour les anciennes lignes non encore indexées.
+                folders_for_search = list(indexed_tours or [])
+                if not folders_for_search:
+                    folders_for_search = self._get_saved_folder_numbers_for_pdf(rep_path)
 
-            files = files_by_entry.get(entry_id) or []
-
-            # On construit une liste de candidats :
-            # 1) le nom_pdf de la ligne représentative SQL
-            # 2) tous les autres fichiers liés au même entry_id
-            candidate_names = []
-
-            if stored_filename:
-                candidate_names.append(stored_filename)
-
-            for f in files:
-                name = str(f.get("nom_pdf") or "").strip()
-                if name and name not in candidate_names:
-                    candidate_names.append(name)
-
-            group_paths = []
-
-            for name in candidate_names:
-                p = os.path.join(folder, name)
-
-                if not os.path.exists(p):
-                    continue
-
+                extra_search_values = list(folders_for_search or [])
                 try:
-                    if not is_supported_document(p):
-                        continue
-                except Exception:
-                    continue
-
-                if p not in group_paths:
-                    group_paths.append(p)
-
-            # Si aucun fichier physique du groupe n'existe, on ignore vraiment la ligne.
-            if not group_paths:
-                continue
-
-            # Par défaut, le représentant est le premier fichier réellement existant.
-            rep_path = group_paths[0]
-
-            try:
-                chosen_rep = ""
-                if hasattr(self, "_choose_representative_pdf"):
-                    chosen_rep = str(self._choose_representative_pdf(group_paths) or "").strip()
-
-                if chosen_rep and os.path.exists(chosen_rep):
-                    rep_path = chosen_rep
-            except Exception:
-                pass
-
-            real_filename = os.path.basename(rep_path)
-            display_filename = format_left_table_filename(real_filename)
-
-            rows_to_add.append(
-                (
-                    display_filename,
-                    rep_path,
-                    entry_id,
-                    group_paths,
-                    (
-                        "ecart"
-                        if str(r.get("processing_status") or "pending").strip().lower() == "eccarts"
-                        else str(r.get("processing_status") or "pending").strip().lower()
-                    ),
-                    str(r.get("invoice_date") or "").strip(),
-                    str(r.get("iban") or "").strip(),
-                    str(r.get("bic") or "").strip(),
-                    r.get("date_mail"),
-                    str(r.get("expediteur") or "").strip(),
-                    str(r.get("sujet") or "").strip(),
-                    str(r.get("transporter_name") or "").strip(),
-                )
-            )
-
-            # IMPORTANT :
-            # Le setting max_pages_* s'applique maintenant aux lignes vraiment affichables.
-            if display_limit and len(rows_to_add) >= display_limit:
-                break
-
-
-
-
-        self.pdf_table.setRowCount(len(rows_to_add))
-
-        for row_index, (rep_filename, rep_path, entry_id, group_paths, status, invoice_date, iban, bic, date_mail, expediteur, sujet, transporter_name) in enumerate(rows_to_add):
-            real_filename = os.path.basename(rep_path)
-            display_filename = format_left_table_filename(real_filename)
-            it0 = QTableWidgetItem(display_filename)
-            it0.setToolTip(real_filename)
-            it0.setData(Qt.UserRole, rep_path)
-            it0.setData(Qt.UserRole + 6, real_filename)
-            it0.setData(Qt.UserRole + 1, status)
-            it0.setData(Qt.UserRole + 4, entry_id)
-            it0.setData(Qt.UserRole + 5, group_paths)
-            it0.setData(Qt.UserRole + 8, self._normalize_left_mail_date_value(date_mail))
-
-            folders_for_search = self._get_saved_folder_numbers_for_pdf(rep_path)
-            extra_search_values = list(folders_for_search or [])
-            try:
-                if date_mail:
-                    extra_search_values.append(str(date_mail))
-                    if hasattr(date_mail, "strftime"):
-                        extra_search_values.append(date_mail.strftime("%d/%m/%Y %H:%M"))
-                if expediteur:
-                    extra_search_values.append(expediteur)
-                if sujet:
-                    extra_search_values.append(sujet)
-                if transporter_name:
-                    extra_search_values.append(transporter_name)
-            except Exception:
-                pass
-            it0.setData(Qt.UserRole + 7, extra_search_values)
-            tooltip_parts = [real_filename]
-            if folders_for_search:
-                folders_txt = "Dossier(s) : " + ", ".join(folders_for_search[:10])
-                if len(folders_for_search) > 10:
-                    folders_txt += "…"
-                tooltip_parts.append(folders_txt)
-            if date_mail:
-                tooltip_parts.append(f"Date mail : {date_mail}")
-            if expediteur:
-                tooltip_parts.append(f"Expéditeur : {expediteur}")
-            if transporter_name:
-                tooltip_parts.append(f"Transporteur : {transporter_name}")
-            if len(tooltip_parts) > 1:
-                it0.setToolTip("\n".join(tooltip_parts))
-
-            self.pdf_table.setItem(row_index, 0, it0)
-            self.pdf_table.setItem(row_index, 1, QTableWidgetItem(invoice_date))
-            self.pdf_table.setItem(row_index, 2, QTableWidgetItem(iban))
-            self.pdf_table.setItem(row_index, 3, QTableWidgetItem(bic))            
-
-            # ✅ Fallback JSON (si la table XXA_LOGMAIL ne stocke pas encore IBAN/BIC/date)
-            # -> On affiche immédiatement ces valeurs dans la liste de gauche
-            # -> Et on les "rattrape" en BDD pour ne plus dépendre du JSON au prochain démarrage.
-            if not invoice_date or not iban or not bic:
-                j_date, j_iban, j_bic = self._get_saved_date_iban_bic_for_pdf(rep_path)
-
-                new_date = invoice_date or j_date
-                new_iban = iban or j_iban
-                new_bic  = bic or j_bic
-
-                # mise à jour UI (sinon tu ne vois rien tant que tu ne cliques pas la ligne)
-                if new_date and not invoice_date:
-                    self.pdf_table.item(row_index, 1).setText(new_date)
-                if new_iban and not iban:
-                    self.pdf_table.item(row_index, 2).setText(new_iban)
-                if new_bic and not bic:
-                    self.pdf_table.item(row_index, 3).setText(new_bic)
-
-                # rattrapage BDD (sans changer le status)
-                try:
-                    if entry_id and (new_date or new_iban or new_bic):
-                        self.logmail_repo.update_document_metadata_for_entry(
-                            entry_id,
-                            invoice_date=new_date,
-                            iban=new_iban,
-                            bic=new_bic,
-                            status=None,
-                        )
+                    if date_mail:
+                        extra_search_values.append(str(date_mail))
+                        if hasattr(date_mail, "strftime"):
+                            extra_search_values.append(date_mail.strftime("%d/%m/%Y %H:%M"))
+                    if expediteur:
+                        extra_search_values.append(expediteur)
+                    if sujet:
+                        extra_search_values.append(sujet)
+                    if transporter_name:
+                        extra_search_values.append(transporter_name)
                 except Exception:
                     pass
+                it0.setData(Qt.UserRole + 7, extra_search_values)
+                it0.setData(Qt.UserRole + 9, folders_for_search)
+                it0.setData(Qt.UserRole + 10, transporter_kundennr)
 
-                invoice_date, iban, bic = new_date, new_iban, new_bic
+                tooltip_parts = [real_filename]
+                if folders_for_search:
+                    folders_txt = "Dossier(s) : " + ", ".join(folders_for_search[:10])
+                    if len(folders_for_search) > 10:
+                        folders_txt += "…"
+                    tooltip_parts.append(folders_txt)
+                if date_mail:
+                    tooltip_parts.append(f"Date mail : {date_mail}")
+                if expediteur:
+                    tooltip_parts.append(f"Expéditeur : {expediteur}")
+                if transporter_name:
+                    tooltip_parts.append(f"Transporteur : {transporter_name}")
+                if len(tooltip_parts) > 1:
+                    it0.setToolTip("\n".join(tooltip_parts))
 
-            # Pays : dépend du transporteur du premier dossier, pas d'IBAN/BIC.
-            lkz = self._get_country_for_document(rep_path, iban, bic)
-            self.pdf_table.setItem(row_index, 4, QTableWidgetItem(lkz))
+                table.setItem(row_index, 0, it0)
+                table.setItem(row_index, 1, QTableWidgetItem(invoice_date))
+                table.setItem(row_index, 2, QTableWidgetItem(iban))
+                table.setItem(row_index, 3, QTableWidgetItem(bic))
 
+                if not invoice_date or not iban or not bic:
+                    j_date, j_iban, j_bic = self._get_saved_date_iban_bic_for_pdf(rep_path)
+                    new_date = invoice_date or j_date
+                    new_iban = iban or j_iban
+                    new_bic = bic or j_bic
+
+                    if new_date and not invoice_date:
+                        table.item(row_index, 1).setText(new_date)
+                    if new_iban and not iban:
+                        table.item(row_index, 2).setText(new_iban)
+                    if new_bic and not bic:
+                        table.item(row_index, 3).setText(new_bic)
+
+                    try:
+                        if entry_id and (new_date or new_iban or new_bic):
+                            self.logmail_repo.update_document_metadata_for_entry(
+                                entry_id,
+                                invoice_date=new_date,
+                                iban=new_iban,
+                                bic=new_bic,
+                                status=None,
+                            )
+                    except Exception:
+                        pass
+
+                    invoice_date, iban, bic = new_date, new_iban, new_bic
+
+                lkz = ""
+                if transporter_kundennr:
+                    try:
+                        if transporter_kundennr not in lkz_cache:
+                            lkz_cache[transporter_kundennr] = str(
+                                self.transporter_repo.get_lkz_by_kundennr(transporter_kundennr) or ""
+                            ).strip()
+                        lkz = lkz_cache.get(transporter_kundennr, "")
+                    except Exception:
+                        lkz = ""
+                if not lkz:
+                    lkz = self._get_country_for_document(rep_path, iban, bic)
+                table.setItem(row_index, 4, QTableWidgetItem(lkz))
+        finally:
+            table.blockSignals(False)
+            table.setUpdatesEnabled(old_updates)
 
         self.refresh_left_table_processing_states()
         self.refresh_left_table_processing_claims()
         self.apply_left_table_search_filter()
-
 
 
     def _get_saved_json_path(self, pdf_path: str) -> str:

@@ -1109,6 +1109,178 @@ class LogmailRepository(BaseRepository):
                      nom_pdf ASC
         """
         return self.fetch_all(query, tuple(params)) or []
+
+
+    def get_document_rows_for_folder_page(
+        self,
+        folder_path: str,
+        status: str,
+        *,
+        offset: int = 0,
+        fetch: int = 300,
+        search_query: str | None = None,
+        date_mail_from=None,
+        date_mail_to=None,
+    ) -> list[dict]:
+        """Retourne une page de lignes représentatives pour le volet gauche.
+
+        Cette version évite de charger des milliers de groupes en mémoire alors
+        que l'UI n'en affichera que `max_pages_*`. Elle conserve la même logique
+        que get_document_rows_for_folder(), mais ajoute une pagination SQL Server
+        sur les groupes déjà dédoublonnés par entry_id.
+        """
+        status = str(status or "pending").strip().lower()
+        if status not in {"pending", "validated", "error", "ecart"}:
+            status = "pending"
+
+        try:
+            offset = max(0, int(offset or 0))
+        except Exception:
+            offset = 0
+        try:
+            fetch = max(1, int(fetch or 300))
+        except Exception:
+            fetch = 300
+
+        normalized_search = str(search_query or "").strip()
+        sort_expr = "COALESCE(TRY_CONVERT(datetime2, date_mail), date_creation)" if status == "pending" else "date_creation"
+
+        params: list = [status]
+        search_filter_sql = ""
+        if normalized_search:
+            like_value = f"%{normalized_search.upper()}%"
+            params.extend([like_value, like_value, like_value, like_value, like_value, like_value, like_value])
+            search_filter_sql = """
+                AND (
+                    UPPER(COALESCE(nom_pdf, '')) LIKE ?
+                    OR UPPER(COALESCE(CONVERT(varchar(50), invoice_date), '')) LIKE ?
+                    OR UPPER(COALESCE(iban, '')) LIKE ?
+                    OR UPPER(COALESCE(bic, '')) LIKE ?
+                    OR UPPER(COALESCE(CONVERT(varchar(50), date_mail, 120), '')) LIKE ?
+                    OR UPPER(COALESCE(expediteur, '')) LIKE ?
+                    OR UPPER(COALESCE(sujet, '')) LIKE ?
+                )
+            """
+
+        mail_date_expr = "COALESCE(TRY_CONVERT(datetime2, date_mail), date_creation)"
+        date_filter_sql = ""
+        if date_mail_from:
+            date_filter_sql += f" AND {mail_date_expr} >= ?"
+            params.append(date_mail_from)
+        if date_mail_to:
+            date_filter_sql += f" AND {mail_date_expr} < ?"
+            params.append(date_mail_to)
+
+        params.extend([offset, fetch])
+
+        query = f"""
+            ;WITH base AS (
+                SELECT
+                    entry_id,
+                    nom_pdf,
+                    CASE
+                        WHEN LTRIM(RTRIM(COALESCE(processing_status, 'pending'))) = 'eccarts' THEN 'ecart'
+                        ELSE LTRIM(RTRIM(COALESCE(processing_status, 'pending')))
+                    END AS processing_status,
+                    invoice_date,
+                    iban,
+                    bic,
+                    doc_type,
+                    date_creation,
+                    date_mail,
+                    LTRIM(RTRIM(COALESCE(expediteur, ''))) AS expediteur,
+                    LTRIM(RTRIM(COALESCE(sujet, ''))) AS sujet,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY entry_id
+                        ORDER BY {sort_expr} ASC,
+                                 id_log ASC
+                    ) AS rn
+                FROM dbo.XXA_LOGMAIL_228794
+                WHERE LTRIM(RTRIM(COALESCE(nom_pdf, ''))) <> ''
+                AND UPPER(LTRIM(RTRIM(COALESCE(doc_type, '')))) <> 'DELETED'
+                AND CASE
+                        WHEN LTRIM(RTRIM(COALESCE(processing_status, 'pending'))) = 'eccarts' THEN 'ecart'
+                        ELSE LTRIM(RTRIM(COALESCE(processing_status, 'pending')))
+                    END = ?
+                {search_filter_sql}
+                {date_filter_sql}
+            ), reps AS (
+                SELECT
+                    entry_id,
+                    nom_pdf,
+                    processing_status,
+                    invoice_date,
+                    iban,
+                    bic,
+                    doc_type,
+                    date_creation,
+                    date_mail,
+                    expediteur,
+                    sujet,
+                    ROW_NUMBER() OVER (ORDER BY {sort_expr} ASC, nom_pdf ASC) AS page_rn
+                FROM base
+                WHERE rn = 1
+            )
+            SELECT
+                entry_id,
+                nom_pdf,
+                processing_status,
+                invoice_date,
+                iban,
+                bic,
+                doc_type,
+                date_creation,
+                date_mail,
+                expediteur,
+                sujet
+            FROM reps
+            WHERE page_rn > ?
+              AND page_rn <= (? + ?)
+            ORDER BY page_rn ASC
+        """
+        # Le dernier paramètre ? est fetch, SQL Server calcule offset + fetch.
+        params = params[:-2] + [offset, offset, fetch]
+        return self.fetch_all(query, tuple(params)) or []
+
+
+    def get_search_index_rows_for_entries(self, entry_ids: list[str]) -> dict[str, dict]:
+        """Retourne les infos déjà indexées pour éviter de relire les JSON.
+
+        Clé : entry_id. Si la table d'index n'existe pas encore, retourne {}.
+        """
+        out: dict[str, dict] = {}
+        clean_ids = [str(e or "").strip() for e in (entry_ids or []) if str(e or "").strip()]
+        if not clean_ids:
+            return out
+
+        try:
+            exists = self.fetch_one("SELECT OBJECT_ID('dbo.XXA_OCR_SEARCH_INDEX', 'U') AS object_id")
+            if not (exists or {}).get("object_id"):
+                return out
+        except Exception:
+            return out
+
+        chunk_size = 200
+        for i in range(0, len(clean_ids), chunk_size):
+            chunk = clean_ids[i:i + chunk_size]
+            placeholders = ",".join(["?"] * len(chunk))
+            query = f"""
+                SELECT
+                    entry_id,
+                    tour_numbers,
+                    transporter_kundennr,
+                    transporter_name,
+                    date_mail,
+                    expediteur
+                FROM dbo.XXA_OCR_SEARCH_INDEX
+                WHERE entry_id IN ({placeholders})
+            """
+            rows = self.fetch_all(query, tuple(chunk)) or []
+            for r in rows:
+                entry_id = str(r.get("entry_id") or "").strip()
+                if entry_id:
+                    out[entry_id] = r
+        return out
     
 
     def get_files_for_entry(self, entry_id: str) -> list[dict]:
