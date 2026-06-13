@@ -551,6 +551,12 @@ class MainWindow(
         self.lbl_vat_total = QLabel("")
         self.lbl_vat_total.setStyleSheet("padding:4px;")
 
+        # Commentaire libre facture (sauvegardé dans le JSON, optionnel pour compatibilité).
+        self.invoice_comment_input = QPlainTextEdit()
+        self.invoice_comment_input.setPlaceholderText("Commentaire libre sur la facture…")
+        self.invoice_comment_input.setMinimumHeight(55)
+        self.invoice_comment_input.setMaximumHeight(90)
+
         # =========================
         # Conteneur vertical (dossiers + totaux + TVA)
         # =========================
@@ -564,6 +570,8 @@ class MainWindow(
         self.folders_layout.addWidget(QLabel("TVA :"))
         self.folders_layout.addWidget(self.vat_table)
         self.folders_layout.addWidget(self.lbl_vat_total)
+        self.folders_layout.addWidget(QLabel("Commentaire :"))
+        self.folders_layout.addWidget(self.invoice_comment_input)
 
         form_layout.addRow("Dossiers :", folders_box)
 

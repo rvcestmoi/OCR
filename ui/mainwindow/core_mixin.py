@@ -236,6 +236,10 @@ class MainWindowCoreMixin:
         # expéditeur
         self.sender_input.clear()
 
+        # commentaire libre facture
+        if hasattr(self, "invoice_comment_input") and self.invoice_comment_input is not None:
+            self.invoice_comment_input.setPlainText("")
+
         # dossiers + TVA
         self.clear_folder_fields()
         self.vat_table.setRowCount(0)
@@ -295,6 +299,20 @@ class MainWindowCoreMixin:
             self.date_input.setText(normalize_date_format(saved_invoice_date) if saved_invoice_date else "")
         if "invoice_number" in saved_data:
             self.invoice_number_input.setText(str(saved_data.get("invoice_number") or "").strip())
+
+        # Commentaire libre facture : champ optionnel, compatible anciens JSON.
+        # Important : refresh_invoice_data() est le flux utilisé à l'ouverture
+        # d'une facture depuis le volet gauche. Sans ce bloc, le commentaire
+        # pouvait bien être écrit dans le JSON mais ne jamais être réaffiché,
+        # donnant l'impression qu'il n'était pas sauvegardé.
+        if hasattr(self, "invoice_comment_input") and self.invoice_comment_input is not None:
+            invoice_comment = str(
+                saved_data.get("invoice_comment")
+                or saved_data.get("free_invoice_comment")
+                or saved_data.get("commentaire_libre")
+                or ""
+            )
+            self.invoice_comment_input.setPlainText(invoice_comment)
 
         # Transporteur : le texte sauvegardé n'est plus restauré directement.
         # Il est recalculé depuis le premier dossier via xxatour.FFNR.
@@ -1143,6 +1161,8 @@ class MainWindowCoreMixin:
             field.clear()
             field.setStyleSheet("")
         self.clear_folder_fields()
+        if hasattr(self, "invoice_comment_input") and self.invoice_comment_input is not None:
+            self.invoice_comment_input.setPlainText("")
         self.selected_kundennr = None
         self.transporter_selected_mode = False
         self._last_transporter_source_tour_nr = None
@@ -1596,6 +1616,11 @@ class MainWindowCoreMixin:
         data["bic"] = self.bic_input.text().strip()
         data["invoice_date"] = self.date_input.text().strip()
         data["invoice_number"] = self.invoice_number_input.text().strip()
+        # Champ libre utilisateur, optionnel : les anciens JSON sans cette clé restent valides.
+        if hasattr(self, "invoice_comment_input") and self.invoice_comment_input is not None:
+            data["invoice_comment"] = (self.invoice_comment_input.toPlainText() or "").strip()
+        else:
+            data["invoice_comment"] = str(data.get("invoice_comment") or "").strip()
         data["transporter_text"] = self.transporter_input.text().strip()
         data["transporter_aux_account"] = (self.transporter_aux_input.text() or "").strip()
 
@@ -1884,6 +1909,17 @@ class MainWindowCoreMixin:
             if "invoice_number" in data:
                 self.invoice_number_input.setText(invoice_number)
 
+            # Commentaire libre facture : nouveau champ optionnel.
+            # Compatibilité : ancien JSON sans clé => champ vide.
+            if hasattr(self, "invoice_comment_input") and self.invoice_comment_input is not None:
+                invoice_comment = str(
+                    data.get("invoice_comment")
+                    or data.get("free_invoice_comment")
+                    or data.get("commentaire_libre")
+                    or ""
+                )
+                self.invoice_comment_input.setPlainText(invoice_comment)
+
 
             self._update_left_table_date_iban_bic(
                 self.current_pdf_path,
@@ -2062,13 +2098,32 @@ class MainWindowCoreMixin:
         elif getattr(data, "folder_number", None):
             folder_numbers = [data.folder_number] if data.folder_number else []
 
-        payload = {
+        existing_payload = {}
+        try:
+            if os.path.exists(json_path):
+                with open(json_path, "r", encoding="utf-8") as f:
+                    existing_payload = json.load(f) or {}
+        except Exception:
+            existing_payload = {}
+
+        payload = dict(existing_payload) if isinstance(existing_payload, dict) else {}
+        payload.update({
             "iban": data.iban or "",
             "bic": data.bic or "",
             "invoice_date": data.invoice_date or "",
             "invoice_number": data.invoice_number or "",
             "folder_numbers": folder_numbers,
-        }
+        })
+
+        # Ne jamais perdre le commentaire libre lors d'une sauvegarde OCR
+        # ancienne/annexe qui passe par _save_data_for_pdf au lieu de save_current_data.
+        try:
+            if hasattr(self, "invoice_comment_input") and self.invoice_comment_input is not None:
+                current_comment = (self.invoice_comment_input.toPlainText() or "").strip()
+                if current_comment or "invoice_comment" in payload:
+                    payload["invoice_comment"] = current_comment
+        except Exception:
+            pass
 
         with open(json_path, "w", encoding="utf-8") as f:
             json.dump(payload, f, ensure_ascii=False, indent=2)
