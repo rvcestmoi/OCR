@@ -2,6 +2,7 @@
 
 from db.repository import BaseRepository
 from typing import Dict, List
+import re
 
 
 class LogmailRepository(BaseRepository):
@@ -498,6 +499,365 @@ class LogmailRepository(BaseRepository):
         """
         self.execute(query, (normalized_doc_type or None, entry_id))
 
+    def _normalize_logmail_status_for_sql(self, status: str | None) -> str | None:
+        """Statuts autorisés dans XXA_LOGMAIL_228794.processing_status.
+
+        Important : "draft" est un statut JSON/local, pas un statut SQL valide
+        chez le client. Pour une sauvegarde simple, on ne touche donc pas au
+        processing_status SQL.
+        """
+        if status is None:
+            return None
+        st = str(status or "").strip().lower()
+        if not st or st == "draft":
+            return None
+        if st == "eccarts":
+            st = "ecart"
+        if st in {"pending", "validated", "error", "ecart"}:
+            return st
+        return None
+
+    def _normalize_search_index_status(self, status: str | None) -> str:
+        """Statut stocké dans l'index de recherche.
+
+        Ici "draft" est volontairement ramené à "pending" : une sauvegarde
+        brouillon doit rester visible/recherchable dans le pool des en attente.
+        """
+        st = str(status or "").strip().lower()
+        if st in {"", "draft"}:
+            return "pending"
+        if st == "eccarts":
+            st = "ecart"
+        if st in {"pending", "validated", "error", "ecart"}:
+            return st
+        return "pending"
+
+    def ensure_search_index_table(self) -> None:
+        """Crée la table d'index de recherche si elle n'existe pas.
+
+        La méthode est appelée avant l'upsert. Si l'utilisateur SQL n'a pas les
+        droits DDL, l'exception remonte : c'est préférable à un échec silencieux.
+        """
+        if getattr(self, "_search_index_table_checked", False):
+            return
+
+        create_sql = """
+        IF OBJECT_ID('dbo.XXA_OCR_SEARCH_INDEX', 'U') IS NULL
+        BEGIN
+            CREATE TABLE dbo.XXA_OCR_SEARCH_INDEX (
+                entry_id varchar(200) NOT NULL CONSTRAINT PK_XXA_OCR_SEARCH_INDEX PRIMARY KEY,
+                nom_pdf nvarchar(500) NULL,
+                processing_status varchar(30) NOT NULL CONSTRAINT DF_XXA_OCR_SEARCH_INDEX_status DEFAULT('pending'),
+                invoice_number nvarchar(100) NULL,
+                invoice_date nvarchar(50) NULL,
+                iban nvarchar(80) NULL,
+                bic nvarchar(50) NULL,
+                tour_numbers nvarchar(max) NULL,
+                transporter_kundennr nvarchar(100) NULL,
+                transporter_name nvarchar(255) NULL,
+                date_mail datetime2 NULL,
+                expediteur nvarchar(255) NULL,
+                search_text nvarchar(max) NULL,
+                search_compact nvarchar(max) NULL,
+                updated_at datetime2 NOT NULL CONSTRAINT DF_XXA_OCR_SEARCH_INDEX_updated DEFAULT(SYSDATETIME())
+            );
+            CREATE INDEX IX_XXA_OCR_SEARCH_INDEX_status_updated
+                ON dbo.XXA_OCR_SEARCH_INDEX(processing_status, updated_at DESC);
+            CREATE INDEX IX_XXA_OCR_SEARCH_INDEX_date_mail
+                ON dbo.XXA_OCR_SEARCH_INDEX(date_mail DESC);
+        END
+        ELSE
+        BEGIN
+            IF COL_LENGTH('dbo.XXA_OCR_SEARCH_INDEX', 'transporter_name') IS NULL
+                ALTER TABLE dbo.XXA_OCR_SEARCH_INDEX ADD transporter_name nvarchar(255) NULL;
+            IF COL_LENGTH('dbo.XXA_OCR_SEARCH_INDEX', 'date_mail') IS NULL
+                ALTER TABLE dbo.XXA_OCR_SEARCH_INDEX ADD date_mail datetime2 NULL;
+            IF COL_LENGTH('dbo.XXA_OCR_SEARCH_INDEX', 'expediteur') IS NULL
+                ALTER TABLE dbo.XXA_OCR_SEARCH_INDEX ADD expediteur nvarchar(255) NULL;
+            IF NOT EXISTS (
+                SELECT 1
+                FROM sys.indexes
+                WHERE name = 'IX_XXA_OCR_SEARCH_INDEX_date_mail'
+                  AND object_id = OBJECT_ID('dbo.XXA_OCR_SEARCH_INDEX')
+            )
+                CREATE INDEX IX_XXA_OCR_SEARCH_INDEX_date_mail
+                    ON dbo.XXA_OCR_SEARCH_INDEX(date_mail DESC);
+        END
+        """
+        self.execute(create_sql)
+        self._search_index_table_checked = True
+
+    def get_search_index_mail_metadata(self, entry_id: str, nom_pdf: str = "") -> dict:
+        """Récupère date_mail/expéditeur depuis XXA_LOGMAIL_228794 pour l'index.
+
+        On privilégie la ligne du document si `nom_pdf` est fourni, sinon la
+        première ligne du groupe `entry_id`. Le fallback date_creation permet
+        d'avoir une date exploitable quand date_mail est NULL.
+        """
+        entry_id = str(entry_id or "").strip()
+        nom_pdf = str(nom_pdf or "").strip()
+        if not entry_id:
+            return {"date_mail": None, "expediteur": ""}
+
+        if nom_pdf:
+            row = self.fetch_one(
+                """
+                SELECT TOP 1
+                    COALESCE(TRY_CONVERT(datetime2, date_mail), date_creation) AS date_mail,
+                    LTRIM(RTRIM(COALESCE(expediteur, ''))) AS expediteur
+                FROM dbo.XXA_LOGMAIL_228794
+                WHERE entry_id = ?
+                ORDER BY
+                    CASE WHEN LTRIM(RTRIM(COALESCE(nom_pdf, ''))) = ? THEN 0 ELSE 1 END,
+                    COALESCE(TRY_CONVERT(datetime2, date_mail), date_creation) ASC,
+                    id_log ASC
+                """,
+                (entry_id, nom_pdf),
+            )
+        else:
+            row = self.fetch_one(
+                """
+                SELECT TOP 1
+                    COALESCE(TRY_CONVERT(datetime2, date_mail), date_creation) AS date_mail,
+                    LTRIM(RTRIM(COALESCE(expediteur, ''))) AS expediteur
+                FROM dbo.XXA_LOGMAIL_228794
+                WHERE entry_id = ?
+                ORDER BY COALESCE(TRY_CONVERT(datetime2, date_mail), date_creation) ASC, id_log ASC
+                """,
+                (entry_id,),
+            )
+
+        return {
+            "date_mail": (row or {}).get("date_mail"),
+            "expediteur": str((row or {}).get("expediteur") or "").strip(),
+        }
+
+    @staticmethod
+    def _date_for_search_text(value) -> str:
+        """Transforme une date SQL/Python en texte cherchable, avec variantes."""
+        if not value:
+            return ""
+        try:
+            # datetime/date Python
+            iso = value.strftime("%Y-%m-%d %H:%M:%S")
+            fr = value.strftime("%d/%m/%Y %H:%M")
+            return f"{iso} {fr}"
+        except Exception:
+            return str(value or "").strip()
+
+    def upsert_search_index(
+        self,
+        *,
+        entry_id: str,
+        nom_pdf: str = "",
+        status: str | None = None,
+        invoice_number: str = "",
+        invoice_date: str = "",
+        iban: str = "",
+        bic: str = "",
+        tour_numbers=None,
+        transporter_kundennr: str = "",
+        transporter_name: str = "",
+        date_mail=None,
+        expediteur: str = "",
+    ) -> str:
+        """Alimente dbo.XXA_OCR_SEARCH_INDEX pour rendre la recherche rapide.
+
+        Retourne "updated", "inserted" ou "skipped".
+        """
+        entry_id = str(entry_id or "").strip()
+        if not entry_id:
+            print("DEBUG SEARCH INDEX: skipped, entry_id vide")
+            return "skipped"
+
+        self.ensure_search_index_table()
+
+        if tour_numbers is None:
+            tours = []
+        elif isinstance(tour_numbers, str):
+            tours = [tour_numbers]
+        else:
+            tours = list(tour_numbers or [])
+
+        clean_tours = []
+        for t in tours:
+            t = str(t or "").strip()
+            if t and t not in clean_tours:
+                clean_tours.append(t)
+
+        status_idx = self._normalize_search_index_status(status)
+        nom_pdf = str(nom_pdf or "").strip()
+        invoice_number = str(invoice_number or "").strip()
+        invoice_date = str(invoice_date or "").strip()
+        iban = str(iban or "").strip()
+        bic = str(bic or "").strip()
+        tour_text = " ".join(clean_tours)
+        transporter_kundennr = str(transporter_kundennr or "").strip()
+        transporter_name = str(transporter_name or "").strip()
+        expediteur = str(expediteur or "").strip()
+
+        # Date mail / expéditeur viennent de XXA_LOGMAIL_228794. On les récupère
+        # ici si l'appelant ne les a pas fournis, pour éviter de dépendre du JSON.
+        if not date_mail or not expediteur:
+            try:
+                meta = self.get_search_index_mail_metadata(entry_id, nom_pdf)
+                if not date_mail:
+                    date_mail = meta.get("date_mail")
+                if not expediteur:
+                    expediteur = str(meta.get("expediteur") or "").strip()
+            except Exception as e:
+                print(f"⚠️ SEARCH INDEX: impossible de récupérer date_mail/expéditeur pour {entry_id}: {e}")
+
+        date_mail_search = self._date_for_search_text(date_mail)
+
+        search_parts = [
+            entry_id,
+            nom_pdf,
+            invoice_number,
+            invoice_date,
+            iban,
+            bic,
+            tour_text,
+            transporter_kundennr,
+            transporter_name,
+            date_mail_search,
+            expediteur,
+        ]
+        search_text = " | ".join([p for p in search_parts if p])
+        search_compact = re.sub(r"[^0-9A-Z]+", "", search_text.upper())
+
+        update_sql = """
+            UPDATE dbo.XXA_OCR_SEARCH_INDEX
+            SET nom_pdf = ?,
+                processing_status = ?,
+                invoice_number = ?,
+                invoice_date = ?,
+                iban = ?,
+                bic = ?,
+                tour_numbers = ?,
+                transporter_kundennr = ?,
+                transporter_name = ?,
+                date_mail = ?,
+                expediteur = ?,
+                search_text = ?,
+                search_compact = ?,
+                updated_at = SYSDATETIME()
+            WHERE entry_id = ?
+        """
+        params_update = (
+            nom_pdf,
+            status_idx,
+            invoice_number,
+            invoice_date,
+            iban,
+            bic,
+            tour_text,
+            transporter_kundennr,
+            transporter_name,
+            date_mail,
+            expediteur,
+            search_text,
+            search_compact,
+            entry_id,
+        )
+        count = self.execute_rowcount(update_sql, params_update)
+        if count and count > 0:
+            print(f"DEBUG SEARCH INDEX: updated entry_id={entry_id} tours={tour_text}")
+            return "updated"
+
+        exists = self.fetch_one(
+            "SELECT COUNT(1) AS c FROM dbo.XXA_OCR_SEARCH_INDEX WHERE entry_id = ?",
+            (entry_id,),
+        )
+        if int((exists or {}).get("c") or 0) > 0:
+            # Cas rare : rowcount non fiable côté driver, mais ligne présente.
+            print(f"DEBUG SEARCH INDEX: updated/exists entry_id={entry_id} tours={tour_text}")
+            return "updated"
+
+        insert_sql = """
+            INSERT INTO dbo.XXA_OCR_SEARCH_INDEX (
+                entry_id,
+                nom_pdf,
+                processing_status,
+                invoice_number,
+                invoice_date,
+                iban,
+                bic,
+                tour_numbers,
+                transporter_kundennr,
+                transporter_name,
+                date_mail,
+                expediteur,
+                search_text,
+                search_compact,
+                updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, SYSDATETIME())
+        """
+        params_insert = (
+            entry_id,
+            nom_pdf,
+            status_idx,
+            invoice_number,
+            invoice_date,
+            iban,
+            bic,
+            tour_text,
+            transporter_kundennr,
+            transporter_name,
+            date_mail,
+            expediteur,
+            search_text,
+            search_compact,
+        )
+        self.execute(insert_sql, params_insert)
+        print(f"DEBUG SEARCH INDEX: inserted entry_id={entry_id} tours={tour_text}")
+        return "inserted"
+
+    def search_entry_ids_in_index(self, search_query: str, status: str | None = None, limit: int = 500) -> list[str]:
+        """Recherche rapide dans XXA_OCR_SEARCH_INDEX.
+
+        Si la table n'existe pas encore, retourne simplement [] pour garder la
+        compatibilité avec les installations non migrées.
+        """
+        q = str(search_query or "").strip()
+        if not q:
+            return []
+
+        try:
+            exists = self.fetch_one("SELECT OBJECT_ID('dbo.XXA_OCR_SEARCH_INDEX', 'U') AS object_id")
+            if not (exists or {}).get("object_id"):
+                return []
+        except Exception:
+            return []
+
+        status_idx = self._normalize_search_index_status(status)
+        like_text = f"%{q.upper()}%"
+        compact_q = re.sub(r"[^0-9A-Z]+", "", q.upper())
+        like_compact = f"%{compact_q}%" if compact_q else like_text
+        try:
+            top = max(1, min(int(limit or 500), 2000))
+        except Exception:
+            top = 500
+
+        sql = f"""
+            SELECT TOP {top} entry_id
+            FROM dbo.XXA_OCR_SEARCH_INDEX
+            WHERE processing_status = ?
+              AND (
+                    UPPER(COALESCE(search_text, '')) LIKE ?
+                    OR UPPER(COALESCE(search_compact, '')) LIKE ?
+                  )
+            ORDER BY updated_at DESC
+        """
+        rows = self.fetch_all(sql, (status_idx, like_text, like_compact)) or []
+        out = []
+        for r in rows:
+            entry = str(r.get("entry_id") or "").strip()
+            if entry and entry not in out:
+                out.append(entry)
+        return out
+
     def update_document_by_filename(self, nom_pdf: str, *, entry_id: str = "", invoice_date: str = "", iban: str = "", bic: str = "", status: str | None = None) -> str:
         """Met à jour un document par nom de fichier, en créant une entrée si nécessaire.
 
@@ -538,12 +898,11 @@ class LogmailRepository(BaseRepository):
         if bic:
             set_parts.append("bic = ?")
             params.append(str(bic).strip())
-        if status is not None:
-            normalized_status = str(status or "").strip().lower()
-            if normalized_status == "eccarts":
-                normalized_status = "ecart"
+
+        sql_status = self._normalize_logmail_status_for_sql(status)
+        if sql_status is not None:
             set_parts.append("processing_status = ?")
-            params.append(normalized_status)
+            params.append(sql_status)
 
         if not set_parts:
             return final_entry_id
@@ -596,13 +955,16 @@ class LogmailRepository(BaseRepository):
         search_filter_sql = ""
         if normalized_search:
             like_value = f"%{normalized_search.upper()}%"
-            params.extend([like_value, like_value, like_value, like_value])
+            params.extend([like_value, like_value, like_value, like_value, like_value, like_value, like_value])
             search_filter_sql = """
                 AND (
                     UPPER(COALESCE(nom_pdf, '')) LIKE ?
                     OR UPPER(COALESCE(CONVERT(varchar(50), invoice_date), '')) LIKE ?
                     OR UPPER(COALESCE(iban, '')) LIKE ?
                     OR UPPER(COALESCE(bic, '')) LIKE ?
+                    OR UPPER(COALESCE(CONVERT(varchar(50), date_mail, 120), '')) LIKE ?
+                    OR UPPER(COALESCE(expediteur, '')) LIKE ?
+                    OR UPPER(COALESCE(sujet, '')) LIKE ?
                 )
             """
 
@@ -621,6 +983,8 @@ class LogmailRepository(BaseRepository):
                     doc_type,
                     date_creation,
                     date_mail,
+                    LTRIM(RTRIM(COALESCE(expediteur, ''))) AS expediteur,
+                    LTRIM(RTRIM(COALESCE(sujet, ''))) AS sujet,
                     ROW_NUMBER() OVER (
                         PARTITION BY entry_id
                         ORDER BY {sort_expr} ASC,
@@ -644,7 +1008,9 @@ class LogmailRepository(BaseRepository):
                 bic,
                 doc_type,
                 date_creation,
-                date_mail
+                date_mail,
+                expediteur,
+                sujet
             FROM base
             WHERE rn = 1
             ORDER BY {sort_expr} ASC,
@@ -728,6 +1094,8 @@ class LogmailRepository(BaseRepository):
                         doc_type,
                         date_creation,
                         date_mail,
+                        LTRIM(RTRIM(COALESCE(expediteur, ''))) AS expediteur,
+                        LTRIM(RTRIM(COALESCE(sujet, ''))) AS sujet,
                         ROW_NUMBER() OVER (
                             PARTITION BY entry_id
                             ORDER BY date_creation ASC, id_log ASC
@@ -746,7 +1114,9 @@ class LogmailRepository(BaseRepository):
                     bic,
                     doc_type,
                     date_creation,
-                    date_mail
+                    date_mail,
+                    expediteur,
+                    sujet
                 FROM base
                 WHERE rn = 1
                 ORDER BY date_creation ASC, nom_pdf ASC

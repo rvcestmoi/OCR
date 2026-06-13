@@ -16,6 +16,10 @@ class MainWindowCoreMixin:
         self.pdf_viewer.field_colors = self.FIELD_COLORS
 
         field.setStyleSheet("background-color: #fff3cd;")
+        try:
+            self._highlight_pdf_field_for_widget(field)
+        except Exception:
+            pass
 
         # ✅ Volet info selon champ actif
         # ✅ Volet info selon champ actif
@@ -191,6 +195,13 @@ class MainWindowCoreMixin:
         self.block_options = {}
         self._supplier_kundennr_by_tour_cache = {}
         self._last_transporter_source_tour_nr = None
+        self._bank_transporter_mismatch = False
+        self._bank_transporter_mismatch_fields = set()
+        self.field_positions = {}
+        try:
+            self.pdf_viewer.clear_highlights()
+        except Exception:
+            pass
 
         # champs facture
         for field in [self.iban_input, self.bic_input, self.date_input, self.invoice_number_input]:
@@ -265,8 +276,10 @@ class MainWindowCoreMixin:
             saved_data = self._read_saved_invoice_json(self.current_pdf_path) or {}
             self.pallet_details = saved_data.get("pallet_details", {}) or {}
             self.block_options = saved_data.get("block_options", {}) or {}
+            self.field_positions = self._normalize_field_positions(saved_data.get("field_positions") or {})
         except Exception:
             saved_data = {}
+            self.field_positions = {}
 
         # ✅ Le fichier JSON de sauvegarde est la source la plus récente.
         # Important en multi-utilisateur : la liste de gauche peut contenir des
@@ -330,6 +343,11 @@ class MainWindowCoreMixin:
         # OCR text
         if saved_data.get("ocr_text"):
             self.ocr_text_view.setPlainText(saved_data["ocr_text"])
+
+        try:
+            self.pdf_viewer.set_highlights(getattr(self, "field_positions", {}) or {})
+        except Exception:
+            pass
 
         # Mettre à jour les totaux
         self.update_folder_totals()
@@ -540,6 +558,167 @@ class MainWindowCoreMixin:
                 return candidate
         return None
 
+    def _field_position_norm_value(self, value: str) -> str:
+        return re.sub(r"[^A-Z0-9]+", "", str(value or "").upper())
+
+    def _field_key_for_widget(self, field) -> str:
+        try:
+            if field == self.iban_input:
+                return "iban"
+            if field == self.bic_input:
+                return "bic"
+            if field == self.date_input:
+                return "invoice_date"
+            if field == self.invoice_number_input:
+                return "invoice_number"
+        except Exception:
+            pass
+        return ""
+
+    def _get_current_field_values_for_positions(self) -> dict[str, str]:
+        return {
+            "iban": (self.iban_input.text() or "").strip(),
+            "bic": (self.bic_input.text() or "").strip(),
+            "invoice_date": (self.date_input.text() or "").strip(),
+            "invoice_number": (self.invoice_number_input.text() or "").strip(),
+        }
+
+    def _normalize_field_positions(self, positions: dict | None) -> dict:
+        """Normalise le bloc JSON optionnel field_positions.
+
+        Rétrocompatibilité : les anciens JSON n'ont pas cette clé, ou peuvent
+        contenir des valeurs incomplètes. Dans ce cas on ignore simplement la
+        position au lieu de bloquer l'ouverture de la facture.
+        """
+        if not isinstance(positions, dict):
+            return {}
+
+        out = {}
+        for key, pos in positions.items():
+            if not isinstance(pos, dict):
+                continue
+            try:
+                x = float(pos.get("x", pos.get("left", pos.get("x0", 0))) or 0)
+                y = float(pos.get("y", pos.get("top", pos.get("y0", 0))) or 0)
+                w = float(pos.get("w", pos.get("width", 0)) or 0)
+                h = float(pos.get("h", pos.get("height", 0)) or 0)
+
+                if (w <= 0 or h <= 0) and {"x0", "y0", "x1", "y1"}.issubset(pos.keys()):
+                    x0 = float(pos.get("x0") or 0)
+                    y0 = float(pos.get("y0") or 0)
+                    x1 = float(pos.get("x1") or 0)
+                    y1 = float(pos.get("y1") or 0)
+                    x, y, w, h = x0, y0, max(0.0, x1 - x0), max(0.0, y1 - y0)
+
+                if w <= 0 or h <= 0:
+                    continue
+
+                page = pos.get("page", pos.get("page_index", 0))
+                try:
+                    page = int(page or 0)
+                except Exception:
+                    page = 0
+                if page >= 1 and bool(pos.get("page_number")):
+                    page -= 1
+
+                norm = dict(pos)
+                norm.update({
+                    "page": max(0, page),
+                    "x": max(0.0, min(1.0, x)),
+                    "y": max(0.0, min(1.0, y)),
+                    "w": max(0.0, min(1.0, w)),
+                    "h": max(0.0, min(1.0, h)),
+                })
+                out[str(key)] = norm
+            except Exception:
+                continue
+        return out
+
+    def _update_field_positions_from_document(self, document_path: str | None = None, *, allow_tesseract_fallback: bool = False) -> dict:
+        """Calcule les rectangles des champs principaux et les garde en mémoire.
+
+        Le résultat est sauvegardé dans le JSON sous `field_positions`. Les
+        anciens JSON restent compatibles : si rien n'est trouvé, le champ est
+        simplement absent et l'interface n'affiche pas de rectangle.
+        """
+        doc_path = str(document_path or self._get_active_document_path() or "").strip()
+        if not doc_path:
+            return getattr(self, "field_positions", {}) or {}
+
+        values = self._get_current_field_values_for_positions()
+        try:
+            found = find_field_positions(
+                doc_path,
+                values,
+                allow_tesseract_fallback=allow_tesseract_fallback,
+            ) or {}
+        except Exception:
+            found = {}
+
+        current = self._normalize_field_positions(getattr(self, "field_positions", {}) or {})
+        for key, pos in self._normalize_field_positions(found).items():
+            pos = dict(pos)
+            pos["document"] = os.path.basename(doc_path)
+            current[key] = pos
+
+        self.field_positions = current
+        try:
+            self.pdf_viewer.set_highlights(current)
+        except Exception:
+            pass
+        return current
+
+    def _highlight_pdf_field_for_widget(self, field) -> None:
+        key = self._field_key_for_widget(field)
+        if not key:
+            try:
+                self.pdf_viewer.highlight_field(None, None)
+            except Exception:
+                pass
+            return
+
+        positions = self._normalize_field_positions(getattr(self, "field_positions", {}) or {})
+        pos = positions.get(key)
+        if not pos:
+            try:
+                self.pdf_viewer.highlight_field(None, None)
+            except Exception:
+                pass
+            return
+
+        # Si la valeur affichée a changé depuis la dernière OCRisation, on évite
+        # d'encadrer une ancienne occurrence qui ne correspond plus au champ.
+        current_value = (self._get_current_field_values_for_positions().get(key) or "").strip()
+        saved_value = str(pos.get("value") or "").strip()
+        if saved_value and current_value and self._field_position_norm_value(saved_value) != self._field_position_norm_value(current_value):
+            try:
+                self.pdf_viewer.highlight_field(None, None)
+            except Exception:
+                pass
+            return
+
+        # Si la position a été calculée sur une autre pièce du même entry_id,
+        # on bascule d'abord l'affichage sur ce document.
+        doc_name = str(pos.get("document") or "").strip()
+        if doc_name and hasattr(self, "entry_pdf_paths"):
+            try:
+                current_name = os.path.basename(str(getattr(self, "view_pdf_path", "") or ""))
+                if current_name != doc_name:
+                    for i, path in enumerate(self.entry_pdf_paths or []):
+                        if os.path.basename(str(path or "")) == doc_name:
+                            self.show_doc_by_index(i)
+                            break
+            except Exception:
+                pass
+
+        try:
+            self.pdf_viewer.highlight_field(key, pos)
+            source = str(pos.get("source") or "").strip()
+            page = int(pos.get("page", 0) or 0) + 1
+            self.statusBar().showMessage(f"Champ localisé sur le document (page {page}{', ' + source if source else ''}).", 2500)
+        except Exception:
+            pass
+
     def analyze_pdf(self, checked: bool = False, show_message: bool = False, document_path: str | None = None, auto_save: bool = True):
 
         active_doc_path = self._get_active_document_path(document_path)
@@ -608,6 +787,7 @@ class MainWindowCoreMixin:
             self.check_bank_information()
             self.enable_transporter_update()
             self._apply_supplier_model_for_current_context()
+            self._update_field_positions_from_document(active_doc_path, allow_tesseract_fallback=False)
 
             # ✅ Si aucun IBAN ou BIC valide n'est trouvé, lancer OCR profond automatiquement
             final_iban = self.iban_input.text().strip()
@@ -762,6 +942,7 @@ class MainWindowCoreMixin:
             self.check_bank_information()
             self.enable_transporter_update()
             self._apply_supplier_model_for_current_context()
+            self._update_field_positions_from_document(active_doc_path, allow_tesseract_fallback=True)
 
             self.highlight_missing_fields()
             if auto_save:
@@ -933,8 +1114,14 @@ class MainWindowCoreMixin:
     def highlight_missing_fields(self):
         fields = [self.iban_input, self.bic_input, self.date_input, self.invoice_number_input]
         for field in fields:
-            if field in (self.iban_input, self.bic_input) and self.bank_valid is not None:
-                continue
+            if field in (self.iban_input, self.bic_input):
+                mismatch_fields = getattr(self, "_bank_transporter_mismatch_fields", set()) or set()
+                if self.bank_valid is not None:
+                    continue
+                if field == self.iban_input and "iban" in mismatch_fields:
+                    continue
+                if field == self.bic_input and "bic" in mismatch_fields:
+                    continue
             field.setStyleSheet("background-color: #ffe6e6;" if not field.text().strip() else "background-color: #e6ffe6;")
 
         rows = self.get_folder_rows()
@@ -1083,62 +1270,6 @@ class MainWindowCoreMixin:
 
 
 
-    def _sync_reporting_modifications_for_current_save(self, pdf_path: str = "") -> list[str]:
-        """Alimente la table de reporting à chaque sauvegarde.
-
-        Une ligne est suivie par couple facture + dossier + utilisateur.
-        Si la ligne existe déjà, on met à jour sa date/heure et l'état de
-        blocage ; sinon on l'insère. Le flag IsLastModifierForTour est recalculé
-        par la couche SQL pour que le dernier utilisateur à avoir modifié un
-        dossier soit identifiable directement.
-        """
-        repo = getattr(self, "reporting_repo", None)
-        if repo is None:
-            return []
-
-        utilisateur = str(getattr(self, "current_username", "") or "").strip()
-        rech_nr = str(self.invoice_number_input.text() if hasattr(self, "invoice_number_input") else "").strip()
-
-        tour_nrs: list[str] = []
-        try:
-            if hasattr(self, "get_folder_rows"):
-                for row in self.get_folder_rows() or []:
-                    if isinstance(row, dict):
-                        tour_nr = str(row.get("tour_nr") or row.get("TourNr") or row.get("tournr") or "").strip()
-                    else:
-                        tour_nr = str(row or "").strip()
-                    if tour_nr:
-                        tour_nrs.append(tour_nr)
-        except Exception:
-            tour_nrs = []
-
-        # Sans ces informations, la ligne de reporting ne serait pas exploitable.
-        # On ne bloque donc pas la sauvegarde et on attend la prochaine sauvegarde
-        # avec facture + dossier renseignés.
-        if not utilisateur or not rech_nr or not tour_nrs:
-            return []
-
-        doc_name = os.path.basename(str(pdf_path or getattr(self, "current_pdf_path", "") or "").strip())
-        try:
-            if hasattr(self, "_get_effective_block_state_for_database"):
-                is_bloque, _comment = self._get_effective_block_state_for_database(
-                    getattr(self, "block_options", {}) or {},
-                    preferred_doc_name=doc_name,
-                )
-            else:
-                block_info = (getattr(self, "block_options", {}) or {}).get(doc_name, {}) or {}
-                is_bloque = bool(block_info.get("blocked", False))
-        except Exception:
-            is_bloque = False
-
-        return repo.upsert_modifications_for_invoice(
-            utilisateur=utilisateur,
-            rech_nr=rech_nr,
-            tour_nrs=tour_nrs,
-            is_bloque=bool(is_bloque),
-        )
-
-
     def save_current_data(self, status: str = "draft", show_message: bool = True, pdf_path: str | None = None):
         target_pdf_path = str(pdf_path or getattr(self, "current_pdf_path", "") or "").strip()
         if not target_pdf_path:
@@ -1200,6 +1331,17 @@ class MainWindowCoreMixin:
         # compat (anciens JSON)
         data["selected_kundennr"] = kundennr
 
+        transporter_name = str(data.get("transporter_text") or "").strip()
+        try:
+            if kundennr and transporter_name.endswith(f"({kundennr})"):
+                transporter_name = transporter_name[: -len(f"({kundennr})")].strip()
+            if not transporter_name and kundennr:
+                transporter = self.transporter_repo.find_transporter_by_kundennr(kundennr) or {}
+                transporter_name = str(transporter.get("name1", "") or "").strip()
+        except Exception:
+            transporter_name = str(data.get("transporter_text") or "").strip()
+        data["transporter_name"] = transporter_name
+
 
         data["folders"] = self.get_folder_rows() if hasattr(self, "get_folder_rows") else []
         data["vat_lines"] = self.get_vat_rows() if hasattr(self, "get_vat_rows") else []
@@ -1213,6 +1355,16 @@ class MainWindowCoreMixin:
         try:
             if hasattr(self, "_collect_cmr_attachments_for_current_entry"):
                 data["cmr_attachments"] = self._collect_cmr_attachments_for_current_entry()
+        except Exception:
+            pass
+
+        # Positions visuelles optionnelles des champs principaux (compat : absent dans les anciens JSON).
+        try:
+            positions = self._normalize_field_positions(getattr(self, "field_positions", {}) or data.get("field_positions") or {})
+            if positions:
+                data["field_positions"] = positions
+            elif "field_positions" in data:
+                data.pop("field_positions", None)
         except Exception:
             pass
 
@@ -1278,21 +1430,56 @@ class MainWindowCoreMixin:
             self.selected_invoice_entry_id = final_entry_id
             data["entry_id"] = final_entry_id
 
-        # ✅ Reporting : une ligne par facture + dossier + utilisateur.
-        # Non bloquant : la sauvegarde JSON reste valable même si le reporting SQL échoue.
-        reporting_errors = []
+        # ✅ 3) Alimentation de l'index SQL de recherche.
+        # Important : ce bloc est volontairement placé APRÈS la résolution de
+        # final_entry_id. Avant, l'index pouvait ne jamais être hydraté si
+        # current_entry_id était vide au début de la sauvegarde.
+        search_index_error = None
         try:
-            reporting_errors = self._sync_reporting_modifications_for_current_save(pdf_path) or []
-        except Exception as e:
-            reporting_errors = [str(e)]
+            if final_entry_id:
+                pdf_filename = os.path.basename(pdf_path)
+                try:
+                    tour_numbers = self._extract_tournrs_from_saved(data) if hasattr(self, "_extract_tournrs_from_saved") else []
+                except Exception:
+                    tour_numbers = []
+                if not tour_numbers:
+                    try:
+                        tour_numbers = [str((r or {}).get("tour_nr") or "").strip() for r in (data.get("folders") or []) if str((r or {}).get("tour_nr") or "").strip()]
+                    except Exception:
+                        tour_numbers = []
 
-        if reporting_errors and show_message:
-            QMessageBox.warning(
-                self,
-                "Reporting",
-                "La sauvegarde est faite, mais le reporting n'a pas pu être mis à jour :\n"
-                + "\n".join(reporting_errors)
-            )
+                index_status = normalized_status
+                result_index = self.logmail_repo.upsert_search_index(
+                    entry_id=final_entry_id,
+                    nom_pdf=pdf_filename,
+                    status=index_status,
+                    invoice_number=str(data.get("invoice_number") or "").strip(),
+                    invoice_date=str(data.get("invoice_date") or "").strip(),
+                    iban=str(data.get("iban") or "").strip(),
+                    bic=str(data.get("bic") or "").strip(),
+                    tour_numbers=tour_numbers,
+                    transporter_kundennr=str(data.get("transporter_kundennr") or data.get("selected_kundennr") or "").strip(),
+                    transporter_name=str(data.get("transporter_name") or data.get("transporter_text") or "").strip(),
+                )
+                print(f"DEBUG SEARCH INDEX: save_current_data result={result_index} entry_id={final_entry_id}")
+        except Exception as e:
+            search_index_error = e
+            print(f"⚠️ Erreur alimentation XXA_OCR_SEARCH_INDEX: {e}")
+            if show_message:
+                QMessageBox.warning(
+                    self,
+                    "Index recherche",
+                    "La sauvegarde est faite, mais l'index de recherche n'a pas été alimenté :\n" + str(e)
+                )
+
+        # Invalide l'ancien cache JSON de recherche : il ne doit plus imposer un
+        # redémarrage pour voir les nouveaux dossiers/factures.
+        try:
+            cache = getattr(self, "_left_search_folder_index_cache", None)
+            if isinstance(cache, dict):
+                cache.clear()
+        except Exception:
+            pass
 
         # refresh léger de la ligne dans le tableau gauche, sans recharger tout le dossier
         try:
@@ -1395,6 +1582,11 @@ class MainWindowCoreMixin:
             # --- Mémoire annexes ---
             self.pallet_details = data.get("pallet_details", {}) or {}
             self.block_options = data.get("block_options", {}) or {}
+            self.field_positions = self._normalize_field_positions(data.get("field_positions") or {})
+            try:
+                self.pdf_viewer.set_highlights(self.field_positions)
+            except Exception:
+                pass
 
             # --- Champs facture ---
             invoice_date = str(data.get("invoice_date", "") or "").strip()

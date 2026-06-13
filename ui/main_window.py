@@ -365,6 +365,7 @@ class MainWindow(
 
         # Stockage en mémoire des détails palettes (chargé depuis le JSON)
         self.pallet_details = {}
+        self.field_positions = {}  # positions optionnelles des champs OCR dans le document
 
         self.block_options = {}   # { "nom_fichier.pdf": {"blocked": bool, "reason": str, "free_comment": str, "comment": str} }
 

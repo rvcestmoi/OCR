@@ -361,17 +361,6 @@ class MainWindowDocumentsMixin:
                 preferred_doc_name=doc_name,
                 show_message=True,
             )
-            try:
-                reporting_errors = self._sync_reporting_modifications_for_current_save(doc_path) or []
-            except Exception as e:
-                reporting_errors = [str(e)]
-            if reporting_errors:
-                QMessageBox.warning(
-                    self,
-                    "Reporting",
-                    "Le motif a été enregistré, mais le reporting n'a pas pu être mis à jour :\n"
-                    + "\n".join(reporting_errors)
-                )
 
     def on_pdf_table_context_menu(self, pos):
         """Clic-droit sur la liste du haut : rattacher un document à la facture sélectionnée."""
@@ -616,6 +605,40 @@ class MainWindowDocumentsMixin:
                 search_query=current_search_query or None,
             )
 
+            # Recherche rapide via l'index SQL alimenté à la sauvegarde.
+            # Elle complète la recherche standard XXA_LOGMAIL et évite de relire
+            # tous les JSON ou de dépendre d'un cache mémoire périmé.
+            if current_search_query:
+                try:
+                    index_entry_ids = self.logmail_repo.search_entry_ids_in_index(
+                        current_search_query,
+                        status=sql_status,
+                        limit=1000,
+                    ) or []
+                except Exception as e:
+                    print(f"⚠️ Erreur recherche XXA_OCR_SEARCH_INDEX: {e}")
+                    index_entry_ids = []
+
+                if index_entry_ids:
+                    already_loaded_entry_ids = {
+                        str(r.get("entry_id") or "").strip()
+                        for r in rows
+                        if str(r.get("entry_id") or "").strip()
+                    }
+                    missing_index_entry_ids = [
+                        entry_id
+                        for entry_id in index_entry_ids
+                        if entry_id and entry_id not in already_loaded_entry_ids
+                    ]
+                    if missing_index_entry_ids:
+                        rows.extend(
+                            self.logmail_repo.get_document_rows_for_entries(
+                                missing_index_entry_ids,
+                                status=sql_status,
+                            )
+                            or []
+                        )
+
             if current_search_query and self._is_folder_like_left_search_query(current_search_query):
                 extra_entry_matches = self._find_additional_left_search_entry_matches(
                     folder,
@@ -727,6 +750,10 @@ class MainWindowDocumentsMixin:
                     str(r.get("invoice_date") or "").strip(),
                     str(r.get("iban") or "").strip(),
                     str(r.get("bic") or "").strip(),
+                    r.get("date_mail"),
+                    str(r.get("expediteur") or "").strip(),
+                    str(r.get("sujet") or "").strip(),
+                    str(r.get("transporter_name") or "").strip(),
                 )
             )
 
@@ -740,7 +767,7 @@ class MainWindowDocumentsMixin:
 
         self.pdf_table.setRowCount(len(rows_to_add))
 
-        for row_index, (rep_filename, rep_path, entry_id, group_paths, status, invoice_date, iban, bic) in enumerate(rows_to_add):
+        for row_index, (rep_filename, rep_path, entry_id, group_paths, status, invoice_date, iban, bic, date_mail, expediteur, sujet, transporter_name) in enumerate(rows_to_add):
             real_filename = os.path.basename(rep_path)
             display_filename = format_left_table_filename(real_filename)
             it0 = QTableWidgetItem(display_filename)
@@ -752,12 +779,35 @@ class MainWindowDocumentsMixin:
             it0.setData(Qt.UserRole + 5, group_paths)
 
             folders_for_search = self._get_saved_folder_numbers_for_pdf(rep_path)
-            it0.setData(Qt.UserRole + 7, folders_for_search)
+            extra_search_values = list(folders_for_search or [])
+            try:
+                if date_mail:
+                    extra_search_values.append(str(date_mail))
+                    if hasattr(date_mail, "strftime"):
+                        extra_search_values.append(date_mail.strftime("%d/%m/%Y %H:%M"))
+                if expediteur:
+                    extra_search_values.append(expediteur)
+                if sujet:
+                    extra_search_values.append(sujet)
+                if transporter_name:
+                    extra_search_values.append(transporter_name)
+            except Exception:
+                pass
+            it0.setData(Qt.UserRole + 7, extra_search_values)
+            tooltip_parts = [real_filename]
             if folders_for_search:
-                tooltip = real_filename + "\nDossier(s) : " + ", ".join(folders_for_search[:10])
+                folders_txt = "Dossier(s) : " + ", ".join(folders_for_search[:10])
                 if len(folders_for_search) > 10:
-                    tooltip += "…"
-                it0.setToolTip(tooltip)
+                    folders_txt += "…"
+                tooltip_parts.append(folders_txt)
+            if date_mail:
+                tooltip_parts.append(f"Date mail : {date_mail}")
+            if expediteur:
+                tooltip_parts.append(f"Expéditeur : {expediteur}")
+            if transporter_name:
+                tooltip_parts.append(f"Transporteur : {transporter_name}")
+            if len(tooltip_parts) > 1:
+                it0.setToolTip("\n".join(tooltip_parts))
 
             self.pdf_table.setItem(row_index, 0, it0)
             self.pdf_table.setItem(row_index, 1, QTableWidgetItem(invoice_date))
@@ -1253,7 +1303,12 @@ class MainWindowDocumentsMixin:
                 extra_search_values = []
 
             haystack = " | ".join(values + extra_search_values)
-            search_visible = (not query) or (query in haystack)
+            loaded_query = str(getattr(self, "_loaded_left_search_query", "") or "").strip().lower()
+            # Quand la table vient d'être rechargée par une recherche SQL/index,
+            # les lignes affichées sont déjà les bons résultats. On ne les
+            # masque donc pas si le match vient d'un champ non visible
+            # (date_mail, expéditeur, transporteur, etc.).
+            search_visible = (not query) or (query == loaded_query) or (query in haystack)
 
             # 3) filtre pays (col 4)
             if country_q and cols_count >= 5:
