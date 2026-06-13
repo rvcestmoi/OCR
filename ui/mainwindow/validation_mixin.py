@@ -1191,6 +1191,17 @@ class MainWindowValidationMixin:
         if getattr(self, "_compacting_folder_rows", False):
             return
         self._compacting_folder_rows = True
+
+        # Le compactage reconstruit le tableau avec setRowCount(0). Qt remet
+        # alors automatiquement l'ascenseur en haut. On mémorise la position
+        # pour la restaurer après reconstruction, notamment quand l'utilisateur
+        # édite une ligne assez basse dans une longue liste de dossiers.
+        v_scroll = self.folder_table.verticalScrollBar()
+        h_scroll = self.folder_table.horizontalScrollBar()
+        old_v = v_scroll.value() if v_scroll else 0
+        old_h = h_scroll.value() if h_scroll else 0
+        old_updates = self.folder_table.updatesEnabled()
+
         try:
             kept = []
             for r in range(self.folder_table.rowCount()):
@@ -1202,21 +1213,44 @@ class MainWindowValidationMixin:
                 if dossier or amount:
                     kept.append((dossier, amount))
 
-            # rebuild table (sans trous)
-            self.folder_table.setRowCount(0)
-            for dossier, amount in kept:
-                self._add_folder_row(dossier=dossier, amount=amount)
+            try:
+                self._prepare_folder_status_caches([dossier for dossier, _amount in kept])
+            except Exception:
+                pass
 
-            # garde une ligne vide en bas
-            self._ensure_empty_folder_row()
+            self.folder_table.setUpdatesEnabled(False)
+            self._folder_bulk_loading = True
+            try:
+                # rebuild table (sans trous)
+                self.folder_table.setRowCount(0)
+                for dossier, amount in kept:
+                    self._add_folder_row(dossier=dossier, amount=amount)
+
+                # garde une ligne vide en bas
+                self._ensure_empty_folder_row()
+            finally:
+                self._folder_bulk_loading = False
 
             # refresh totaux / statuts
+            try:
+                self._refresh_all_folder_row_statuses()
+            except Exception:
+                pass
             self.update_folder_totals()
             self._last_transporter_source_tour_nr = self._get_first_folder_number() if hasattr(self, "_get_first_folder_number") else None
             self.load_transporter_information(force_by_kundennr=False)
             self.update_transporter_vs_dossiers_status()
 
         finally:
+            self.folder_table.setUpdatesEnabled(old_updates)
+            try:
+                if v_scroll:
+                    v_scroll.setValue(min(old_v, v_scroll.maximum()))
+                if h_scroll:
+                    h_scroll.setValue(min(old_h, h_scroll.maximum()))
+                QTimer.singleShot(0, lambda: v_scroll and v_scroll.setValue(min(old_v, v_scroll.maximum())))
+            except Exception:
+                pass
             self._compacting_folder_rows = False
 
     def _find_pdf_path_by_filename(self, filename: str) -> str | None:

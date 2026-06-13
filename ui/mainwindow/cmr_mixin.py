@@ -259,8 +259,13 @@ class MainWindowCmrMixin:
 
         try:
             if self.selected_invoice_entry_id and self.selected_invoice_entry_id.strip() == entry_id:
-                for r in range(self.folder_table.rowCount()):
-                    self._update_folder_row_status(r)
+                if hasattr(self, "_invalidate_cmr_status_cache"):
+                    self._invalidate_cmr_status_cache()
+                if hasattr(self, "_refresh_all_folder_row_statuses"):
+                    self._refresh_all_folder_row_statuses()
+                else:
+                    for r in range(self.folder_table.rowCount()):
+                        self._update_folder_row_status(r)
         except Exception:
             pass
 
@@ -513,7 +518,6 @@ class MainWindowCmrMixin:
             return True, {}
 
         required = self._get_required_orders_by_tour(invoice_tours)
-        print(required)
         attached = self._get_cmr_attached_orders_for_entry()
         legacy = getattr(self, "_cmr_legacy_cache", {}) or {}
 

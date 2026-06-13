@@ -1009,11 +1009,166 @@ class MainWindowTransportTablesMixin:
         except ValueError:
             return None
 
+
+    def _unique_tour_numbers(self, tour_numbers) -> list[str]:
+        out = []
+        seen = set()
+        for t in (tour_numbers or []):
+            t = str(t or "").strip()
+            if t and t not in seen:
+                seen.add(t)
+                out.append(t)
+        return out
+
+    def _prepare_folder_status_caches(self, tour_numbers) -> None:
+        """Précharge en batch les infos nécessaires à l'affichage des dossiers.
+
+        Sur les grosses factures, l'ancien flux lançait plusieurs requêtes SQL
+        par ligne de dossier (kosten, TVA, AB, EUROPAL, LISINVOICE, CMR).
+        Cette méthode remplit les caches en quelques requêtes groupées.
+        Les fonctions unitaires restent en fallback pour l'édition manuelle.
+        """
+        tours = self._unique_tour_numbers(tour_numbers)
+        if not tours:
+            return
+
+        if not hasattr(self, "_kosten_cache") or self._kosten_cache is None:
+            self._kosten_cache = {}
+        if not hasattr(self, "_vat_theo_cache") or self._vat_theo_cache is None:
+            self._vat_theo_cache = {}
+        if not hasattr(self, "_ab_cache") or self._ab_cache is None:
+            self._ab_cache = {}
+        if not hasattr(self, "_europal_cache") or self._europal_cache is None:
+            self._europal_cache = {}
+        if not hasattr(self, "_lisinvoice_tour_exists_cache") or self._lisinvoice_tour_exists_cache is None:
+            self._lisinvoice_tour_exists_cache = {}
+
+        missing_kosten = [t for t in tours if t not in self._kosten_cache]
+        if missing_kosten:
+            try:
+                self._kosten_cache.update(self.tour_repo.get_kosten_by_tournrs(missing_kosten) or {})
+                for t in missing_kosten:
+                    self._kosten_cache.setdefault(t, None)
+            except Exception:
+                pass
+
+        missing_vat = [t for t in tours if t not in self._vat_theo_cache]
+        if missing_vat:
+            try:
+                if hasattr(self.tour_repo, "get_theoretical_vat_percent_by_tournrs"):
+                    self._vat_theo_cache.update(self.tour_repo.get_theoretical_vat_percent_by_tournrs(missing_vat) or {})
+                    for t in missing_vat:
+                        self._vat_theo_cache.setdefault(t, None)
+            except Exception:
+                pass
+
+        missing_ab = [t for t in tours if t not in self._ab_cache]
+        if missing_ab:
+            try:
+                if hasattr(self.tour_repo, "has_infosymbol19_311_by_tournrs"):
+                    self._ab_cache.update(self.tour_repo.has_infosymbol19_311_by_tournrs(missing_ab) or {})
+                    for t in missing_ab:
+                        self._ab_cache.setdefault(t, False)
+            except Exception:
+                pass
+
+        missing_eu = [t for t in tours if t not in self._europal_cache]
+        if missing_eu:
+            try:
+                if hasattr(self.tour_repo, "has_europal_by_tournrs"):
+                    self._europal_cache.update(self.tour_repo.has_europal_by_tournrs(missing_eu) or {})
+                    for t in missing_eu:
+                        self._europal_cache.setdefault(t, False)
+            except Exception:
+                pass
+
+        missing_lis = [t for t in tours if t not in self._lisinvoice_tour_exists_cache]
+        if missing_lis:
+            try:
+                if hasattr(self.lisinvoice_repo, "get_existing_tournrs"):
+                    existing = self.lisinvoice_repo.get_existing_tournrs(missing_lis) or set()
+                    for t in missing_lis:
+                        self._lisinvoice_tour_exists_cache[t] = t in existing
+            except Exception:
+                pass
+
+        try:
+            self._prepare_cmr_status_cache(tours)
+        except Exception:
+            pass
+
+    def _prepare_cmr_status_cache(self, tour_numbers) -> None:
+        """Prépare le statut CMR par dossier en une seule passe."""
+        tours = self._unique_tour_numbers(tour_numbers)
+        key = (tuple(sorted(tours)), str(getattr(self, "selected_invoice_entry_id", "") or ""))
+        if getattr(self, "_cmr_status_cache_key", None) == key:
+            return
+
+        status = {}
+        if not tours:
+            self._cmr_status_cache_key = key
+            self._cmr_status_by_tour = status
+            return
+
+        required = {}
+        attached = {}
+        legacy = {}
+        try:
+            required = self._get_required_orders_by_tour(set(tours)) or {}
+            attached = self._get_cmr_attached_orders_for_entry() or {}
+            legacy = getattr(self, "_cmr_legacy_cache", {}) or {}
+        except Exception:
+            required = {}
+            attached = {}
+            legacy = {}
+
+        for tour in tours:
+            req = set(required.get(tour, set()))
+            att = set(attached.get(tour, set()))
+            if not att and legacy.get(tour, 0) > 0 and len(req) == 1:
+                att = set(req)
+
+            covered = set(att)
+
+            if not req:
+                status[tour] = {"state": "unknown", "required": set(), "attached": att, "missing": []}
+            else:
+                missing = sorted(req - covered)
+                if not missing:
+                    state = "ok"
+                elif len(covered) > 0:
+                    state = "partial"
+                else:
+                    state = "missing"
+                status[tour] = {"state": state, "required": req, "attached": covered, "missing": missing}
+
+        self._cmr_status_cache_key = key
+        self._cmr_status_by_tour = status
+
+    def _invalidate_cmr_status_cache(self) -> None:
+        self._cmr_status_cache_key = None
+        self._cmr_status_by_tour = {}
+
+    def _refresh_all_folder_row_statuses(self) -> None:
+        rows = self.get_folder_rows() if hasattr(self, "get_folder_rows") else []
+        tours = [r.get("tour_nr") for r in rows if r.get("tour_nr")]
+        self._prepare_folder_status_caches(tours)
+
+        old_updates = self.folder_table.updatesEnabled() if hasattr(self, "folder_table") else True
+        try:
+            self.folder_table.setUpdatesEnabled(False)
+            for row in range(self.folder_table.rowCount()):
+                self._update_folder_row_status(row)
+        finally:
+            self.folder_table.setUpdatesEnabled(old_updates)
+
     def update_folder_totals(self):
         rows = self.get_folder_rows()
 
         tour_nrs = [r["tour_nr"] for r in rows if r.get("tour_nr")]
-        kosten_map = self.tour_repo.get_kosten_by_tournrs(tour_nrs) if tour_nrs else {}
+        if tour_nrs:
+            self._prepare_folder_status_caches(tour_nrs)
+        kosten_map = {t: getattr(self, "_kosten_cache", {}).get(t) for t in tour_nrs}
 
         total_db = 0.0
         has_db = False
@@ -1092,8 +1247,8 @@ class MainWindowTransportTablesMixin:
         amount_le.setText("" if amount is None else str(amount))
         vat_theo_le.setText("" if vat_theo is None else str(vat_theo))
 
-        dossier_le.mousePressEvent = lambda e, f=dossier_le: self.set_active_field(f)
-        amount_le.mousePressEvent = lambda e, f=amount_le: self.set_active_field(f)
+        self._bind_active_field_click(dossier_le)
+        self._bind_active_field_click(amount_le)
 
         dossier_le.textChanged.connect(lambda _=None, r=row: self._on_folder_row_changed(r))
         amount_le.textChanged.connect(lambda _=None, r=row: self._on_folder_row_changed(r))
@@ -1104,7 +1259,8 @@ class MainWindowTransportTablesMixin:
         self.folder_table.setCellWidget(row, 1, amount_le)
         self.folder_table.setCellWidget(row, 2, vat_theo_le)
 
-        self._update_folder_row_status(row)
+        if not getattr(self, "_folder_bulk_loading", False):
+            self._update_folder_row_status(row)
 
     def _ensure_empty_folder_row(self):
         # si aucune ligne -> en créer une vide
@@ -1222,26 +1378,26 @@ class MainWindowTransportTablesMixin:
                 cmr_lbl.setText("")
                 cmr_lbl.setToolTip("")
             else:
-                ok, missing_by_tour = self._check_all_orders_have_cmr()
-                required = self._get_required_orders_by_tour({tour_nr})
-                attached = self._get_cmr_attached_orders_for_entry()
+                try:
+                    self._prepare_cmr_status_cache(self.get_folder_numbers())
+                    cmr_status = (getattr(self, "_cmr_status_by_tour", {}) or {}).get(tour_nr, {})
+                except Exception:
+                    cmr_status = {}
 
-                req = required.get(tour_nr, set())
-                att = attached.get(tour_nr, set())
+                state = cmr_status.get("state")
+                req = set(cmr_status.get("required") or set())
+                attached = set(cmr_status.get("attached") or set())
+                missing = list(cmr_status.get("missing") or [])
 
-                if not tour_nr:
-                    cmr_lbl.setText("")
-                    cmr_lbl.setToolTip("")
-                elif not req:
+                if state == "unknown" or not req:
                     cmr_lbl.setText("🧾❓")
                     cmr_lbl.setToolTip("Aucune commande (AufNr) trouvée en BDD pour ce dossier.")
-                elif req.issubset(att):
+                elif state == "ok":
                     cmr_lbl.setText("🧾✅")
                     cmr_lbl.setToolTip(f"Toutes les commandes ont une CMR ({len(req)}/{len(req)}).")
-                elif len(att) > 0:
-                    miss = sorted(req - att)
+                elif state == "partial":
                     cmr_lbl.setText("🧾⚠️")
-                    cmr_lbl.setToolTip(f"CMR partielle: {len(att)}/{len(req)}. Manque: {', '.join(miss[:10])}" + ("..." if len(miss) > 10 else ""))
+                    cmr_lbl.setToolTip(f"CMR partielle: {len(attached)}/{len(req)}. Manque: {', '.join(missing[:10])}" + ("..." if len(missing) > 10 else ""))
                 else:
                     cmr_lbl.setText("🧾❌")
                     cmr_lbl.setToolTip(f"Aucune CMR sur les commandes. Attendu: {len(req)} commande(s).")
@@ -1283,7 +1439,13 @@ class MainWindowTransportTablesMixin:
 
 
         try:
-            db_kosten = self.tour_repo.get_kosten_by_tournr(tour_nr)
+            if not hasattr(self, "_kosten_cache") or self._kosten_cache is None:
+                self._kosten_cache = {}
+            if tour_nr in self._kosten_cache:
+                db_kosten = self._kosten_cache.get(tour_nr)
+            else:
+                db_kosten = self.tour_repo.get_kosten_by_tournr(tour_nr)
+                self._kosten_cache[tour_nr] = db_kosten
         except Exception as e:
             amount_le.setStyleSheet("background-color: #ffe6e6;")
             amount_le.setToolTip(f"Erreur BDD: {e}")
@@ -1344,9 +1506,9 @@ class MainWindowTransportTablesMixin:
         vat_le.setText("" if vat is None else str(vat))
 
         # champ actif
-        rate_le.mousePressEvent = lambda e, f=rate_le: self.set_active_field(f)
-        base_le.mousePressEvent = lambda e, f=base_le: self.set_active_field(f)
-        vat_le.mousePressEvent  = lambda e, f=vat_le: self.set_active_field(f)
+        self._bind_active_field_click(rate_le)
+        self._bind_active_field_click(base_le)
+        self._bind_active_field_click(vat_le)
 
         # changements => total + ligne vide
         rate_le.textChanged.connect(lambda _=None, r=row: self._on_vat_row_changed(r))

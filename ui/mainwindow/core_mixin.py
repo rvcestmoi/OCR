@@ -9,6 +9,32 @@ from ocr.supplier_model import validate_iban, validate_bic
 
 class MainWindowCoreMixin:
 
+    def _bind_active_field_click(self, field):
+        """Rend un champ actif au clic sans casser le comportement natif Qt.
+
+        Avant, on remplaçait directement mousePressEvent par set_active_field(...).
+        Le clic ne passait donc plus par QLineEdit.mousePressEvent : Qt ne pouvait
+        plus positionner le curseur à l'endroit exact cliqué, et le curseur finissait
+        souvent en fin de texte.
+        """
+        if field is None or getattr(field, "_ocr_active_click_bound", False):
+            return
+
+        original_mouse_press = field.mousePressEvent
+        field._ocr_original_mouse_press_event = original_mouse_press
+        field._ocr_active_click_bound = True
+
+        def _mouse_press_event(event, _field=field, _original=original_mouse_press):
+            try:
+                _original(event)
+            finally:
+                try:
+                    self.set_active_field(_field)
+                except Exception:
+                    pass
+
+        field.mousePressEvent = _mouse_press_event
+
     def set_active_field(self, field):
         self.active_field = field
 
@@ -158,14 +184,22 @@ class MainWindowCoreMixin:
                 self.btn_next_page.setEnabled(False)
                 return
 
-            doc = fitz.open(doc_path)
-            pixmaps = []
-            for page in doc:
-                pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
-                img = QImage(pix.samples, pix.width, pix.height, pix.stride, QImage.Format_RGB888)
-                pixmaps.append(QPixmap.fromImage(img))
-            self.pdf_viewer.set_pages(pixmaps)
-            doc.close()
+            # Optimisation gros PDF : le viewer rend maintenant les pages à la demande.
+            # Avant, toutes les pages étaient converties en images dès l'ouverture,
+            # ce qui pouvait bloquer plusieurs secondes/minutes sur des PDF volumineux.
+            if hasattr(self.pdf_viewer, "set_pdf_file"):
+                self.pdf_viewer.set_pdf_file(doc_path)
+            else:
+                doc = fitz.open(doc_path)
+                pixmaps = []
+                for page in doc:
+                    pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
+                    img = QImage(pix.samples, pix.width, pix.height, pix.stride, QImage.Format_RGB888)
+                    pixmaps.append(QPixmap.fromImage(img))
+                self.pdf_viewer.set_pages(pixmaps)
+                doc.close()
+
+            self.update_page_indicator()
 
         except Exception as e:
             QMessageBox.critical(self, "Erreur document", str(e))
@@ -335,28 +369,55 @@ class MainWindowCoreMixin:
         # Dossiers
         folders = saved_data.get("folders") or []
         if folders:
-            # Supprimer la ligne vide ajoutée par clear_folder_fields
-            self.folder_table.setRowCount(0)
+            folder_rows_to_load = []
             for folder in folders:
                 if isinstance(folder, dict):
-                    tour_nr = folder.get("tour_nr", "")
-                    amount = folder.get("amount_ht_ocr", "")
-                    vat_theo = ""  # vat_theo n'est pas sauvegardé, laissé vide
+                    folder_rows_to_load.append((
+                        folder.get("tour_nr", ""),
+                        folder.get("amount_ht_ocr", ""),
+                        "",  # vat_theo n'est pas sauvegardé, il est recalculé depuis la BDD
+                    ))
+
+            # Optimisation gros PDF : précharger les statuts BDD en batch et
+            # construire le tableau sans recalcul ligne par ligne.
+            try:
+                self._prepare_folder_status_caches([r[0] for r in folder_rows_to_load])
+            except Exception:
+                pass
+
+            old_updates = self.folder_table.updatesEnabled()
+            self._folder_bulk_loading = True
+            try:
+                self.folder_table.setUpdatesEnabled(False)
+                self.folder_table.setRowCount(0)
+                for tour_nr, amount, vat_theo in folder_rows_to_load:
                     self._add_folder_row(tour_nr, amount, vat_theo)
-            # Ajouter une ligne vide à la fin si nécessaire
-            self._ensure_empty_folder_row()
+                self._ensure_empty_folder_row()
+            finally:
+                self._folder_bulk_loading = False
+                self.folder_table.setUpdatesEnabled(old_updates)
+
+            try:
+                self._refresh_all_folder_row_statuses()
+            except Exception:
+                pass
 
         # TVA
         vat_lines = saved_data.get("vat_lines") or []
         if vat_lines:
-            # Supprimer la ligne vide ajoutée par _ensure_empty_vat_row
-            self.vat_table.setRowCount(0)
-            for vat_line in vat_lines:
-                if isinstance(vat_line, dict):
-                    rate = vat_line.get("rate", "")
-                    base = vat_line.get("base", "")
-                    vat = vat_line.get("vat", "")
-                    self._add_vat_row(rate, base, vat)
+            old_updates = self.vat_table.updatesEnabled()
+            try:
+                self.vat_table.setUpdatesEnabled(False)
+                # Supprimer la ligne vide ajoutée par _ensure_empty_vat_row
+                self.vat_table.setRowCount(0)
+                for vat_line in vat_lines:
+                    if isinstance(vat_line, dict):
+                        rate = vat_line.get("rate", "")
+                        base = vat_line.get("base", "")
+                        vat = vat_line.get("vat", "")
+                        self._add_vat_row(rate, base, vat)
+            finally:
+                self.vat_table.setUpdatesEnabled(old_updates)
 
         # OCR text
         if saved_data.get("ocr_text"):

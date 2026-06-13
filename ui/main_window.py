@@ -73,9 +73,12 @@ class MainWindow(
         self._last_main_selected_path: str | None = None
         self._did_autoload_default_folder = False
 
+        self._kosten_cache: dict[str, float | None] = {}
         self._vat_theo_cache: dict[str, float | None] = {}
         self._ab_cache: dict[str, bool] = {}
         self._europal_cache: dict[str, bool] = {}
+        self._cmr_status_cache_key = None
+        self._cmr_status_by_tour: dict[str, dict] = {}
         self._pending_tags_to_add: set[str] = set()
         self._lkz_cache: dict[tuple[str, str], str] = {}
 
@@ -649,11 +652,12 @@ class MainWindow(
         self.main_splitter.setStretchFactor(2, 4)
         self.main_splitter.setSizes([320, 520, 420])
 
-        # Champs cliquables
+        # Champs cliquables : on garde le clic natif du QLineEdit pour que
+        # l'utilisateur puisse placer le curseur exactement où il clique.
         for field in [self.iban_input, self.bic_input, self.date_input, self.invoice_number_input]:
-            field.mousePressEvent = lambda e, f=field: self.set_active_field(f)
+            self._bind_active_field_click(field)
             field.textChanged.connect(lambda _, f=field: f.setStyleSheet(""))
-            self.transporter_input.mousePressEvent = lambda e, f=self.transporter_input: self.set_active_field(f)
+        self._bind_active_field_click(self.transporter_input)
 
         # =========================
         # Recherche dans texte OCR

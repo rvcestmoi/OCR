@@ -43,22 +43,25 @@ class TourRepository(BaseRepository):
         if not tour_numbers:
             return {}
 
-        placeholders = ",".join(["?"] * len(tour_numbers))
-        query = f"""
-            SELECT CONVERT(VARCHAR(20), TourNr) AS TourNr, Kosten
-            FROM xxatour
-            WHERE CONVERT(VARCHAR(20), TourNr) IN ({placeholders})
-        """
-        rows = self.fetch_all(query, tuple(tour_numbers))
-
         out: Dict[str, Optional[float]] = {}
-        for r in rows:
-            k = str(r.get("TourNr") or r.get("tournr") or "").strip()
-            v = r.get("Kosten") if "Kosten" in r else r.get("kosten")
-            try:
-                out[k] = float(v) if v is not None else None
-            except Exception:
-                out[k] = None
+        chunk_size = 200
+        for i in range(0, len(tour_numbers), chunk_size):
+            chunk = tour_numbers[i:i + chunk_size]
+            placeholders = ",".join(["?"] * len(chunk))
+            query = f"""
+                SELECT LTRIM(RTRIM(CAST(TourNr AS VARCHAR(20)))) AS TourNr, Kosten
+                FROM xxatour
+                WHERE LTRIM(RTRIM(CAST(TourNr AS VARCHAR(20)))) IN ({placeholders})
+            """
+            rows = self.fetch_all(query, tuple(chunk)) or []
+
+            for r in rows:
+                k = str(r.get("TourNr") or r.get("tournr") or "").strip()
+                v = r.get("Kosten") if "Kosten" in r else r.get("kosten")
+                try:
+                    out[k] = float(v) if v is not None else None
+                except Exception:
+                    out[k] = None
         return out
     
     def get_palette_details_by_tournr(self, tour_nr: str) -> List[Dict[str, Any]]:
@@ -456,6 +459,87 @@ class TourRepository(BaseRepository):
         row = self.fetch_one(query, (tournr,))
         return str((row or {}).get("FFNR") or "").strip()
     
+
+
+    def get_theoretical_vat_percent_by_tournrs(self, tour_numbers: List[str]) -> Dict[str, Optional[float]]:
+        """Retourne {TourNr: taux TVA théorique} en une seule série de requêtes."""
+        tour_numbers = [str(t).strip() for t in (tour_numbers or []) if str(t).strip()]
+        if not tour_numbers:
+            return {}
+
+        out: Dict[str, Optional[float]] = {}
+        chunk_size = 200
+        for i in range(0, len(tour_numbers), chunk_size):
+            chunk = tour_numbers[i:i + chunk_size]
+            placeholders = ",".join(["?"] * len(chunk))
+            query = f"""
+                SELECT
+                    LTRIM(RTRIM(CAST(auf.TourNr AS VARCHAR(20)))) AS TourNr,
+                    MAX(COALESCE(uc.Prozent, 0)) AS Prozent
+                FROM XXAV_FR_UNION_XXAPreFakAuf_XXAFakAuf auf
+                LEFT JOIN XXAUC uc ON auf.FFUC = uc.UC
+                WHERE auf.AufDK = 'K'
+                AND LTRIM(RTRIM(CAST(auf.TourNr AS VARCHAR(20)))) IN ({placeholders})
+                GROUP BY LTRIM(RTRIM(CAST(auf.TourNr AS VARCHAR(20))))
+            """
+            rows = self.fetch_all(query, tuple(chunk)) or []
+            for r in rows:
+                t = str(r.get("TourNr") or r.get("tournr") or "").strip()
+                v = r.get("Prozent") if "Prozent" in r else r.get("prozent")
+                try:
+                    out[t] = float(v) if v is not None else None
+                except Exception:
+                    out[t] = None
+        return out
+
+    def has_infosymbol19_311_by_tournrs(self, tour_numbers: List[str]) -> Dict[str, bool]:
+        """Retourne {TourNr: bool AB} en batch."""
+        tour_numbers = [str(t).strip() for t in (tour_numbers or []) if str(t).strip()]
+        if not tour_numbers:
+            return {}
+
+        out: Dict[str, bool] = {t: False for t in tour_numbers}
+        chunk_size = 200
+        for i in range(0, len(tour_numbers), chunk_size):
+            chunk = tour_numbers[i:i + chunk_size]
+            placeholders = ",".join(["?"] * len(chunk))
+            query = f"""
+                SELECT DISTINCT LTRIM(RTRIM(CAST(auf.TourNr AS VARCHAR(20)))) AS TourNr
+                FROM XXASLAufInfSym sym
+                LEFT JOIN XXASLAuf auf ON auf.AufIntNr = sym.AufIntNr
+                WHERE sym.InfoSymbol19 = 311
+                AND LTRIM(RTRIM(CAST(auf.TourNr AS VARCHAR(20)))) IN ({placeholders})
+            """
+            rows = self.fetch_all(query, tuple(chunk)) or []
+            for r in rows:
+                t = str(r.get("TourNr") or r.get("tournr") or "").strip()
+                if t:
+                    out[t] = True
+        return out
+
+    def has_europal_by_tournrs(self, tour_numbers: List[str]) -> Dict[str, bool]:
+        """Retourne {TourNr: bool EUROPAL} en batch."""
+        tour_numbers = [str(t).strip() for t in (tour_numbers or []) if str(t).strip()]
+        if not tour_numbers:
+            return {}
+
+        out: Dict[str, bool] = {t: False for t in tour_numbers}
+        chunk_size = 200
+        for i in range(0, len(tour_numbers), chunk_size):
+            chunk = tour_numbers[i:i + chunk_size]
+            placeholders = ",".join(["?"] * len(chunk))
+            query = f"""
+                SELECT DISTINCT LTRIM(RTRIM(CAST(TourNr AS VARCHAR(20)))) AS TourNr
+                FROM xxav_LIS_SUMTOUR_228794
+                WHERE VPE = 'EUROPAL'
+                AND LTRIM(RTRIM(CAST(TourNr AS VARCHAR(20)))) IN ({placeholders})
+            """
+            rows = self.fetch_all(query, tuple(chunk)) or []
+            for r in rows:
+                t = str(r.get("TourNr") or r.get("tournr") or "").strip()
+                if t:
+                    out[t] = True
+        return out
 
     def get_aufintnr_by_aufnr(self, aufnr: str) -> str:
         aufnr = str(aufnr or "").strip()

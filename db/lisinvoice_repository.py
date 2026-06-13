@@ -129,3 +129,31 @@ class LISInvoiceRepository(BaseRepository):
         """
         row = self.fetch_one(sql, (rech_nr, kunden_nr, tour_nr))
         return row is not None
+
+    def get_existing_tournrs(self, tour_numbers: list[str]) -> set[str]:
+        """Retourne les TourNr déjà présents dans LISINVOICE_EDTRANS en batch.
+
+        Utilisé à l'affichage des gros PDF pour éviter une requête SQL par
+        ligne de dossier.
+        """
+        tour_numbers = [str(t).strip() for t in (tour_numbers or []) if str(t).strip()]
+        if not tour_numbers:
+            return set()
+
+        out: set[str] = set()
+        chunk_size = 200
+        for i in range(0, len(tour_numbers), chunk_size):
+            chunk = tour_numbers[i:i + chunk_size]
+            placeholders = ",".join(["?"] * len(chunk))
+            sql = f"""
+                SELECT DISTINCT LTRIM(RTRIM(CAST(TourNr AS VARCHAR(20)))) AS TourNr
+                FROM dbo.LISINVOICE_EDTRANS
+                WHERE LTRIM(RTRIM(CAST(TourNr AS VARCHAR(20)))) IN ({placeholders})
+            """
+            rows = self.fetch_all(sql, tuple(chunk)) or []
+            for r in rows:
+                t = str(r.get("TourNr") or r.get("tournr") or "").strip()
+                if t:
+                    out.add(t)
+        return out
+

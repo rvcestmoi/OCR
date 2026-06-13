@@ -4,8 +4,13 @@ from PySide6.QtWidgets import (
     QLabel,
     QScrollArea,
 )
-from PySide6.QtGui import QPixmap, QTransform, QPainter, QPen, QColor
+from PySide6.QtGui import QPixmap, QTransform, QPainter, QPen, QColor, QImage
 from PySide6.QtCore import Qt, Signal, QRectF, QTimer
+
+try:
+    import fitz
+except Exception:  # pragma: no cover - dépend de l'installation client
+    fitz = None
 
 
 class PdfViewer(QWidget):
@@ -29,6 +34,11 @@ class PdfViewer(QWidget):
         super().__init__(parent)
 
         self._pixmaps: list[QPixmap] = []
+        self._pdf_path: str | None = None
+        self._pdf_page_count: int = 0
+        self._render_cache: dict[int, QPixmap] = {}
+        self._render_scale: float = 2.0
+        self._max_cached_pages: int = 6
         self._current_page: int = 0
 
         self._zoom_factor: float = 1.0
@@ -66,6 +76,15 @@ class PdfViewer(QWidget):
     # Public API
     # ------------------------------------------------------------------
     def set_pages(self, pixmaps: list[QPixmap]) -> None:
+        """Charge une liste de pixmaps déjà rendues.
+
+        Cette API est conservée pour les images et la compatibilité. Pour les
+        PDF multipages, `set_pdf_file()` est plus rapide car il ne rend que la
+        page affichée.
+        """
+        self._pdf_path = None
+        self._pdf_page_count = 0
+        self._render_cache = {}
         self._pixmaps = pixmaps or []
         self._current_page = 0
         self._rotation_degrees = 0
@@ -73,7 +92,42 @@ class PdfViewer(QWidget):
         self._auto_fit_width = True
         self.clear_highlights(refresh=False)
 
-        if self._pixmaps:
+        if self.page_count() > 0:
+            self.fit_to_width()
+        else:
+            self.label.clear()
+            self.view_changed.emit()
+
+    def set_pdf_file(self, pdf_path: str) -> None:
+        """Charge un PDF en rendu paresseux.
+
+        Avant, l'application rendait toutes les pages à l'ouverture. Sur les
+        gros PDF, c'était très coûteux alors qu'une seule page est affichée.
+        Ici on garde le nombre de pages, puis on rend uniquement la page
+        courante, avec un petit cache pour la navigation.
+        """
+        if fitz is None:
+            raise RuntimeError("PyMuPDF/fitz indisponible : impossible d'afficher le PDF.")
+
+        path = str(pdf_path or "").strip()
+        if not path:
+            self.set_pages([])
+            return
+
+        with fitz.open(path) as doc:
+            page_count = int(doc.page_count or 0)
+
+        self._pixmaps = []
+        self._pdf_path = path
+        self._pdf_page_count = max(0, page_count)
+        self._render_cache = {}
+        self._current_page = 0
+        self._rotation_degrees = 0
+        self._zoom_factor = 1.0
+        self._auto_fit_width = True
+        self.clear_highlights(refresh=False)
+
+        if self.page_count() > 0:
             self.fit_to_width()
         else:
             self.label.clear()
@@ -88,7 +142,7 @@ class PdfViewer(QWidget):
 
     # ---------------- Navigation ----------------
     def next_page(self) -> None:
-        if self._current_page < len(self._pixmaps) - 1:
+        if self._current_page < self.page_count() - 1:
             self._current_page += 1
             self._refresh()
 
@@ -98,11 +152,13 @@ class PdfViewer(QWidget):
             self._refresh()
 
     def go_to_page(self, index: int) -> None:
-        if 0 <= index < len(self._pixmaps):
+        if 0 <= index < self.page_count():
             self._current_page = index
             self._refresh()
 
     def page_count(self) -> int:
+        if self._pdf_path:
+            return int(self._pdf_page_count or 0)
         return len(self._pixmaps)
 
     def current_page_index(self) -> int:
@@ -110,14 +166,14 @@ class PdfViewer(QWidget):
 
     # ---------------- Zoom ----------------
     def zoom_in(self) -> None:
-        if not self._pixmaps:
+        if self.page_count() <= 0:
             return
         self._auto_fit_width = False
         self._zoom_factor *= 1.2
         self._refresh()
 
     def zoom_out(self) -> None:
-        if not self._pixmaps:
+        if self.page_count() <= 0:
             return
         self._auto_fit_width = False
         self._zoom_factor /= 1.2
@@ -128,10 +184,13 @@ class PdfViewer(QWidget):
         self.fit_to_width()
 
     def fit_to_width(self) -> None:
-        if not self._pixmaps:
+        if self.page_count() <= 0:
             return
 
-        rotated = self._get_rotated_pixmap(self._pixmaps[self._current_page])
+        base = self._get_page_pixmap(self._current_page)
+        if base is None or base.isNull():
+            return
+        rotated = self._get_rotated_pixmap(base)
         page_width = rotated.width()
         viewport_width = max(1, self.scroll_area.viewport().width() - 10)
 
@@ -145,7 +204,7 @@ class PdfViewer(QWidget):
 
     # ---------------- Rotation ----------------
     def rotate_left(self) -> None:
-        if not self._pixmaps:
+        if self.page_count() <= 0:
             return
         self._rotation_degrees = (self._rotation_degrees - 90) % 360
         if self._auto_fit_width:
@@ -154,7 +213,7 @@ class PdfViewer(QWidget):
             self._refresh()
 
     def rotate_right(self) -> None:
-        if not self._pixmaps:
+        if self.page_count() <= 0:
             return
         self._rotation_degrees = (self._rotation_degrees + 90) % 360
         if self._auto_fit_width:
@@ -181,7 +240,7 @@ class PdfViewer(QWidget):
     # ------------------------------------------------------------------
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
-        if self._pixmaps and self._auto_fit_width:
+        if self.page_count() > 0 and self._auto_fit_width:
             self.fit_to_width()
 
     def wheelEvent(self, event) -> None:
@@ -250,7 +309,7 @@ class PdfViewer(QWidget):
                 self._highlights[key or "active"] = norm
                 self._active_highlight_key = key or "active"
                 page = self._position_page_index(norm)
-                if page is not None and 0 <= page < len(self._pixmaps):
+                if page is not None and 0 <= page < self.page_count():
                     self._current_page = page
                 self._refresh()
                 QTimer.singleShot(0, lambda: self._scroll_to_highlight(self._highlights.get(self._active_highlight_key or "")))
@@ -260,7 +319,7 @@ class PdfViewer(QWidget):
         if key and key in self._highlights:
             self._active_highlight_key = key
             page = self._position_page_index(self._highlights[key])
-            if page is not None and 0 <= page < len(self._pixmaps):
+            if page is not None and 0 <= page < self.page_count():
                 self._current_page = page
             self._refresh()
             QTimer.singleShot(0, lambda: self._scroll_to_highlight(self._highlights.get(key)))
@@ -379,6 +438,42 @@ class PdfViewer(QWidget):
     # ------------------------------------------------------------------
     # Internal
     # ------------------------------------------------------------------
+    def _get_page_pixmap(self, index: int) -> QPixmap | None:
+        if index < 0 or index >= self.page_count():
+            return None
+
+        if self._pdf_path:
+            if index in self._render_cache:
+                return self._render_cache[index]
+            if fitz is None:
+                return None
+
+            try:
+                with fitz.open(self._pdf_path) as doc:
+                    page = doc.load_page(index)
+                    pix = page.get_pixmap(matrix=fitz.Matrix(self._render_scale, self._render_scale), alpha=False)
+                    fmt = QImage.Format_RGB888 if pix.n < 4 else QImage.Format_RGBA8888
+                    img = QImage(pix.samples, pix.width, pix.height, pix.stride, fmt).copy()
+                    qpix = QPixmap.fromImage(img)
+            except Exception:
+                return None
+
+            self._render_cache[index] = qpix
+            if len(self._render_cache) > self._max_cached_pages:
+                # petit LRU simplifié : on garde la page courante et les pages proches
+                keep = {index, index - 1, index + 1}
+                for old_idx in list(self._render_cache.keys()):
+                    if len(self._render_cache) <= self._max_cached_pages:
+                        break
+                    if old_idx not in keep:
+                        self._render_cache.pop(old_idx, None)
+            return qpix
+
+        try:
+            return self._pixmaps[index]
+        except Exception:
+            return None
+
     def _get_rotated_pixmap(self, pixmap: QPixmap) -> QPixmap:
         if self._rotation_degrees % 360 == 0:
             return pixmap
@@ -386,12 +481,17 @@ class PdfViewer(QWidget):
         return pixmap.transformed(transform, Qt.SmoothTransformation)
 
     def _refresh(self) -> None:
-        if not self._pixmaps:
+        if self.page_count() <= 0:
             self.label.clear()
             self.view_changed.emit()
             return
 
-        base_pixmap = self._pixmaps[self._current_page]
+        base_pixmap = self._get_page_pixmap(self._current_page)
+        if base_pixmap is None or base_pixmap.isNull():
+            self.label.clear()
+            self.view_changed.emit()
+            return
+
         painted = self._paint_highlights(base_pixmap, self._current_page)
         pixmap = self._get_rotated_pixmap(painted)
 
