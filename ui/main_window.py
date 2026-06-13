@@ -116,6 +116,23 @@ class MainWindow(
         self.btn_ocr_all = QPushButton("⚙️ OCRiser")
         self.btn_ocr_all.clicked.connect(self.ocr_all_pdfs)
 
+        # Bouton admin masqué par défaut.
+        # Activation dans settings/app_settings.json :
+        #   "ui": { "show_rebuild_search_index_button": true }
+        self.btn_rebuild_search_index = QPushButton("🔁 Recréer l'index recherche")
+        self.btn_rebuild_search_index.setToolTip(
+            "Reconstruit entièrement XXA_OCR_SEARCH_INDEX depuis XXA_LOGMAIL_228794 et les JSON sauvegardés."
+        )
+        self.btn_rebuild_search_index.clicked.connect(self.on_rebuild_search_index_clicked)
+        try:
+            from app.settings import load_settings, get_ui_value
+            settings = load_settings()
+            self.btn_rebuild_search_index.setVisible(
+                bool(get_ui_value(settings, "show_rebuild_search_index_button", False))
+            )
+        except Exception:
+            self.btn_rebuild_search_index.setVisible(False)
+
         self.lbl_last_mail_date = QLabel("Dernier mail : chargement…")
         self.lbl_last_mail_date.setWordWrap(True)
         self.lbl_last_mail_date.setStyleSheet("color: #666; padding: 2px 0 0 2px;")
@@ -136,6 +153,31 @@ class MainWindow(
         left_layout = QVBoxLayout(left_top_widget)
 
         left_layout.addWidget(self.btn_ocr_all)
+        left_layout.addWidget(self.btn_rebuild_search_index)
+
+        # Filtre date mail : placé sous le bouton OCRiser.
+        # Il recharge la liste depuis SQL pour filtrer sur XXA_LOGMAIL_228794.date_mail.
+        mail_date_filter_bar = QHBoxLayout()
+        self.left_mail_date_filter_checkbox = QCheckBox("Date mail")
+        self.left_mail_date_filter_date = QDateEdit()
+        self.left_mail_date_filter_date.setCalendarPopup(True)
+        self.left_mail_date_filter_date.setDisplayFormat("dd/MM/yyyy")
+        self.left_mail_date_filter_date.setDate(QDate.currentDate())
+        self.left_mail_date_filter_date.setEnabled(False)
+        self.left_mail_date_filter_date.setMaximumWidth(120)
+        self.btn_left_mail_date_filter_clear = QPushButton("Tous")
+        self.btn_left_mail_date_filter_clear.setMaximumWidth(55)
+
+        mail_date_filter_bar.addWidget(self.left_mail_date_filter_checkbox)
+        mail_date_filter_bar.addWidget(self.left_mail_date_filter_date)
+        mail_date_filter_bar.addWidget(self.btn_left_mail_date_filter_clear)
+        mail_date_filter_bar.addStretch(1)
+        left_layout.addLayout(mail_date_filter_bar)
+
+        self.left_mail_date_filter_checkbox.toggled.connect(self.on_left_mail_date_filter_changed)
+        self.left_mail_date_filter_date.dateChanged.connect(self.on_left_mail_date_filter_changed)
+        self.btn_left_mail_date_filter_clear.clicked.connect(self.clear_left_mail_date_filter)
+
         left_layout.addWidget(self.lbl_last_mail_date)
         left_layout.addWidget(self.lbl_last_mail_sender)
         left_layout.addWidget(self.lbl_last_mail_subject)

@@ -12,11 +12,11 @@ import csv
 from app.paths import CSV_EXPORT_DIR
 
 
-from PySide6.QtCore import QObject, QThread, Qt, QTimer, Signal, Slot, QStringListModel
+from PySide6.QtCore import QObject, QThread, Qt, QTimer, Signal, Slot, QStringListModel, QDate
 from PySide6.QtGui import (QBrush, QColor, QImage, QKeySequence, QPixmap,
                            QShortcut, QTextCharFormat, QTextCursor)
 from PySide6.QtWidgets import (QApplication, QButtonGroup, QCompleter, QDialog,
-                               QFileDialog, QFormLayout, QHeaderView, QHBoxLayout,
+                               QCheckBox, QDateEdit, QFileDialog, QFormLayout, QHeaderView, QHBoxLayout,
                                QInputDialog, QLabel, QLineEdit, QMainWindow, QMenu,
                                QMessageBox, QPlainTextEdit, QProgressDialog,
                                QPushButton, QSplitter, QTableWidget,

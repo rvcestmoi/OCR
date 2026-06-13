@@ -561,6 +561,8 @@ class MainWindowDocumentsMixin:
 
         current_search_query = self._get_left_search_query()
         self._loaded_left_search_query = current_search_query
+        date_mail_from, date_mail_to = self._get_left_mail_date_filter_range()
+        self._loaded_left_mail_date_filter = (date_mail_from, date_mail_to)
 
         mode = str(getattr(self, "left_filter_mode", "pending") or "pending").strip().lower()
         if mode == "errors":
@@ -603,6 +605,8 @@ class MainWindowDocumentsMixin:
                 sql_status,
                 limit=None,
                 search_query=current_search_query or None,
+                date_mail_from=date_mail_from,
+                date_mail_to=date_mail_to,
             )
 
             # Recherche rapide via l'index SQL alimenté à la sauvegarde.
@@ -614,6 +618,8 @@ class MainWindowDocumentsMixin:
                         current_search_query,
                         status=sql_status,
                         limit=1000,
+                        date_mail_from=date_mail_from,
+                        date_mail_to=date_mail_to,
                     ) or []
                 except Exception as e:
                     print(f"⚠️ Erreur recherche XXA_OCR_SEARCH_INDEX: {e}")
@@ -635,6 +641,8 @@ class MainWindowDocumentsMixin:
                             self.logmail_repo.get_document_rows_for_entries(
                                 missing_index_entry_ids,
                                 status=sql_status,
+                                date_mail_from=date_mail_from,
+                                date_mail_to=date_mail_to,
                             )
                             or []
                         )
@@ -661,6 +669,8 @@ class MainWindowDocumentsMixin:
                             self.logmail_repo.get_document_rows_for_entries(
                                 missing_entry_ids,
                                 status=sql_status,
+                                date_mail_from=date_mail_from,
+                                date_mail_to=date_mail_to,
                             )
                             or []
                         )
@@ -777,6 +787,7 @@ class MainWindowDocumentsMixin:
             it0.setData(Qt.UserRole + 1, status)
             it0.setData(Qt.UserRole + 4, entry_id)
             it0.setData(Qt.UserRole + 5, group_paths)
+            it0.setData(Qt.UserRole + 8, self._normalize_left_mail_date_value(date_mail))
 
             folders_for_search = self._get_saved_folder_numbers_for_pdf(rep_path)
             extra_search_values = list(folders_for_search or [])
@@ -1226,6 +1237,89 @@ class MainWindowDocumentsMixin:
         return lkz
     
 
+    def _normalize_left_mail_date_value(self, value) -> str:
+        """Retourne la date mail au format YYYY-MM-DD pour le filtre local UI."""
+        if not value:
+            return ""
+        try:
+            if hasattr(value, "strftime"):
+                return value.strftime("%Y-%m-%d")
+        except Exception:
+            pass
+
+        raw = str(value or "").strip()
+        if not raw:
+            return ""
+
+        # Formats SQL courants : 2026-06-13, 2026-06-13 07:18:09
+        m = re.search(r"\b(\d{4})-(\d{1,2})-(\d{1,2})\b", raw)
+        if m:
+            return f"{m.group(1)}-{int(m.group(2)):02d}-{int(m.group(3)):02d}"
+
+        # Format affiché : 13/06/2026 ou 13.06.2026
+        m = re.search(r"\b(\d{1,2})[./-](\d{1,2})[./-](\d{4})\b", raw)
+        if m:
+            return f"{m.group(3)}-{int(m.group(2)):02d}-{int(m.group(1)):02d}"
+
+        return ""
+
+    def _get_left_mail_date_filter_range(self):
+        """Retourne (début inclus, fin exclue) pour le filtre date_mail SQL."""
+        cb = getattr(self, "left_mail_date_filter_checkbox", None)
+        date_edit = getattr(self, "left_mail_date_filter_date", None)
+        try:
+            if cb is None or date_edit is None or not cb.isChecked():
+                return None, None
+            qdate = date_edit.date()
+            if not qdate or not qdate.isValid():
+                return None, None
+            start = qdate.toString("yyyy-MM-dd") + " 00:00:00"
+            end = qdate.addDays(1).toString("yyyy-MM-dd") + " 00:00:00"
+            return start, end
+        except Exception:
+            return None, None
+
+    def _get_left_mail_date_filter_day(self) -> str:
+        cb = getattr(self, "left_mail_date_filter_checkbox", None)
+        date_edit = getattr(self, "left_mail_date_filter_date", None)
+        try:
+            if cb is None or date_edit is None or not cb.isChecked():
+                return ""
+            qdate = date_edit.date()
+            if not qdate or not qdate.isValid():
+                return ""
+            return qdate.toString("yyyy-MM-dd")
+        except Exception:
+            return ""
+
+    def on_left_mail_date_filter_changed(self, *_args):
+        date_edit = getattr(self, "left_mail_date_filter_date", None)
+        cb = getattr(self, "left_mail_date_filter_checkbox", None)
+        try:
+            if date_edit is not None and cb is not None:
+                date_edit.setEnabled(cb.isChecked())
+        except Exception:
+            pass
+        self._schedule_left_table_reload()
+
+    def clear_left_mail_date_filter(self):
+        cb = getattr(self, "left_mail_date_filter_checkbox", None)
+        try:
+            if cb is not None:
+                cb.setChecked(False)
+        except Exception:
+            pass
+        self._schedule_left_table_reload()
+
+    def _schedule_left_table_reload(self, delay_ms: int = 250):
+        timer = getattr(self, "_left_search_reload_timer", None)
+        if timer is None:
+            timer = QTimer(self)
+            timer.setSingleShot(True)
+            timer.timeout.connect(self._reload_left_table_for_search)
+            self._left_search_reload_timer = timer
+        timer.start(max(0, int(delay_ms or 0)))
+
     def _get_left_search_query(self) -> str:
         widget = getattr(self, "left_search_input", None)
         if widget is None:
@@ -1234,14 +1328,7 @@ class MainWindowDocumentsMixin:
 
     def on_left_search_text_changed(self, _text: str):
         """Relance le chargement depuis SQL pour chercher aussi dans les lignes non chargées."""
-        timer = getattr(self, "_left_search_reload_timer", None)
-        if timer is None:
-            timer = QTimer(self)
-            timer.setSingleShot(True)
-            timer.timeout.connect(self._reload_left_table_for_search)
-            self._left_search_reload_timer = timer
-
-        timer.start(400)
+        self._schedule_left_table_reload(400)
 
     def _reload_left_table_for_search(self):
         current_folder = str(getattr(self, "current_folder_path", "") or "").strip()
@@ -1261,6 +1348,8 @@ class MainWindowDocumentsMixin:
 
         country_q = (getattr(self, "left_country_filter_input", None).text() if getattr(self, "left_country_filter_input", None) else "")
         country_q = (country_q or "").strip().lower()
+
+        mail_date_day = self._get_left_mail_date_filter_day()
 
         cols_count = self.pdf_table.columnCount()
 
@@ -1310,7 +1399,17 @@ class MainWindowDocumentsMixin:
             # (date_mail, expéditeur, transporteur, etc.).
             search_visible = (not query) or (query == loaded_query) or (query in haystack)
 
-            # 3) filtre pays (col 4)
+            # 3) filtre date mail local, utile quand le tableau est déjà chargé
+            if mail_date_day:
+                try:
+                    row_mail_day = str(it0.data(Qt.UserRole + 8) or "").strip()
+                except Exception:
+                    row_mail_day = ""
+                mail_date_visible = (row_mail_day == mail_date_day)
+            else:
+                mail_date_visible = True
+
+            # 4) filtre pays (col 4)
             if country_q and cols_count >= 5:
                 it = self.pdf_table.item(row, 4)
                 lkz_txt = str(it.text() if it else "").strip().lower()
@@ -1318,7 +1417,7 @@ class MainWindowDocumentsMixin:
             else:
                 country_visible = True
 
-            self.pdf_table.setRowHidden(row, not (status_visible and search_visible and country_visible))
+            self.pdf_table.setRowHidden(row, not (status_visible and search_visible and mail_date_visible and country_visible))
 
 
     def _get_country_for_document(self, pdf_path: str, iban: str | None, bic: str | None) -> str:

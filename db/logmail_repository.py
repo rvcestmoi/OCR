@@ -660,6 +660,7 @@ class LogmailRepository(BaseRepository):
         transporter_name: str = "",
         date_mail=None,
         expediteur: str = "",
+        verbose: bool = True,
     ) -> str:
         """Alimente dbo.XXA_OCR_SEARCH_INDEX pour rendre la recherche rapide.
 
@@ -667,7 +668,8 @@ class LogmailRepository(BaseRepository):
         """
         entry_id = str(entry_id or "").strip()
         if not entry_id:
-            print("DEBUG SEARCH INDEX: skipped, entry_id vide")
+            if verbose:
+                print("DEBUG SEARCH INDEX: skipped, entry_id vide")
             return "skipped"
 
         self.ensure_search_index_table()
@@ -762,7 +764,8 @@ class LogmailRepository(BaseRepository):
         )
         count = self.execute_rowcount(update_sql, params_update)
         if count and count > 0:
-            print(f"DEBUG SEARCH INDEX: updated entry_id={entry_id} tours={tour_text}")
+            if verbose:
+                print(f"DEBUG SEARCH INDEX: updated entry_id={entry_id} tours={tour_text}")
             return "updated"
 
         exists = self.fetch_one(
@@ -771,7 +774,8 @@ class LogmailRepository(BaseRepository):
         )
         if int((exists or {}).get("c") or 0) > 0:
             # Cas rare : rowcount non fiable côté driver, mais ligne présente.
-            print(f"DEBUG SEARCH INDEX: updated/exists entry_id={entry_id} tours={tour_text}")
+            if verbose:
+                print(f"DEBUG SEARCH INDEX: updated/exists entry_id={entry_id} tours={tour_text}")
             return "updated"
 
         insert_sql = """
@@ -811,10 +815,76 @@ class LogmailRepository(BaseRepository):
             search_compact,
         )
         self.execute(insert_sql, params_insert)
-        print(f"DEBUG SEARCH INDEX: inserted entry_id={entry_id} tours={tour_text}")
+        if verbose:
+            print(f"DEBUG SEARCH INDEX: inserted entry_id={entry_id} tours={tour_text}")
         return "inserted"
 
-    def search_entry_ids_in_index(self, search_query: str, status: str | None = None, limit: int = 500) -> list[str]:
+    def clear_search_index(self) -> int:
+        """Vide entièrement l'index de recherche avant une reconstruction complète."""
+        self.ensure_search_index_table()
+        return self.execute_rowcount("DELETE FROM dbo.XXA_OCR_SEARCH_INDEX")
+
+    def get_all_search_index_source_rows(self) -> list[dict]:
+        """Source complète pour reconstruire XXA_OCR_SEARCH_INDEX.
+
+        Retourne une ligne représentative par entry_id depuis XXA_LOGMAIL_228794,
+        hors documents marqués DELETED. Les champs JSON viendront enrichir ces
+        lignes côté UI quand un fichier de sauvegarde existe.
+        """
+        query = """
+            ;WITH base AS (
+                SELECT
+                    entry_id,
+                    nom_pdf,
+                    CASE
+                        WHEN LTRIM(RTRIM(COALESCE(processing_status, 'pending'))) = 'eccarts' THEN 'ecart'
+                        ELSE LTRIM(RTRIM(COALESCE(processing_status, 'pending')))
+                    END AS processing_status,
+                    invoice_date,
+                    iban,
+                    bic,
+                    doc_type,
+                    date_creation,
+                    COALESCE(TRY_CONVERT(datetime2, date_mail), date_creation) AS date_mail,
+                    LTRIM(RTRIM(COALESCE(expediteur, ''))) AS expediteur,
+                    LTRIM(RTRIM(COALESCE(sujet, ''))) AS sujet,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY entry_id
+                        ORDER BY
+                            COALESCE(TRY_CONVERT(datetime2, date_mail), date_creation) ASC,
+                            id_log ASC
+                    ) AS rn
+                FROM dbo.XXA_LOGMAIL_228794
+                WHERE LTRIM(RTRIM(COALESCE(entry_id, ''))) <> ''
+                  AND LTRIM(RTRIM(COALESCE(nom_pdf, ''))) <> ''
+                  AND UPPER(LTRIM(RTRIM(COALESCE(doc_type, '')))) <> 'DELETED'
+            )
+            SELECT
+                entry_id,
+                nom_pdf,
+                processing_status,
+                invoice_date,
+                iban,
+                bic,
+                doc_type,
+                date_creation,
+                date_mail,
+                expediteur,
+                sujet
+            FROM base
+            WHERE rn = 1
+            ORDER BY date_mail ASC, nom_pdf ASC
+        """
+        return self.fetch_all(query) or []
+
+    def search_entry_ids_in_index(
+        self,
+        search_query: str,
+        status: str | None = None,
+        limit: int = 500,
+        date_mail_from=None,
+        date_mail_to=None,
+    ) -> list[str]:
         """Recherche rapide dans XXA_OCR_SEARCH_INDEX.
 
         Si la table n'existe pas encore, retourne simplement [] pour garder la
@@ -840,6 +910,15 @@ class LogmailRepository(BaseRepository):
         except Exception:
             top = 500
 
+        params = [status_idx, like_text, like_compact]
+        date_filter_sql = ""
+        if date_mail_from:
+            date_filter_sql += " AND date_mail >= ?"
+            params.append(date_mail_from)
+        if date_mail_to:
+            date_filter_sql += " AND date_mail < ?"
+            params.append(date_mail_to)
+
         sql = f"""
             SELECT TOP {top} entry_id
             FROM dbo.XXA_OCR_SEARCH_INDEX
@@ -848,9 +927,10 @@ class LogmailRepository(BaseRepository):
                     UPPER(COALESCE(search_text, '')) LIKE ?
                     OR UPPER(COALESCE(search_compact, '')) LIKE ?
                   )
+              {date_filter_sql}
             ORDER BY updated_at DESC
         """
-        rows = self.fetch_all(sql, (status_idx, like_text, like_compact)) or []
+        rows = self.fetch_all(sql, tuple(params)) or []
         out = []
         for r in rows:
             entry = str(r.get("entry_id") or "").strip()
@@ -926,6 +1006,8 @@ class LogmailRepository(BaseRepository):
         status: str,
         limit: int | None = None,
         search_query: str | None = None,
+        date_mail_from=None,
+        date_mail_to=None,
     ) -> list[dict]:
         """
         Retourne les lignes groupées par entry_id pour alimenter le tableau de gauche.
@@ -968,6 +1050,15 @@ class LogmailRepository(BaseRepository):
                 )
             """
 
+        mail_date_expr = "COALESCE(TRY_CONVERT(datetime2, date_mail), date_creation)"
+        date_filter_sql = ""
+        if date_mail_from:
+            date_filter_sql += f" AND {mail_date_expr} >= ?"
+            params.append(date_mail_from)
+        if date_mail_to:
+            date_filter_sql += f" AND {mail_date_expr} < ?"
+            params.append(date_mail_to)
+
         query = f"""
             ;WITH base AS (
                 SELECT
@@ -998,6 +1089,7 @@ class LogmailRepository(BaseRepository):
                         ELSE LTRIM(RTRIM(COALESCE(processing_status, 'pending')))
                     END = ?
                 {search_filter_sql}
+                {date_filter_sql}
             )
             SELECT {top_clause}
                 entry_id,
@@ -1046,6 +1138,8 @@ class LogmailRepository(BaseRepository):
         self,
         entry_ids: list[str],
         status: str | None = None,
+        date_mail_from=None,
+        date_mail_to=None,
     ) -> list[dict]:
         """
         Retourne les lignes représentatives (1 ligne par entry_id) pour une liste
@@ -1079,6 +1173,15 @@ class LogmailRepository(BaseRepository):
                 """
                 params.append(normalized_status)
 
+            mail_date_expr = "COALESCE(TRY_CONVERT(datetime2, date_mail), date_creation)"
+            date_filter_sql = ""
+            if date_mail_from:
+                date_filter_sql += f" AND {mail_date_expr} >= ?"
+                params.append(date_mail_from)
+            if date_mail_to:
+                date_filter_sql += f" AND {mail_date_expr} < ?"
+                params.append(date_mail_to)
+
             query = f"""
                 ;WITH base AS (
                     SELECT
@@ -1104,6 +1207,7 @@ class LogmailRepository(BaseRepository):
                     WHERE entry_id IN ({placeholders})
                       AND UPPER(LTRIM(RTRIM(COALESCE(doc_type, '')))) <> 'DELETED'
                     {status_sql}
+                    {date_filter_sql}
                 )
                 SELECT
                     entry_id,

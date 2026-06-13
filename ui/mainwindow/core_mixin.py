@@ -1270,6 +1270,284 @@ class MainWindowCoreMixin:
 
 
 
+    def _score_search_index_json_data(self, data: dict) -> int:
+        """Score simple pour choisir le JSON le plus riche lors d'une reconstruction d'index."""
+        if not isinstance(data, dict):
+            return 0
+        score = 0
+        for key in (
+            "invoice_number",
+            "invoice_date",
+            "iban",
+            "bic",
+            "transporter_kundennr",
+            "selected_kundennr",
+            "transporter_name",
+            "transporter_text",
+            "ocr_text",
+        ):
+            if str(data.get(key) or "").strip():
+                score += 1
+        try:
+            score += min(5, len(self._extract_tournrs_from_saved(data)))
+        except Exception:
+            pass
+        try:
+            score += min(3, len(data.get("folders") or []))
+        except Exception:
+            pass
+        return score
+
+    def _build_saved_json_lookup_for_search_index(self) -> dict:
+        """Prépare un index mémoire des JSON de sauvegarde existants.
+
+        Compatibilité : gère les anciens noms `<entry_id>__fichier.json`, les
+        nouveaux noms `<fichier>___suffixe.json`, et les JSON qui portent eux-mêmes
+        `entry_id` dans leur contenu.
+        """
+        lookup = {"by_entry": {}, "by_stem": {}}
+        model_dir = str(MODELS_DIR or "").strip()
+        if not model_dir or not os.path.isdir(model_dir):
+            return lookup
+
+        try:
+            filenames = [f for f in os.listdir(model_dir) if str(f).lower().endswith(".json")]
+        except Exception:
+            return lookup
+
+        for filename in filenames:
+            path = os.path.join(model_dir, filename)
+            if not os.path.isfile(path):
+                continue
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    data = json.load(f) or {}
+            except Exception:
+                continue
+            if not isinstance(data, dict):
+                continue
+
+            stem = os.path.splitext(filename)[0]
+            entry_id = str(data.get("entry_id") or "").strip()
+            if not entry_id and ENTRY_FILE_SEPARATOR in stem:
+                candidate = stem.split(ENTRY_FILE_SEPARATOR, 1)[0]
+                # Un entry_id Outlook est long ; on évite de prendre un simple
+                # nom de fichier contenant "__" par hasard.
+                if len(candidate) >= 20:
+                    entry_id = candidate
+
+            item = {"path": path, "stem": stem, "entry_id": entry_id, "data": data, "score": self._score_search_index_json_data(data)}
+            lookup["by_stem"].setdefault(stem.upper(), []).append(item)
+            if ENTRY_FILE_SEPARATOR in stem:
+                lookup["by_stem"].setdefault(stem.split(ENTRY_FILE_SEPARATOR, 1)[1].upper(), []).append(item)
+
+            if entry_id:
+                lookup["by_entry"].setdefault(entry_id, []).append(item)
+
+        return lookup
+
+    def _find_saved_json_for_search_index(self, entry_id: str, nom_pdf: str, lookup: dict) -> dict:
+        """Retourne le meilleur JSON disponible pour un entry_id/nom_pdf."""
+        entry_id = str(entry_id or "").strip()
+        nom_pdf = os.path.basename(str(nom_pdf or "").strip())
+        stem = os.path.splitext(nom_pdf)[0]
+        candidates = []
+
+        if stem:
+            candidates.append(stem.upper())
+        if entry_id and stem:
+            candidates.append(f"{entry_id}{ENTRY_FILE_SEPARATOR}{stem}".upper())
+        if ENTRY_FILE_SEPARATOR in stem:
+            candidates.append(stem.split(ENTRY_FILE_SEPARATOR, 1)[1].upper())
+
+        by_stem = (lookup or {}).get("by_stem") or {}
+        for key in candidates:
+            items = by_stem.get(key) or []
+            if not items:
+                continue
+            exact_items = [
+                item for item in items
+                if str(item.get("entry_id") or "").strip() == entry_id
+                or str(item.get("stem") or "").upper().startswith(f"{entry_id}{ENTRY_FILE_SEPARATOR}".upper())
+            ]
+            pool = exact_items or items
+            best = max(pool, key=lambda x: int(x.get("score") or 0))
+            return best.get("data") or {}
+
+        by_entry = (lookup or {}).get("by_entry") or {}
+        entry_items = by_entry.get(entry_id) or []
+        if entry_items:
+            best = max(entry_items, key=lambda x: int(x.get("score") or 0))
+            return best.get("data") or {}
+
+        return {}
+
+    def _transporter_name_for_search_index(self, kundennr: str, fallback: str = "", cache: dict | None = None) -> str:
+        """Nom transporteur pour l'index, avec cache pour éviter trop d'appels SQL."""
+        kundennr = str(kundennr or "").strip()
+        fallback = str(fallback or "").strip()
+        if fallback and kundennr and fallback.endswith(f"({kundennr})"):
+            fallback = fallback[: -len(f"({kundennr})")].strip()
+        if fallback:
+            return fallback
+        if not kundennr:
+            return ""
+        if cache is not None and kundennr in cache:
+            return cache[kundennr]
+        name = ""
+        try:
+            transporter = self.transporter_repo.find_transporter_by_kundennr(kundennr) or {}
+            name = str(transporter.get("name1") or "").strip()
+        except Exception:
+            name = ""
+        if cache is not None:
+            cache[kundennr] = name
+        return name
+
+    def on_rebuild_search_index_clicked(self):
+        """Bouton admin : reconstruit tout XXA_OCR_SEARCH_INDEX depuis le début."""
+        reply = QMessageBox.question(
+            self,
+            "Recréer l'index recherche",
+            "Cette opération va vider puis reconstruire entièrement la table XXA_OCR_SEARCH_INDEX\n"
+            "à partir de XXA_LOGMAIL_228794 et des JSON sauvegardés.\n\n"
+            "Continuer ?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return
+
+        progress = None
+        rebuilt = 0
+        skipped = 0
+        errors: list[str] = []
+        canceled = False
+
+        try:
+            QApplication.setOverrideCursor(Qt.WaitCursor)
+            rows = self.logmail_repo.get_all_search_index_source_rows() or []
+            self.logmail_repo.clear_search_index()
+            lookup = self._build_saved_json_lookup_for_search_index()
+            transporter_name_cache: dict[str, str] = {}
+
+            progress = QProgressDialog(
+                "Reconstruction de l'index de recherche…",
+                "Annuler",
+                0,
+                max(1, len(rows)),
+                self,
+            )
+            progress.setWindowTitle("Index recherche")
+            progress.setWindowModality(Qt.WindowModal)
+            progress.setMinimumDuration(0)
+
+            for i, row in enumerate(rows, start=1):
+                if progress.wasCanceled():
+                    canceled = True
+                    break
+
+                entry_id = str((row or {}).get("entry_id") or "").strip()
+                nom_pdf = str((row or {}).get("nom_pdf") or "").strip()
+                if not entry_id:
+                    skipped += 1
+                    continue
+
+                progress.setValue(i - 1)
+                progress.setLabelText(f"Reconstruction de l'index…\n{i}/{len(rows)}\n{nom_pdf}")
+                QApplication.processEvents()
+
+                try:
+                    data = self._find_saved_json_for_search_index(entry_id, nom_pdf, lookup)
+                    if not isinstance(data, dict):
+                        data = {}
+
+                    try:
+                        tour_numbers = self._extract_tournrs_from_saved(data) if data else []
+                    except Exception:
+                        tour_numbers = []
+
+                    status = str((row or {}).get("processing_status") or data.get("status") or "pending").strip()
+                    invoice_number = str(data.get("invoice_number") or "").strip()
+                    invoice_date = str(data.get("invoice_date") or (row or {}).get("invoice_date") or "").strip()
+                    iban = str(data.get("iban") or (row or {}).get("iban") or "").strip()
+                    bic = str(data.get("bic") or (row or {}).get("bic") or "").strip()
+                    kundennr = str(data.get("transporter_kundennr") or data.get("selected_kundennr") or "").strip()
+                    transporter_name = self._transporter_name_for_search_index(
+                        kundennr,
+                        fallback=str(data.get("transporter_name") or data.get("transporter_text") or "").strip(),
+                        cache=transporter_name_cache,
+                    )
+
+                    self.logmail_repo.upsert_search_index(
+                        entry_id=entry_id,
+                        nom_pdf=nom_pdf,
+                        status=status,
+                        invoice_number=invoice_number,
+                        invoice_date=invoice_date,
+                        iban=iban,
+                        bic=bic,
+                        tour_numbers=tour_numbers,
+                        transporter_kundennr=kundennr,
+                        transporter_name=transporter_name,
+                        date_mail=(row or {}).get("date_mail"),
+                        expediteur=str((row or {}).get("expediteur") or "").strip(),
+                        verbose=False,
+                    )
+                    rebuilt += 1
+                except Exception as e:
+                    skipped += 1
+                    if len(errors) < 10:
+                        errors.append(f"{entry_id} / {nom_pdf} : {e}")
+
+            if progress:
+                progress.setValue(progress.maximum())
+
+        except Exception as e:
+            errors.append(str(e))
+        finally:
+            try:
+                QApplication.restoreOverrideCursor()
+            except Exception:
+                pass
+            try:
+                if progress:
+                    progress.close()
+            except Exception:
+                pass
+
+        # Force la prochaine recherche à repartir de l'index frais.
+        try:
+            cache = getattr(self, "_left_search_folder_index_cache", None)
+            if isinstance(cache, dict):
+                cache.clear()
+        except Exception:
+            pass
+
+        try:
+            folder = str(getattr(self, "current_folder_path", "") or "").strip()
+            if folder and hasattr(self, "load_folder"):
+                self.load_folder(folder)
+        except Exception:
+            pass
+
+        if errors:
+            QMessageBox.warning(
+                self,
+                "Index recherche",
+                f"Index reconstruit partiellement.\n\n"
+                f"Lignes indexées : {rebuilt}\n"
+                f"Lignes ignorées/en erreur : {skipped}\n"
+                f"Annulé : {'oui' if canceled else 'non'}\n\n"
+                "Premières erreurs :\n" + "\n".join(errors[:10]),
+            )
+        else:
+            QMessageBox.information(
+                self,
+                "Index recherche",
+                f"Index reconstruit avec succès.\n\nLignes indexées : {rebuilt}\nLignes ignorées : {skipped}",
+            )
+
     def save_current_data(self, status: str = "draft", show_message: bool = True, pdf_path: str | None = None):
         target_pdf_path = str(pdf_path or getattr(self, "current_pdf_path", "") or "").strip()
         if not target_pdf_path:
