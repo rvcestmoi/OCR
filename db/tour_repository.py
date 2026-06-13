@@ -317,9 +317,18 @@ class TourRepository(BaseRepository):
         ocr_user_db = (ocr_user or "").strip() or None
         self.execute(sql, (tour_nr, ocr_user_db, ocr_user_db))
 
-    def set_block_status_for_tournr(self, tour_nr: str, is_blocked: bool, motif: str = "", ocr_user: str = ""):
+    def set_block_status_for_tournr(
+        self,
+        tour_nr: str,
+        is_blocked: bool,
+        motif: str = "",
+        ocr_user: str = "",
+        ocr_expediteur: str = "",
+        ocr_objet: str = "",
+    ):
         """
-        Met à jour XXATourExt.isBloqued + MotifBlocage + ComBloquageOCR + OCRUser pour un TourNr.
+        Met à jour XXATourExt.isBloqued + MotifBlocage + ComBloquageOCR
+        + OCRUser + OCRExpediteur + OCRObjet pour un TourNr.
         Upsert si la ligne XXATourExt n'existe pas encore.
         """
         sql = """
@@ -338,18 +347,30 @@ class TourRepository(BaseRepository):
                     isBloqued = ?,
                     MotifBlocage = ?,
                     ComBloquageOCR = ?,
-                    OCRUser = ?
+                    OCRUser = ?,
+                    OCRExpediteur = ?,
+                    OCRObjet = ?
                 WHERE TourIntNr = @TourIntNr;
             END
             ELSE
             BEGIN
-                INSERT INTO XXATourExt (TourIntNr, isBloqued, MotifBlocage, ComBloquageOCR, OCRUser)
-                VALUES (@TourIntNr, ?, ?, ?, ?);
+                INSERT INTO XXATourExt (
+                    TourIntNr,
+                    isBloqued,
+                    MotifBlocage,
+                    ComBloquageOCR,
+                    OCRUser,
+                    OCRExpediteur,
+                    OCRObjet
+                )
+                VALUES (@TourIntNr, ?, ?, ?, ?, ?, ?);
             END
         """
-        # si pas bloqué -> commentaire NULL (plus propre)
+        # si pas bloqué -> valeurs NULL (même logique que le motif)
         comment_db = (motif or "").strip() if is_blocked else None
         ocr_user_db = (ocr_user or "").strip() or None
+        expediteur_db = (ocr_expediteur or "").strip()[:255] if is_blocked else None
+        objet_db = (ocr_objet or "").strip()[:500] if is_blocked else None
         self.execute(
             sql,
             (
@@ -358,10 +379,14 @@ class TourRepository(BaseRepository):
                 comment_db,
                 comment_db,
                 ocr_user_db,
+                expediteur_db,
+                objet_db,
                 1 if is_blocked else 0,
                 comment_db,
                 comment_db,
                 ocr_user_db,
+                expediteur_db,
+                objet_db,
             ),
         )
 

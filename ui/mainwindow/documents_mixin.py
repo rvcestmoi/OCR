@@ -253,11 +253,49 @@ class MainWindowDocumentsMixin:
 
         return True, " ; ".join(comments) if comments else "A bloquer"
 
-    def _apply_block_state_to_database(self, tournrs: list[str], *, blocked: bool, comment: str = "") -> list[str]:
+    def _get_block_mail_metadata(self, preferred_doc_name: str = "") -> dict:
+        """Récupère l'expéditeur et l'objet du mail source de la facture.
+
+        Ces informations sont poussées dans XXATourExt lors de la synchronisation
+        d'un motif de blocage. Si l'ancien flux n'a pas encore d'entry_id en
+        mémoire, on retombe sur le nom du PDF courant.
+        """
+        meta = {"expediteur": "", "sujet": ""}
+        try:
+            entry_id = str(getattr(self, "selected_invoice_entry_id", "") or "").strip()
+            if not entry_id and hasattr(self, "_resolve_current_entry_id"):
+                entry_id = str(self._resolve_current_entry_id(getattr(self, "current_pdf_path", None)) or "").strip()
+
+            nom_pdf = str(preferred_doc_name or "").strip()
+            if not nom_pdf:
+                current_pdf_path = str(getattr(self, "current_pdf_path", "") or "").strip()
+                if current_pdf_path:
+                    nom_pdf = os.path.basename(current_pdf_path)
+
+            if hasattr(self, "logmail_repo") and hasattr(self.logmail_repo, "get_mail_info_for_entry_id"):
+                row = self.logmail_repo.get_mail_info_for_entry_id(entry_id=entry_id, nom_pdf=nom_pdf) or {}
+                meta["expediteur"] = str(row.get("expediteur") or "").strip()
+                meta["sujet"] = str(row.get("sujet") or "").strip()
+        except Exception:
+            pass
+
+        return meta
+
+    def _apply_block_state_to_database(
+        self,
+        tournrs: list[str],
+        *,
+        blocked: bool,
+        comment: str = "",
+        mail_expediteur: str = "",
+        mail_objet: str = "",
+    ) -> list[str]:
         """Applique immédiatement l'état de blocage dans les tables SQL liées aux tours."""
         errors: list[str] = []
         value = 601 if blocked else 600
         ocr_user = str(getattr(self, "current_username", "") or "").strip()
+        mail_expediteur = str(mail_expediteur or "").strip()
+        mail_objet = str(mail_objet or "").strip()
 
         for tour_nr in tournrs or []:
             tour_nr = str(tour_nr or "").strip()
@@ -271,6 +309,8 @@ class MainWindowDocumentsMixin:
                     is_blocked=bool(blocked),
                     motif=comment,
                     ocr_user=ocr_user,
+                    ocr_expediteur=mail_expediteur,
+                    ocr_objet=mail_objet,
                 )
             except Exception as e:
                 errors.append(f"{tour_nr} : {e}")
@@ -291,7 +331,14 @@ class MainWindowDocumentsMixin:
                 )
             return False
 
-        errors = self._apply_block_state_to_database(tournrs, blocked=blocked, comment=comment)
+        mail_meta = self._get_block_mail_metadata(preferred_doc_name) if blocked else {"expediteur": "", "sujet": ""}
+        errors = self._apply_block_state_to_database(
+            tournrs,
+            blocked=blocked,
+            comment=comment,
+            mail_expediteur=mail_meta.get("expediteur", ""),
+            mail_objet=mail_meta.get("sujet", ""),
+        )
         if errors:
             if show_message:
                 QMessageBox.warning(

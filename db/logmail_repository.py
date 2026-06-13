@@ -59,6 +59,56 @@ class LogmailRepository(BaseRepository):
         row = self.fetch_one(query, (entry_id,))
         return row["expediteur"] if row else None
 
+    def get_mail_info_for_entry_id(self, entry_id: str = "", nom_pdf: str = "") -> dict:
+        """Retourne les informations mail du groupe/document courant.
+
+        Utilisé pour pousser dans XXATourExt les champs OCRExpediteur et
+        OCRObjet en même temps que le motif de blocage. On privilégie la ligne
+        du document affiché quand `nom_pdf` est fourni, puis on retombe sur la
+        première ligne du même entry_id.
+        """
+        entry_id = str(entry_id or "").strip()
+        nom_pdf = str(nom_pdf or "").strip()
+
+        if entry_id:
+            row = self.fetch_one(
+                """
+                SELECT TOP 1
+                    COALESCE(TRY_CONVERT(datetime2, date_mail), date_creation) AS date_mail,
+                    LTRIM(RTRIM(COALESCE(expediteur, ''))) AS expediteur,
+                    LTRIM(RTRIM(COALESCE(sujet, ''))) AS sujet
+                FROM dbo.XXA_LOGMAIL_228794
+                WHERE entry_id = ?
+                ORDER BY
+                    CASE WHEN ? <> '' AND LTRIM(RTRIM(COALESCE(nom_pdf, ''))) = ? THEN 0 ELSE 1 END,
+                    COALESCE(TRY_CONVERT(datetime2, date_mail), date_creation) ASC,
+                    id_log ASC
+                """,
+                (entry_id, nom_pdf, nom_pdf),
+            )
+        elif nom_pdf:
+            row = self.fetch_one(
+                """
+                SELECT TOP 1
+                    COALESCE(TRY_CONVERT(datetime2, date_mail), date_creation) AS date_mail,
+                    LTRIM(RTRIM(COALESCE(expediteur, ''))) AS expediteur,
+                    LTRIM(RTRIM(COALESCE(sujet, ''))) AS sujet
+                FROM dbo.XXA_LOGMAIL_228794
+                WHERE LTRIM(RTRIM(COALESCE(nom_pdf, ''))) = ?
+                ORDER BY COALESCE(TRY_CONVERT(datetime2, date_mail), date_creation) ASC, id_log ASC
+                """,
+                (nom_pdf,),
+            )
+        else:
+            row = None
+
+        row = row or {}
+        return {
+            "date_mail": row.get("date_mail"),
+            "expediteur": str(row.get("expediteur") or "").strip(),
+            "sujet": str(row.get("sujet") or "").strip(),
+        }
+
     def get_files_for_entry(self, entry_id: str):
         query = """
             SELECT nom_pdf

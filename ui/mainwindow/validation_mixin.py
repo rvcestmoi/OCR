@@ -182,7 +182,14 @@ class MainWindowValidationMixin:
 
         # 4) Updates SQL
         if hasattr(self, "_apply_block_state_to_database"):
-            errors = self._apply_block_state_to_database(tournrs, blocked=blocked, comment=comment)
+            mail_meta = self._get_block_mail_metadata(doc_name) if blocked and hasattr(self, "_get_block_mail_metadata") else {"expediteur": "", "sujet": ""}
+            errors = self._apply_block_state_to_database(
+                tournrs,
+                blocked=blocked,
+                comment=comment,
+                mail_expediteur=mail_meta.get("expediteur", ""),
+                mail_objet=mail_meta.get("sujet", ""),
+            )
         else:
             errors = []
             value = 601 if blocked else 600
@@ -191,11 +198,14 @@ class MainWindowValidationMixin:
                 try:
                     self.tour_repo.set_infosymbol18_for_tournr(t, value=value)
                     self.tour_repo.set_ocr_user_for_tournr(t, ocr_user=ocr_user)
+                    mail_meta = self._get_block_mail_metadata(doc_name) if blocked and hasattr(self, "_get_block_mail_metadata") else {"expediteur": "", "sujet": ""}
                     self.tour_repo.set_block_status_for_tournr(
                         t,
                         is_blocked=blocked,
                         motif=comment,
                         ocr_user=ocr_user,
+                        ocr_expediteur=mail_meta.get("expediteur", ""),
+                        ocr_objet=mail_meta.get("sujet", ""),
                     )
                 except Exception as e:
                     errors.append(f"{t} : {e}")
