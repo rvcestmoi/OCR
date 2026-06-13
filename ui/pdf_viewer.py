@@ -4,13 +4,13 @@ from PySide6.QtWidgets import (
     QLabel,
     QScrollArea,
 )
-from PySide6.QtGui import QPixmap, QTransform
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtGui import QPixmap, QTransform, QPainter, QPen, QColor
+from PySide6.QtCore import Qt, Signal, QRectF, QTimer
 
 
 class PdfViewer(QWidget):
     """
-    Viewer PDF/image avec navigation par page, zoom et rotation.
+    Viewer PDF/image avec navigation par page, zoom, rotation et surlignage.
 
     - PDF multipages
     - Une page affichée à la fois
@@ -34,6 +34,12 @@ class PdfViewer(QWidget):
         self._zoom_factor: float = 1.0
         self._auto_fit_width: bool = True
         self._rotation_degrees: int = 0
+
+        # Highlights optionnels, format compatible JSON :
+        # {"iban": {"page": 0, "x": 0.1, "y": 0.2, "w": 0.3, "h": 0.04}}
+        # Les coordonnées sont normalisées par rapport à la page non tournée.
+        self._highlights: dict[str, dict] = {}
+        self._active_highlight_key: str | None = None
 
         self._init_ui()
 
@@ -65,6 +71,7 @@ class PdfViewer(QWidget):
         self._rotation_degrees = 0
         self._zoom_factor = 1.0
         self._auto_fit_width = True
+        self.clear_highlights(refresh=False)
 
         if self._pixmaps:
             self.fit_to_width()
@@ -201,6 +208,175 @@ class PdfViewer(QWidget):
         return super().eventFilter(obj, event)
 
     # ------------------------------------------------------------------
+    # Highlights
+    # ------------------------------------------------------------------
+    def clear_highlights(self, refresh: bool = True) -> None:
+        self._highlights = {}
+        self._active_highlight_key = None
+        if refresh:
+            self._refresh()
+
+    def set_highlights(self, highlights=None, active_key: str | None = None, **kwargs) -> None:
+        if highlights is None:
+            highlights = kwargs.get("field_positions") or kwargs.get("positions") or {}
+        if not isinstance(highlights, dict):
+            highlights = {}
+
+        cleaned: dict[str, dict] = {}
+        for key, pos in highlights.items():
+            if not isinstance(pos, dict):
+                continue
+            norm = self._normalize_highlight_position(pos)
+            if norm:
+                cleaned[str(key)] = norm
+
+        self._highlights = cleaned
+        self._active_highlight_key = str(active_key) if active_key else None
+        self._refresh()
+
+    def highlight_field(self, field_key=None, position=None, **kwargs) -> None:
+        """Affiche le rectangle du champ demandé.
+
+        Accepte les deux formes :
+        - highlight_field("iban", position_dict)
+        - highlight_field(field_key="iban", position=position_dict)
+        """
+        key = str(field_key or kwargs.get("key") or kwargs.get("field") or "").strip()
+        pos = position or kwargs.get("position") or kwargs.get("rect")
+
+        if isinstance(pos, dict):
+            norm = self._normalize_highlight_position(pos)
+            if norm:
+                self._highlights[key or "active"] = norm
+                self._active_highlight_key = key or "active"
+                page = self._position_page_index(norm)
+                if page is not None and 0 <= page < len(self._pixmaps):
+                    self._current_page = page
+                self._refresh()
+                QTimer.singleShot(0, lambda: self._scroll_to_highlight(self._highlights.get(self._active_highlight_key or "")))
+                return
+
+        # fallback : si seule la clé est donnée, on tente de l'utiliser dans les highlights existants
+        if key and key in self._highlights:
+            self._active_highlight_key = key
+            page = self._position_page_index(self._highlights[key])
+            if page is not None and 0 <= page < len(self._pixmaps):
+                self._current_page = page
+            self._refresh()
+            QTimer.singleShot(0, lambda: self._scroll_to_highlight(self._highlights.get(key)))
+        else:
+            self._active_highlight_key = None
+            self._refresh()
+
+    def _normalize_highlight_position(self, pos: dict) -> dict | None:
+        try:
+            x = float(pos.get("x", pos.get("left", pos.get("x0", 0))))
+            y = float(pos.get("y", pos.get("top", pos.get("y0", 0))))
+            w = float(pos.get("w", pos.get("width", 0)))
+            h = float(pos.get("h", pos.get("height", 0)))
+
+            # Compat éventuelle avec x0/y0/x1/y1 normalisés.
+            if (w <= 0 or h <= 0) and {"x0", "y0", "x1", "y1"}.issubset(pos.keys()):
+                x0 = float(pos.get("x0") or 0)
+                y0 = float(pos.get("y0") or 0)
+                x1 = float(pos.get("x1") or 0)
+                y1 = float(pos.get("y1") or 0)
+                x, y, w, h = x0, y0, max(0.0, x1 - x0), max(0.0, y1 - y0)
+
+            if w <= 0 or h <= 0:
+                return None
+
+            page = pos.get("page", pos.get("page_index", 0))
+            try:
+                page = int(page)
+            except Exception:
+                page = 0
+            if page >= 1 and bool(pos.get("page_number")):
+                page -= 1
+
+            out = dict(pos)
+            out.update({
+                "page": max(0, page),
+                "x": max(0.0, min(1.0, x)),
+                "y": max(0.0, min(1.0, y)),
+                "w": max(0.0, min(1.0, w)),
+                "h": max(0.0, min(1.0, h)),
+            })
+            return out
+        except Exception:
+            return None
+
+    def _position_page_index(self, pos: dict | None) -> int | None:
+        if not isinstance(pos, dict):
+            return None
+        try:
+            return max(0, int(pos.get("page", pos.get("page_index", 0)) or 0))
+        except Exception:
+            return None
+
+    def _paint_highlights(self, pixmap: QPixmap, page_index: int) -> QPixmap:
+        if pixmap.isNull() or not self._highlights:
+            return pixmap
+
+        page_w = max(1, pixmap.width())
+        page_h = max(1, pixmap.height())
+
+        to_paint: list[tuple[str, dict]] = []
+        for key, pos in self._highlights.items():
+            if self._position_page_index(pos) == page_index:
+                to_paint.append((key, pos))
+
+        if not to_paint:
+            return pixmap
+
+        out = QPixmap(pixmap)
+        painter = QPainter(out)
+        try:
+            # Un seul champ actif à la fois dans l'étape 1.
+            for key, pos in to_paint:
+                active = bool(self._active_highlight_key and key == self._active_highlight_key)
+                color = QColor(220, 0, 0, 230) if active else QColor(255, 140, 0, 210)
+                pen_width = max(4 if active else 3, int(min(page_w, page_h) * (0.004 if active else 0.003)))
+                painter.setPen(QPen(color, pen_width, Qt.SolidLine))
+
+                x = float(pos.get("x", 0)) * page_w
+                y = float(pos.get("y", 0)) * page_h
+                w = float(pos.get("w", 0)) * page_w
+                h = float(pos.get("h", 0)) * page_h
+
+                pad = max(2.0, pen_width * 1.5)
+                rect = QRectF(
+                    max(0.0, x - pad),
+                    max(0.0, y - pad),
+                    min(float(page_w), w + pad * 2),
+                    min(float(page_h), h + pad * 2),
+                )
+                painter.drawRect(rect)
+        finally:
+            painter.end()
+
+        return out
+
+    def _scroll_to_highlight(self, pos: dict | None) -> None:
+        """Centre approximativement la zone active après changement de page.
+
+        La peinture se fait avant rotation ; cette méthode reste volontairement
+        simple pour ne jamais bloquer l'affichage si la page est tournée.
+        """
+        if not isinstance(pos, dict) or not self.label.pixmap():
+            return
+        try:
+            scaled = self.label.pixmap()
+            if scaled.isNull():
+                return
+            x = float(pos.get("x", 0)) * scaled.width()
+            y = float(pos.get("y", 0)) * scaled.height()
+            self.scroll_area.horizontalScrollBar().setValue(max(0, int(x) - self.scroll_area.viewport().width() // 2))
+            self.scroll_area.verticalScrollBar().setValue(max(0, int(y) - self.scroll_area.viewport().height() // 2))
+        except Exception:
+            pass
+
+    # ------------------------------------------------------------------
     # Internal
     # ------------------------------------------------------------------
     def _get_rotated_pixmap(self, pixmap: QPixmap) -> QPixmap:
@@ -215,7 +391,9 @@ class PdfViewer(QWidget):
             self.view_changed.emit()
             return
 
-        pixmap = self._get_rotated_pixmap(self._pixmaps[self._current_page])
+        base_pixmap = self._pixmaps[self._current_page]
+        painted = self._paint_highlights(base_pixmap, self._current_page)
+        pixmap = self._get_rotated_pixmap(painted)
 
         scaled = pixmap.scaled(
             pixmap.size() * self._zoom_factor,
@@ -226,18 +404,6 @@ class PdfViewer(QWidget):
         self.label.setPixmap(scaled)
         self.label.adjustSize()
         self.view_changed.emit()
-
-    # ------------------------------------------------------------------
-    # Legacy no-op (zones / highlights supprimés)
-    # ------------------------------------------------------------------
-    def clear_highlights(self) -> None:
-        pass
-
-    def set_highlights(self, *args, **kwargs) -> None:
-        pass
-
-    def highlight_field(self, *args, **kwargs) -> None:
-        pass
 
     def get_current_page_number(self) -> int:
         return int(getattr(self, "_current_page", 0)) + 1

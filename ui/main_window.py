@@ -35,6 +35,7 @@ class MainWindow(
         from db.transporter_repository import TransporterRepository
         from db.bank_repository import BankRepository
         from db.tour_repository import TourRepository
+        from db.reporting_repository import ReportingRepository
         from ui.ocr_text_view import OcrTextView
         from db.tour_repository import TourRepository
         from ocr.folder_patterns import DOSSIER_PATTERN, is_valid_folder_number
@@ -53,6 +54,7 @@ class MainWindow(
         self.tour_repo = TourRepository(self.db_conn)
         self.xxare_repo = XXAReRepository(self.db_conn)
         self.lisinvoice_repo = LISInvoiceRepository(self.db_conn)
+        self.reporting_repo = ReportingRepository(self.db_conn)
         self.DOSSIER_PATTERN = DOSSIER_PATTERN
         # --- State ---
         self.current_pdf_path: str | None = None

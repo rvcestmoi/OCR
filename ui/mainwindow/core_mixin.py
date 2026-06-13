@@ -191,8 +191,6 @@ class MainWindowCoreMixin:
         self.block_options = {}
         self._supplier_kundennr_by_tour_cache = {}
         self._last_transporter_source_tour_nr = None
-        self._bank_transporter_mismatch = False
-        self._bank_transporter_mismatch_fields = set()
 
         # champs facture
         for field in [self.iban_input, self.bic_input, self.date_input, self.invoice_number_input]:
@@ -935,14 +933,8 @@ class MainWindowCoreMixin:
     def highlight_missing_fields(self):
         fields = [self.iban_input, self.bic_input, self.date_input, self.invoice_number_input]
         for field in fields:
-            if field in (self.iban_input, self.bic_input):
-                mismatch_fields = getattr(self, "_bank_transporter_mismatch_fields", set()) or set()
-                if self.bank_valid is not None:
-                    continue
-                if field == self.iban_input and "iban" in mismatch_fields:
-                    continue
-                if field == self.bic_input and "bic" in mismatch_fields:
-                    continue
+            if field in (self.iban_input, self.bic_input) and self.bank_valid is not None:
+                continue
             field.setStyleSheet("background-color: #ffe6e6;" if not field.text().strip() else "background-color: #e6ffe6;")
 
         rows = self.get_folder_rows()
@@ -1091,6 +1083,62 @@ class MainWindowCoreMixin:
 
 
 
+    def _sync_reporting_modifications_for_current_save(self, pdf_path: str = "") -> list[str]:
+        """Alimente la table de reporting à chaque sauvegarde.
+
+        Une ligne est suivie par couple facture + dossier + utilisateur.
+        Si la ligne existe déjà, on met à jour sa date/heure et l'état de
+        blocage ; sinon on l'insère. Le flag IsLastModifierForTour est recalculé
+        par la couche SQL pour que le dernier utilisateur à avoir modifié un
+        dossier soit identifiable directement.
+        """
+        repo = getattr(self, "reporting_repo", None)
+        if repo is None:
+            return []
+
+        utilisateur = str(getattr(self, "current_username", "") or "").strip()
+        rech_nr = str(self.invoice_number_input.text() if hasattr(self, "invoice_number_input") else "").strip()
+
+        tour_nrs: list[str] = []
+        try:
+            if hasattr(self, "get_folder_rows"):
+                for row in self.get_folder_rows() or []:
+                    if isinstance(row, dict):
+                        tour_nr = str(row.get("tour_nr") or row.get("TourNr") or row.get("tournr") or "").strip()
+                    else:
+                        tour_nr = str(row or "").strip()
+                    if tour_nr:
+                        tour_nrs.append(tour_nr)
+        except Exception:
+            tour_nrs = []
+
+        # Sans ces informations, la ligne de reporting ne serait pas exploitable.
+        # On ne bloque donc pas la sauvegarde et on attend la prochaine sauvegarde
+        # avec facture + dossier renseignés.
+        if not utilisateur or not rech_nr or not tour_nrs:
+            return []
+
+        doc_name = os.path.basename(str(pdf_path or getattr(self, "current_pdf_path", "") or "").strip())
+        try:
+            if hasattr(self, "_get_effective_block_state_for_database"):
+                is_bloque, _comment = self._get_effective_block_state_for_database(
+                    getattr(self, "block_options", {}) or {},
+                    preferred_doc_name=doc_name,
+                )
+            else:
+                block_info = (getattr(self, "block_options", {}) or {}).get(doc_name, {}) or {}
+                is_bloque = bool(block_info.get("blocked", False))
+        except Exception:
+            is_bloque = False
+
+        return repo.upsert_modifications_for_invoice(
+            utilisateur=utilisateur,
+            rech_nr=rech_nr,
+            tour_nrs=tour_nrs,
+            is_bloque=bool(is_bloque),
+        )
+
+
     def save_current_data(self, status: str = "draft", show_message: bool = True, pdf_path: str | None = None):
         target_pdf_path = str(pdf_path or getattr(self, "current_pdf_path", "") or "").strip()
         if not target_pdf_path:
@@ -1229,6 +1277,22 @@ class MainWindowCoreMixin:
         if final_entry_id:
             self.selected_invoice_entry_id = final_entry_id
             data["entry_id"] = final_entry_id
+
+        # ✅ Reporting : une ligne par facture + dossier + utilisateur.
+        # Non bloquant : la sauvegarde JSON reste valable même si le reporting SQL échoue.
+        reporting_errors = []
+        try:
+            reporting_errors = self._sync_reporting_modifications_for_current_save(pdf_path) or []
+        except Exception as e:
+            reporting_errors = [str(e)]
+
+        if reporting_errors and show_message:
+            QMessageBox.warning(
+                self,
+                "Reporting",
+                "La sauvegarde est faite, mais le reporting n'a pas pu être mis à jour :\n"
+                + "\n".join(reporting_errors)
+            )
 
         # refresh léger de la ligne dans le tableau gauche, sans recharger tout le dossier
         try:

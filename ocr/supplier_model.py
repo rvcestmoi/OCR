@@ -109,7 +109,46 @@ def _find_line_with_value(text: str, value: str) -> Optional[str]:
     return best
 
 
-def _extract_label_near_value(text: str, value: str, window: int = 50) -> Optional[str]:
+def _is_plausible_learned_label(label: str, field: str = "") -> bool:
+    """Vérifie qu'une ligne proche ressemble bien à un libellé et pas à une valeur.
+
+    Important pour les factures où le label est seul sur une ligne, par exemple :
+    Rechnungs-Nr
+    137549
+
+    Les anciens JSON restent compatibles : cette fonction ne fait qu'améliorer
+    l'apprentissage des nouveaux near_label.
+    """
+    lab = (label or "").strip().strip(" :;=-")
+    if not lab or len(lab) < 3 or len(lab) > 80:
+        return False
+    if not re.search(r"[A-Za-zÀ-ÖØ-öø-ÿ]", lab):
+        return False
+
+    up = lab.upper()
+    compact = _norm_for_search(lab)
+
+    # Évite d'apprendre une valeur comme label.
+    if re.fullmatch(r"[A-Z]{0,4}\d[A-Z0-9/_\-.]{2,}", up):
+        return False
+    if re.fullmatch(r"\d{1,2}[./-]\d{1,2}[./-]\d{2,4}", lab):
+        return False
+
+    if field == "invoice_number":
+        return any(k in compact for k in (
+            "FACTURE", "INVOICE", "INV", "FAKTUR", "RECHNUNG",
+            "RECHNUNGSNR", "RECHNUNGSNUMMER", "NUMER", "NUMERO",
+            "NUMBER", "NUMMER", "BELEG"
+        ))
+    if field == "invoice_date":
+        return any(k in compact for k in (
+            "DATE", "DATUM", "RECHNUNGSDATUM", "FACTURE", "INVOICE", "FAKTUR"
+        ))
+
+    return True
+
+
+def _extract_label_near_value(text: str, value: str, window: int = 50, field: str = "") -> Optional[str]:
     """Extrait le label réel près d'une valeur (cherche dans les lignes autour)."""
     if not text or not value:
         return None
@@ -123,30 +162,38 @@ def _extract_label_near_value(text: str, value: str, window: int = 50) -> Option
             # 1) Chercher un label sur la même ligne (valeur après label)
             value_idx = line_norm.find(v_norm)
             if value_idx > 0:
-                left_part = line[:value_idx].strip()
+                # Si la valeur brute est présente dans la ligne, on utilise son index
+                # réel. L'index normalisé peut être décalé par les espaces/tirets/points
+                # (ex: "Rechnungs-Datum 06.03.2026").
+                raw_match = re.search(re.escape(value.strip()), line, re.IGNORECASE) if value.strip() else None
+                if raw_match:
+                    left_part = line[:raw_match.start()].strip()
+                else:
+                    left_part = line[:value_idx].strip()
+
                 if ':' in left_part:
                     candidate = left_part.split(':')[0].strip()
                 else:
                     candidate = left_part.strip()
 
-                if candidate and len(candidate) > 2 and len(candidate) < 60 and re.search(r"[A-Za-zÀ-ÖØ-öø-ÿ]", candidate):
+                if _is_plausible_learned_label(candidate, field):
                     return candidate
 
-            # 2) Chercher un label dans les lignes précédentes (1-2 lignes)
+            # 2) Chercher un label dans les lignes précédentes (1-2 lignes).
+            # Avant on ne retenait que les lignes avec ':', ce qui excluait
+            # les factures allemandes du type "Rechnungs-Nr" puis valeur en dessous.
             for j in range(max(0, i - 2), i):
                 prev_line = lines[j]
-                if ':' in prev_line:
-                    label = prev_line.split(':')[0].strip()
-                    if label and len(label) > 2 and len(label) < 60:
-                        return label
+                label = prev_line.split(':', 1)[0].strip() if ':' in prev_line else prev_line.strip()
+                if _is_plausible_learned_label(label, field):
+                    return label
 
             # 3) Chercher un label dans la ligne suivante (cas label en dessous)
             if i + 1 < len(lines):
                 next_line = lines[i + 1]
-                if ':' in next_line:
-                    label = next_line.split(':')[0].strip()
-                    if label and len(label) > 2 and len(label) < 60:
-                        return label
+                label = next_line.split(':', 1)[0].strip() if ':' in next_line else next_line.strip()
+                if _is_plausible_learned_label(label, field):
+                    return label
 
     return None
 
@@ -304,12 +351,17 @@ def _tolerant_exact_regex(value: str) -> Optional[str]:
 
 
 _INVOICE_DATE_LABEL_HINT_RE = re.compile(
-    r"(?:DATE\s+D['’]?[ÉE]MISSION|DATE\s+FACTURE|INVOICE\s+DATE|ISSUED?\s+DATE|DATUM)",
+    r"(?:DATE\s+D['’]?[ÉE]MISSION|DATE\s+FACTURE|INVOICE\s+DATE|ISSUED?\s+DATE|RECHNUNGS\s*[-.]?\s*DATUM|RECHNUNGSDATUM|DATUM)",
     re.IGNORECASE,
 )
 
 _DUE_DATE_HINT_RE = re.compile(
     r"(?:[ÉE]CH[ÉE]ANCE|DUE\s+DATE|PAYMENT\s+DUE|PAYABLE|R[ÈE]GLEMENT|VIREMENT|MATURIT[ÉE])",
+    re.IGNORECASE,
+)
+
+_ORDER_DATE_HINT_RE = re.compile(
+    r"(?:AUFTRAGS\s*[-.]?\s*DATUM|ORDER\s+DATE|DATE\s+COMMANDE)",
     re.IGNORECASE,
 )
 
@@ -332,9 +384,13 @@ def _score_invoice_date_candidate(rule: Dict[str, Any], context: str) -> int:
         score += 180
     if _DUE_DATE_HINT_RE.search(haystack):
         score -= 220
+    if _ORDER_DATE_HINT_RE.search(haystack):
+        score -= 160
 
     if re.search(r"DATE\s+D['’]?[ÉE]MISSION", haystack, re.IGNORECASE):
         score += 140
+    if re.search(r"RECHNUNGS\s*[-.]?\s*DATUM|RECHNUNGSDATUM", haystack, re.IGNORECASE):
+        score += 180
     if re.search(r"\bFACTURE\b|\bINVOICE\b", haystack, re.IGNORECASE):
         score += 40
 
@@ -531,7 +587,7 @@ def learn_supplier_patterns(
     if invoice_number:
         line = _find_line_with_value(ocr_text, invoice_number)
         rx = _make_line_regex(line, "invoice_number", invoice_number) if line else None
-        if rx:
+        if rx and _norm_for_search(line or "") != _norm_for_search(invoice_number):
             patterns["invoice_number"].append({
                 "mode": "line_regex",
                 "regex": rx,
@@ -541,7 +597,7 @@ def learn_supplier_patterns(
             })
 
         # Apprendre le label spécifique trouvé près de la valeur
-        specific_label = _extract_label_near_value(ocr_text, invoice_number)
+        specific_label = _extract_label_near_value(ocr_text, invoice_number, field="invoice_number")
         if specific_label:
             group_re = _value_group_regex("invoice_number", invoice_number)
             patterns["invoice_number"].append({
@@ -557,8 +613,8 @@ def learn_supplier_patterns(
         # Fallback générique
         patterns["invoice_number"].append({
             "mode": "near_label",
-            "label_regex": r"\b(Num[eé]ro\s+de\s+facture|Numero\s+de\s+facture|N[°O]\s*FACTURE|FACTURE\s*(N[°O]|NO\.?)|INVOICE\s*(NO\.?|NUMBER)|INV\.?\s*NO\.?|NUMER\s+FAKTURY)\b",
-            "value_regex": r"([A-Z0-9][A-Z0-9\-_/\.]*\d[A-Z0-9\-_/\.]{1,})",
+            "label_regex": r"\b(Num[eé]ro\s+de\s+facture|Numero\s+de\s+facture|N[°O]\s*FACTURE|FACTURE\s*(N[°O]|NO\.?)|INVOICE\s*(NO\.?|NUMBER)|INV\.?\s*NO\.?|NUMER\s+FAKTURY|RECHNUNGS\s*[-.]?\s*(NR|NO|NUMMER)|RECHNUNGSNUMMER|BELEGNUMMER)\b",
+            "value_regex": r"([A-Z0-9][A-Z0-9\-_/\.]*\d[A-Z0-9\-_/\.]*)",
             "window": 200,
             "group": 1,
             "hit_count": 0,
@@ -568,7 +624,7 @@ def learn_supplier_patterns(
     if invoice_date:
         line = _find_line_with_value(ocr_text, invoice_date)
         rx = _make_line_regex(line, "invoice_date", invoice_date) if line else None
-        if rx:
+        if rx and _norm_for_search(line or "") != _norm_for_search(invoice_date):
             patterns["invoice_date"].append({
                 "mode": "line_regex",
                 "regex": rx,
@@ -578,7 +634,7 @@ def learn_supplier_patterns(
             })
 
         # Apprendre le label spécifique trouvé près de la valeur
-        specific_label = _extract_label_near_value(ocr_text, invoice_date)
+        specific_label = _extract_label_near_value(ocr_text, invoice_date, field="invoice_date")
         if specific_label:
             patterns["invoice_date"].append({
                 "mode": "near_label",
@@ -610,7 +666,7 @@ def learn_supplier_patterns(
 
             # Pour rate
             if rate:
-                specific_label = _extract_label_near_value(ocr_text, rate)
+                specific_label = _extract_label_near_value(ocr_text, rate, field="vat_rate")
                 if specific_label and _is_plausible_vat_label("vat_rate", specific_label):
                     patterns["vat_rate"].append({
                         "mode": "near_label",
@@ -624,7 +680,7 @@ def learn_supplier_patterns(
 
             # Pour base
             if base:
-                specific_label = _extract_label_near_value(ocr_text, base)
+                specific_label = _extract_label_near_value(ocr_text, base, field="vat_base")
                 if specific_label and _is_plausible_vat_label("vat_base", specific_label):
                     patterns["vat_base"].append({
                         "mode": "near_label",
@@ -638,7 +694,7 @@ def learn_supplier_patterns(
 
             # Pour vat
             if vat:
-                specific_label = _extract_label_near_value(ocr_text, vat)
+                specific_label = _extract_label_near_value(ocr_text, vat, field="vat_amount")
                 if specific_label and _is_plausible_vat_label("vat_amount", specific_label):
                     patterns["vat_amount"].append({
                         "mode": "near_label",
@@ -824,7 +880,11 @@ def extract_fields_with_model(text: str, model: dict) -> Dict[str, str]:
                         if not val:
                             continue
                         abs_end = min(len(src), lm.end() + vm.end())
-                        ctx = src[max(0, lm.start() - 120): min(len(src), abs_end + 120)]
+                        # Contexte volontairement local : avec un OCR contenant
+                        # "Auftrags-Datum" puis "Rechnungs-Datum", un contexte
+                        # trop large mélange les deux labels et peut choisir la
+                        # date de commande au lieu de la date de facture.
+                        ctx = src[max(0, lm.start() - 25): min(len(src), abs_end + 80)]
                         score = _score_invoice_date_candidate(r, ctx)
                         if score > best_score:
                             best_score = score

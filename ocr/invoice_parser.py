@@ -291,7 +291,10 @@ def extract_invoice_number(text: str) -> str:
         r"FACTURE\s*(N[°O]|NO\.?)|"
         r"INVOICE\s*(NO\.?|NUMBER)|"
         r"INV\.?\s*NO\.?|"
-        r"NUMER\s+FAKTURY"
+        r"NUMER\s+FAKTURY|"
+        r"RECHNUNGS\s*[-.]?\s*(?:NR|NO|NUMMER)|"
+        r"RECHNUNGSNUMMER|"
+        r"BELEGNUMMER"
         r")\b",
         re.IGNORECASE,
     )
@@ -335,7 +338,10 @@ def extract_invoice_number(text: str) -> str:
         r"FACTURE\s*(?:N[°O]|NO\.?)|"
         r"INVOICE\s*(?:NO\.?|NUMBER)|"
         r"INV\.?\s*NO\.?|"
-        r"NUMER\s+FAKTURY"
+        r"NUMER\s+FAKTURY|"
+        r"RECHNUNGS\s*[-.]?\s*(?:NR|NO|NUMMER)|"
+        r"RECHNUNGSNUMMER|"
+        r"BELEGNUMMER"
         r")\b[^\w]{0,20}([A-Z0-9\-_/\.]{3,})",
         text,
         re.IGNORECASE,

@@ -27,7 +27,7 @@ from app.paths import DEFAULT_PDF_FOLDER, MODELS_DIR, SUPPLIERS_DIR
 from ocr.invoice_parser import parse_invoice
 from ocr.field_detector import detect_fields_multilingual
 try:
-    from ocr.ocr_engine import extract_text_from_pdf, extract_text_with_tesseract
+    from ocr.ocr_engine import extract_text_from_pdf, extract_text_with_tesseract, find_field_positions
     OCR_ENGINE_AVAILABLE = True
 except ImportError:
     # Fallback functions if OCR engine is not available
@@ -36,6 +36,9 @@ except ImportError:
     
     def extract_text_with_tesseract(image_path: str) -> str:
         return "OCR engine not available"
+
+    def find_field_positions(*args, **kwargs) -> dict:
+        return {}
     
     OCR_ENGINE_AVAILABLE = False
 from ocr.document_classifier import classify_document_text

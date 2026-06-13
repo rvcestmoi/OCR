@@ -361,6 +361,17 @@ class MainWindowDocumentsMixin:
                 preferred_doc_name=doc_name,
                 show_message=True,
             )
+            try:
+                reporting_errors = self._sync_reporting_modifications_for_current_save(doc_path) or []
+            except Exception as e:
+                reporting_errors = [str(e)]
+            if reporting_errors:
+                QMessageBox.warning(
+                    self,
+                    "Reporting",
+                    "Le motif a été enregistré, mais le reporting n'a pas pu être mis à jour :\n"
+                    + "\n".join(reporting_errors)
+                )
 
     def on_pdf_table_context_menu(self, pos):
         """Clic-droit sur la liste du haut : rattacher un document à la facture sélectionnée."""

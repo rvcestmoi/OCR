@@ -11,6 +11,7 @@ ALLOWED_FOLDER_PREFIXES = (
     "695",
     "725",
     "785",
+    "595"
 )
 
 _PREFIXES_3 = tuple(p for p in ALLOWED_FOLDER_PREFIXES if len(p) == 3 and p != "150")
