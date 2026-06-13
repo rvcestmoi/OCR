@@ -35,6 +35,7 @@ DEFAULT_SETTINGS = {
         "max_pages_pending": 100,
         "max_pages_error": 50,
         "max_pages_validated": 200,
+        "show_rebuild_search_index_button": False,
     },
     "vat": {
         "allowed_rates": [0, 20]
