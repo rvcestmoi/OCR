@@ -1255,6 +1255,15 @@ class MainWindowTransportTablesMixin:
         dossier_le.editingFinished.connect(self.compact_folder_rows)
         amount_le.editingFinished.connect(self.compact_folder_rows)
 
+        if getattr(self, "_invoice_validated_locked", False):
+            try:
+                dossier_le.setReadOnly(True)
+                amount_le.setReadOnly(True)
+                dossier_le.setToolTip("Facture déjà validée : champ non modifiable.")
+                amount_le.setToolTip("Facture déjà validée : champ non modifiable.")
+            except Exception:
+                pass
+
         self.folder_table.setCellWidget(row, 0, dossier_le)
         self.folder_table.setCellWidget(row, 1, amount_le)
         self.folder_table.setCellWidget(row, 2, vat_theo_le)
@@ -1514,6 +1523,14 @@ class MainWindowTransportTablesMixin:
         rate_le.textChanged.connect(lambda _=None, r=row: self._on_vat_row_changed(r))
         base_le.textChanged.connect(lambda _=None, r=row: self._on_vat_row_changed(r))
         vat_le.textChanged.connect(lambda _=None, r=row: self._on_vat_row_changed(r))
+
+        if getattr(self, "_invoice_validated_locked", False):
+            try:
+                for _le in (rate_le, base_le, vat_le):
+                    _le.setReadOnly(True)
+                    _le.setToolTip("Facture déjà validée : champ non modifiable.")
+            except Exception:
+                pass
 
         self.vat_table.setCellWidget(row, 0, rate_le)
         self.vat_table.setCellWidget(row, 1, base_le)

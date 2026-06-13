@@ -39,6 +39,8 @@ class MainWindowValidationMixin:
         if not self.current_pdf_path:
             self.statusBar().showMessage("Aucun PDF sélectionné.", 3000)
             return
+        if hasattr(self, "_warn_if_invoice_validated_locked") and self._warn_if_invoice_validated_locked("valider à nouveau"):
+            return
         if not self._block_validate_if_missing_cmr():
             return
         if not self._block_validate_if_transporter_not_matching_tours():
@@ -58,15 +60,19 @@ class MainWindowValidationMixin:
             )
             return
 
-        # Vérifier que la date de facture est remplie
-        invoice_date = (self.date_input.text() or "").strip()
-        if not invoice_date:
-            QMessageBox.warning(
-                self,
-                "Validation impossible",
-                "Le champ 'Date facture' doit être rempli pour valider la facture."
-            )
-            return
+        # Vérifier que la date de facture est remplie ET réellement valide
+        if hasattr(self, "_validate_invoice_date_for_validation"):
+            if not self._validate_invoice_date_for_validation():
+                return
+        else:
+            invoice_date = (self.date_input.text() or "").strip()
+            if not invoice_date:
+                QMessageBox.warning(
+                    self,
+                    "Validation impossible",
+                    "Le champ 'Date facture' doit être rempli pour valider la facture."
+                )
+                return
 
         # Vérifie les tournées AVANT toute validation
         tournrs = sorted({
@@ -283,6 +289,14 @@ class MainWindowValidationMixin:
             QMessageBox.information(self, "Validation", msg)
 
 
+
+        # La facture courante vient d'être validée : on verrouille immédiatement
+        # l'édition, même avant le prochain rechargement de la liste.
+        try:
+            if hasattr(self, "_apply_invoice_validated_lock"):
+                self._apply_invoice_validated_lock(True)
+        except Exception:
+            pass
 
         # 7) Après validation d'un document provenant des écarts,
         #    revenir automatiquement sur le filtre En attente.

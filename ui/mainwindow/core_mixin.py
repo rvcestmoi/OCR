@@ -214,6 +214,14 @@ class MainWindowCoreMixin:
         if not self.current_pdf_path:
             return
 
+        # En changeant de facture, on enlève d'abord un éventuel verrou hérité
+        # de la facture précédente. Il sera réappliqué à la fin si la nouvelle
+        # facture est déjà validée.
+        try:
+            self._apply_invoice_validated_lock(False)
+        except Exception:
+            pass
+
         # reset UI
         self.bank_valid = None
         self.selected_kundennr = None
@@ -455,6 +463,14 @@ class MainWindowCoreMixin:
         else:
             self.sender_input.clear()
 
+        # Verrouiller l'édition si la facture est déjà validée. La vérification
+        # relit la BDD en priorité pour éviter qu'un JSON local ancien autorise
+        # une modification sur une facture déjà validée par un autre utilisateur.
+        try:
+            self._apply_invoice_validated_lock(self._is_invoice_already_validated(pdf_path=self.current_pdf_path))
+        except Exception:
+            pass
+
     def _confirm_relaunch_ocr_data(self, title: str) -> bool:
         reply = QMessageBox.question(
             self,
@@ -623,10 +639,14 @@ class MainWindowCoreMixin:
         return model
 
     def on_analyze_pdf_clicked(self, checked: bool = False):
+        if self._warn_if_invoice_validated_locked("relancer l'OCR"):
+            return
         if self._confirm_relaunch_ocr_data("Analyser le PDF (OCR)"):
             self.analyze_pdf(checked=checked)
 
     def on_analyze_pdf_deep_clicked(self, checked: bool = False):
+        if self._warn_if_invoice_validated_locked("relancer l'OCR profond"):
+            return
         if self._confirm_relaunch_ocr_data("OCR profond"):
             self.analyze_pdf_deep(checked=checked)
 
@@ -805,6 +825,9 @@ class MainWindowCoreMixin:
             QMessageBox.warning(self, "Analyse OCR", "Aucun document sélectionné.")
             return
 
+        if self._warn_if_invoice_validated_locked("relancer l'OCR", pdf_path=active_doc_path):
+            return
+
         if not is_ocr_allowed_document(active_doc_path):
             QMessageBox.information(
                 self,
@@ -909,6 +932,197 @@ class MainWindowCoreMixin:
 
         return status if status in {"pending", "validated", "error", "ecart"} else "pending"
 
+    def _parse_invoice_date_strict(self, value: str):
+        """Retourne (date_obj, date_normalisee) si la date facture est réellement valide.
+
+        Contrairement à normalize_date_format(), cette méthode refuse les dates
+        impossibles comme 31/02/2026 ou 4705.53.77. Elle accepte les formats
+        courants utilisés par les OCR : jj/mm/aaaa, jj.mm.aaaa, jj-mm-aaaa,
+        aaaa-mm-jj et les années sur 2 chiffres.
+        """
+        raw = str(value or "").strip()
+        if not raw:
+            return None, ""
+
+        m = re.search(r"\b(\d{1,4})[./\-](\d{1,2})[./\-](\d{1,4})\b", raw)
+        if not m:
+            return None, ""
+
+        try:
+            p1, p2, p3 = [int(x) for x in m.groups()]
+        except Exception:
+            return None, ""
+
+        # aaaa-mm-jj / aaaa.mm.jj
+        if len(m.group(1)) == 4 or p1 > 31:
+            year, month, day = p1, p2, p3
+        else:
+            day, month, year = p1, p2, p3
+
+        if year < 100:
+            # Pivot classique : 00-69 => 2000-2069, 70-99 => 1970-1999.
+            year = 2000 + year if year <= 69 else 1900 + year
+
+        if not (1900 <= year <= 2100):
+            return None, ""
+
+        try:
+            dt = datetime(year, month, day)
+        except Exception:
+            return None, ""
+
+        return dt.date(), f"{dt.day:02d}/{dt.month:02d}/{dt.year:04d}"
+
+    def _validate_invoice_date_for_validation(self) -> bool:
+        raw = str(self.date_input.text() or "").strip()
+        _date_obj, normalized = self._parse_invoice_date_strict(raw)
+        if not normalized:
+            QMessageBox.warning(
+                self,
+                "Validation impossible",
+                "Le champ 'Date facture' doit contenir une date valide pour valider la facture.\n\n"
+                "Formats acceptés : JJ/MM/AAAA, JJ.MM.AAAA, JJ-MM-AAAA ou AAAA-MM-JJ."
+            )
+            try:
+                self.date_input.setStyleSheet("background-color: #ffe6e6;")
+                self.date_input.setFocus()
+                self.date_input.selectAll()
+            except Exception:
+                pass
+            return False
+
+        if raw != normalized:
+            try:
+                self.date_input.setText(normalized)
+            except Exception:
+                pass
+        try:
+            if not getattr(self, "_invoice_validated_locked", False):
+                self.date_input.setStyleSheet("")
+        except Exception:
+            pass
+        return True
+
+    def _get_effective_invoice_status(self, pdf_path: str | None = None, entry_id: str | None = None, default: str = "pending") -> str:
+        """Statut réel d'une facture, avec priorité à la BDD.
+
+        Pour verrouiller une facture validée, la BDD doit primer sur un JSON
+        éventuellement ancien ou localement modifié.
+        """
+        allowed = {"pending", "validated", "error", "ecart", "eccarts", "draft"}
+        status = str(default or "pending").strip().lower()
+
+        try:
+            entry_id = str(entry_id or "").strip()
+            if not entry_id:
+                target_pdf = str(pdf_path or getattr(self, "current_pdf_path", "") or "").strip()
+                if target_pdf:
+                    entry_id = str(self._resolve_current_entry_id(target_pdf) or "").strip()
+                else:
+                    entry_id = str(self._resolve_current_entry_id() or "").strip()
+            if entry_id:
+                sql_status = str(self.logmail_repo.get_processing_status_for_entry(entry_id) or "").strip().lower()
+                if sql_status == "eccarts":
+                    sql_status = "ecart"
+                if sql_status in allowed:
+                    return sql_status
+        except Exception:
+            pass
+
+        try:
+            target_pdf = str(pdf_path or getattr(self, "current_pdf_path", "") or "").strip()
+            if target_pdf:
+                data = self._read_saved_invoice_json(target_pdf) or {}
+                json_status = str(data.get("status") or "").strip().lower()
+                if json_status == "eccarts":
+                    json_status = "ecart"
+                if json_status in allowed:
+                    return json_status
+        except Exception:
+            pass
+
+        if status == "eccarts":
+            status = "ecart"
+        return status if status in allowed else "pending"
+
+    def _is_invoice_already_validated(self, pdf_path: str | None = None, entry_id: str | None = None) -> bool:
+        return self._get_effective_invoice_status(pdf_path=pdf_path, entry_id=entry_id, default="pending") == "validated"
+
+    def _warn_if_invoice_validated_locked(self, action: str = "modifier", pdf_path: str | None = None) -> bool:
+        if not self._is_invoice_already_validated(pdf_path=pdf_path):
+            return False
+
+        QMessageBox.warning(
+            self,
+            "Facture déjà validée",
+            "Cette facture est déjà validée et ne peut plus être modifiée.\n\n"
+            f"Action refusée : {action}."
+        )
+        try:
+            self.statusBar().showMessage("Facture déjà validée : modification refusée.", 5000)
+        except Exception:
+            pass
+        return True
+
+    def _set_line_edit_locked_style(self, field, locked: bool):
+        if field is None:
+            return
+        try:
+            field.setReadOnly(bool(locked))
+            if locked:
+                field.setStyleSheet("background-color: #f3f3f3;")
+                field.setToolTip("Facture déjà validée : champ non modifiable.")
+            else:
+                field.setToolTip("")
+        except Exception:
+            pass
+
+    def _apply_invoice_validated_lock(self, locked: bool):
+        """Verrouille/déverrouille l'édition des champs d'une facture validée.
+
+        Le verrou visuel complète le blocage de sauvegarde : même si un ancien
+        flux tente quand même de sauver, save_current_data refuse la modification.
+        """
+        self._invoice_validated_locked = bool(locked)
+
+        for field_name in ("iban_input", "bic_input", "date_input", "invoice_number_input"):
+            self._set_line_edit_locked_style(getattr(self, field_name, None), locked)
+
+        try:
+            if hasattr(self, "invoice_comment_input") and self.invoice_comment_input is not None:
+                self.invoice_comment_input.setReadOnly(bool(locked))
+                self.invoice_comment_input.setToolTip("Facture déjà validée : commentaire non modifiable." if locked else "")
+        except Exception:
+            pass
+
+        try:
+            if hasattr(self, "folder_table") and self.folder_table is not None:
+                for r in range(self.folder_table.rowCount()):
+                    dossier_le, amount_le, vat_theo_le = self._get_row_widgets(r)
+                    self._set_line_edit_locked_style(dossier_le, locked)
+                    self._set_line_edit_locked_style(amount_le, locked)
+                    # La colonne TVA théorique reste toujours en lecture seule.
+                    if vat_theo_le is not None:
+                        vat_theo_le.setReadOnly(True)
+        except Exception:
+            pass
+
+        try:
+            if hasattr(self, "vat_table") and self.vat_table is not None:
+                for r in range(self.vat_table.rowCount()):
+                    for w in self._get_vat_row_widgets(r):
+                        self._set_line_edit_locked_style(w, locked)
+        except Exception:
+            pass
+
+        try:
+            if hasattr(self, "btn_analyze_pdf"):
+                self.btn_analyze_pdf.setToolTip("Facture déjà validée : OCR non autorisé." if locked else "")
+            if hasattr(self, "btn_deep_ocr"):
+                self.btn_deep_ocr.setToolTip("Facture déjà validée : OCR profond non autorisé." if locked else "")
+        except Exception:
+            pass
+
     def _auto_save_after_ocr(self, pdf_path: str | None = None) -> bool:
         target_pdf_path = str(pdf_path or getattr(self, "current_pdf_path", "") or "").strip()
         if not target_pdf_path:
@@ -946,6 +1160,9 @@ class MainWindowCoreMixin:
         active_doc_path = self._get_active_document_path(document_path)
         if not active_doc_path:
             QMessageBox.warning(self, "OCR profond", "Aucun document sélectionné.")
+            return
+
+        if self._warn_if_invoice_validated_locked("relancer l'OCR profond", pdf_path=active_doc_path):
             return
 
         progress = None
@@ -1642,6 +1859,13 @@ class MainWindowCoreMixin:
                 QMessageBox.warning(self, "Sauvegarde", "Chemin de document invalide.")
             return False
 
+        requested_status = str(status or "draft").strip().lower()
+        if requested_status == "eccarts":
+            requested_status = "ecart"
+
+        if self._warn_if_invoice_validated_locked("sauvegarder/modifier", pdf_path=pdf_path):
+            return False
+
         json_path = self._get_saved_json_path(pdf_path)
 
         # retrouve l'entry_id même si selected_invoice_entry_id n'est pas rempli
@@ -1669,9 +1893,7 @@ class MainWindowCoreMixin:
 
         # met à jour uniquement les champs utiles
         data["entry_id"] = current_entry_id
-        normalized_status = str(status or "draft").strip().lower()
-        if normalized_status == "eccarts":
-            normalized_status = "ecart"
+        normalized_status = requested_status
         data["status"] = normalized_status
         data["iban"] = self.iban_input.text().strip()
         data["bic"] = self.bic_input.text().strip()
@@ -2148,6 +2370,9 @@ class MainWindowCoreMixin:
         )
 
     def _save_data_for_pdf(self, pdf_path, data):
+        if self._warn_if_invoice_validated_locked("sauvegarder/modifier", pdf_path=pdf_path):
+            return False
+
         base_name = os.path.splitext(os.path.basename(pdf_path))[0]
         model_dir = MODELS_DIR
         os.makedirs(model_dir, exist_ok=True)
@@ -2188,6 +2413,7 @@ class MainWindowCoreMixin:
 
         with open(json_path, "w", encoding="utf-8") as f:
             json.dump(payload, f, ensure_ascii=False, indent=2)
+        return True
 
     def _model_exists_for_pdf(self, pdf_path):
         base_name = os.path.splitext(os.path.basename(pdf_path))[0]
