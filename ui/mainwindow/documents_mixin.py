@@ -722,14 +722,18 @@ class MainWindowDocumentsMixin:
                     continue
 
                 rep_path = group_paths[0]
-                try:
-                    chosen_rep = ""
-                    if hasattr(self, "_choose_representative_pdf"):
-                        chosen_rep = str(self._choose_representative_pdf(group_paths) or "").strip()
-                    if chosen_rep and os.path.exists(chosen_rep):
-                        rep_path = chosen_rep
-                except Exception:
-                    pass
+                # En mode recherche, on ne relit pas les fichiers/JSON pour choisir
+                # un représentant : le résultat doit rester strictement piloté par
+                # XXA_OCR_SEARCH_INDEX + XXA_LOGMAIL_228794.
+                if not current_search_query:
+                    try:
+                        chosen_rep = ""
+                        if hasattr(self, "_choose_representative_pdf"):
+                            chosen_rep = str(self._choose_representative_pdf(group_paths) or "").strip()
+                        if chosen_rep and os.path.exists(chosen_rep):
+                            rep_path = chosen_rep
+                    except Exception:
+                        pass
 
                 idx = index_by_entry.get(entry_id) or {}
                 indexed_tours = _split_index_tours(idx.get("tour_numbers"))
@@ -762,10 +766,11 @@ class MainWindowDocumentsMixin:
                 )
 
         try:
-            # Recherche : on privilégie l'index SQL. Si l'index n'est pas encore
-            # disponible ou ne trouve rien, l'ancien chemin SQL/JSON reste en fallback.
-            used_index_for_search = False
             if current_search_query:
+                # Recherche EXCLUSIVE via XXA_OCR_SEARCH_INDEX.
+                # On ne retombe plus sur les JSON/fichiers locaux quand l'index
+                # ne trouve rien : l'index SQL est désormais la seule source de
+                # vérité pour la recherche du volet gauche.
                 try:
                     idx_limit = max(1000, (display_limit or 200) * 8)
                     index_entry_ids = self.logmail_repo.search_entry_ids_in_index(
@@ -780,7 +785,6 @@ class MainWindowDocumentsMixin:
                     index_entry_ids = []
 
                 if index_entry_ids:
-                    used_index_for_search = True
                     chunk_size = 200
                     for i in range(0, len(index_entry_ids), chunk_size):
                         if display_limit and len(rows_to_add) >= display_limit:
@@ -794,8 +798,7 @@ class MainWindowDocumentsMixin:
                                 date_mail_to=date_mail_to,
                             ) or []
                         )
-
-            if not current_search_query or not used_index_for_search:
+            else:
                 fetch_size = max(250, (display_limit or 100) * 4)
                 offset = 0
                 while True:
@@ -806,7 +809,7 @@ class MainWindowDocumentsMixin:
                         sql_status,
                         offset=offset,
                         fetch=fetch_size,
-                        search_query=current_search_query or None,
+                        search_query=None,
                         date_mail_from=date_mail_from,
                         date_mail_to=date_mail_to,
                     ) or []
@@ -817,39 +820,8 @@ class MainWindowDocumentsMixin:
                     # Sans limite UI, on garde une pagination mais on s'arrête quand SQL n'a plus rien.
                     if len(rows_page) < fetch_size:
                         break
-
-            # Fallback rétrocompatible pour les anciens JSON non encore indexés,
-            # uniquement si la recherche ressemble à un numéro de dossier.
-            if (
-                current_search_query
-                and self._is_folder_like_left_search_query(current_search_query)
-                and (not display_limit or len(rows_to_add) < display_limit)
-            ):
-                try:
-                    extra_entry_matches = self._find_additional_left_search_entry_matches(
-                        folder,
-                        current_search_query,
-                        sql_status,
-                    )
-                except Exception:
-                    extra_entry_matches = {}
-
-                missing_entry_ids = [
-                    entry_id
-                    for entry_id in (extra_entry_matches or {}).keys()
-                    if entry_id and entry_id not in seen_entry_ids
-                ]
-                if missing_entry_ids:
-                    _append_rows_from_sql(
-                        self.logmail_repo.get_document_rows_for_entries(
-                            missing_entry_ids,
-                            status=sql_status,
-                            date_mail_from=date_mail_from,
-                            date_mail_to=date_mail_to,
-                        ) or []
-                    )
         except Exception as e:
-            QMessageBox.warning(self, "Chargement dossier", f"Erreur lecture XXA_LOGMAIL_228794 :\n{e}")
+            QMessageBox.warning(self, "Chargement dossier", f"Erreur lecture XXA_LOGMAIL_228794 / XXA_OCR_SEARCH_INDEX :\n{e}")
             return
 
         table = self.pdf_table
@@ -872,11 +844,10 @@ class MainWindowDocumentsMixin:
                 it0.setData(Qt.UserRole + 5, group_paths)
                 it0.setData(Qt.UserRole + 8, self._normalize_left_mail_date_value(date_mail))
 
-                # Les numéros de dossier viennent d'abord de l'index SQL. On ne
-                # relit le JSON que pour les anciennes lignes non encore indexées.
+                # Les numéros de dossier utilisés pour la recherche viennent
+                # exclusivement de XXA_OCR_SEARCH_INDEX. On ne relit plus les JSON
+                # pour compléter les anciennes lignes non indexées.
                 folders_for_search = list(indexed_tours or [])
-                if not folders_for_search:
-                    folders_for_search = self._get_saved_folder_numbers_for_pdf(rep_path)
 
                 extra_search_values = list(folders_for_search or [])
                 try:
@@ -916,7 +887,10 @@ class MainWindowDocumentsMixin:
                 table.setItem(row_index, 2, QTableWidgetItem(iban))
                 table.setItem(row_index, 3, QTableWidgetItem(bic))
 
-                if not invoice_date or not iban or not bic:
+                if (not current_search_query) and (not invoice_date or not iban or not bic):
+                    # Hors recherche uniquement : on conserve l'ancien complément
+                    # d'affichage depuis le JSON. En recherche, aucune lecture JSON
+                    # ne doit compléter les résultats.
                     j_date, j_iban, j_bic = self._get_saved_date_iban_bic_for_pdf(rep_path)
                     new_date = invoice_date or j_date
                     new_iban = iban or j_iban
@@ -953,7 +927,9 @@ class MainWindowDocumentsMixin:
                         lkz = lkz_cache.get(transporter_kundennr, "")
                     except Exception:
                         lkz = ""
-                if not lkz:
+                if not lkz and not current_search_query:
+                    # Hors recherche uniquement : ancien complément pays depuis le JSON.
+                    # En recherche, la liste reste exclusive à l'index SQL.
                     lkz = self._get_country_for_document(rep_path, iban, bic)
                 table.setItem(row_index, 4, QTableWidgetItem(lkz))
         finally:
@@ -1189,115 +1165,21 @@ class MainWindowDocumentsMixin:
             return False
 
     def _get_left_search_folder_index(self, folder: str) -> dict:
-        folder = str(folder or "").strip()
-        if not folder or not os.path.isdir(folder):
-            return {"entry_to_tournrs": {}, "statuses": {}}
+        """Compat : ancien index mémoire basé sur les JSON désactivé.
 
-        cache_by_folder = getattr(self, "_left_search_folder_index_cache", None)
-        if cache_by_folder is None:
-            cache_by_folder = {}
-            self._left_search_folder_index_cache = cache_by_folder
-
-        cached = cache_by_folder.get(folder)
-        if cached:
-            return cached
-
-        try:
-            filenames = sorted(os.listdir(folder))
-        except Exception:
-            filenames = []
-
-        supported_filenames: list[str] = []
-        paths_by_name: dict[str, str] = {}
-        for name in filenames:
-            full_path = os.path.join(folder, name)
-            if not os.path.isfile(full_path):
-                continue
-            try:
-                if not is_supported_document(full_path):
-                    continue
-            except Exception:
-                continue
-            supported_filenames.append(name)
-            paths_by_name[name] = full_path
-
-        entry_to_tournrs: dict[str, set[str]] = {}
-        statuses: dict[str, str] = {}
-
-        if supported_filenames:
-            try:
-                entry_ids_by_name = self.logmail_repo.get_entry_ids_for_files(supported_filenames) or {}
-            except Exception:
-                entry_ids_by_name = {}
-
-            entry_ids = sorted({str(v or "").strip() for v in entry_ids_by_name.values() if str(v or "").strip()})
-            if entry_ids:
-                try:
-                    statuses = self.logmail_repo.get_processing_status_map_for_entries(entry_ids) or {}
-                except Exception:
-                    statuses = {}
-
-            for name, pdf_path in paths_by_name.items():
-                entry_id = str(entry_ids_by_name.get(name) or "").strip()
-                if not entry_id:
-                    continue
-                try:
-                    tournrs = self._get_saved_folder_numbers_for_pdf(pdf_path)
-                except Exception:
-                    tournrs = []
-                if not tournrs:
-                    continue
-                entry_to_tournrs.setdefault(entry_id, set()).update(
-                    str(t).strip() for t in tournrs if str(t).strip()
-                )
-
-        cache_payload = {
-            "entry_to_tournrs": entry_to_tournrs,
-            "statuses": statuses,
-        }
-        cache_by_folder[folder] = cache_payload
-        return cache_payload
+        La recherche doit rester exclusive à XXA_OCR_SEARCH_INDEX, donc cette
+        méthode ne parcourt plus le dossier et ne lit plus les fichiers JSON.
+        """
+        return {"entry_to_tournrs": {}, "statuses": {}}
 
     def _find_additional_left_search_entry_matches(self, folder: str, search_query: str, status: str) -> dict[str, set[str]]:
+        """Compat : fallback JSON désactivé.
+
+        La recherche du volet gauche est maintenant volontairement exclusive à
+        XXA_OCR_SEARCH_INDEX. Cette méthode reste présente pour ne pas casser
+        d'éventuels anciens appels, mais elle ne lit plus les JSON/fichiers.
         """
-        Recherche des entry_id supplémentaires hors pool déjà chargé, à partir des
-        JSON sauvegardés, pour permettre la recherche par numéro de dossier.
-        Retourne {entry_id: {tour1, tour2, ...}}.
-        """
-        folder = str(folder or "").strip()
-        query = str(search_query or "").strip().lower()
-        normalized_status = str(status or "pending").strip().lower()
-        if normalized_status == "eccarts":
-            normalized_status = "ecart"
-
-        if not folder or not os.path.isdir(folder) or not query:
-            return {}
-
-        index_data = self._get_left_search_folder_index(folder)
-        entry_to_tournrs = index_data.get("entry_to_tournrs") or {}
-        statuses = index_data.get("statuses") or {}
-
-        matches: dict[str, set[str]] = {}
-        for entry_id, tournrs in entry_to_tournrs.items():
-            clean_entry_id = str(entry_id or "").strip()
-            if not clean_entry_id:
-                continue
-
-            entry_status = str(statuses.get(clean_entry_id) or "pending").strip().lower()
-            if entry_status == "eccarts":
-                entry_status = "ecart"
-            if normalized_status and entry_status != normalized_status:
-                continue
-
-            matched_tournrs = {
-                str(t).strip()
-                for t in (tournrs or [])
-                if str(t).strip() and query in str(t).strip().lower()
-            }
-            if matched_tournrs:
-                matches[clean_entry_id] = matched_tournrs
-
-        return matches
+        return {}
 
     def _is_typing_in_input(self) -> bool:
         w = QApplication.focusWidget()

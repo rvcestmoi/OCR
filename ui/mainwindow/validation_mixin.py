@@ -740,6 +740,7 @@ class MainWindowValidationMixin:
             return
 
         table = self.pdf_table
+        search_active = bool(str(getattr(self, "_loaded_left_search_query", "") or "").strip())
         row_payloads: list[tuple[int, list[str], str]] = []
         all_tours: set[str] = set()
         fallback_rows: list[int] = []
@@ -756,10 +757,15 @@ class MainWindowValidationMixin:
             except Exception:
                 tours = []
 
-            # Fallback rétrocompatible : si la ligne n'a pas encore les dossiers
-            # en mémoire, on utilise l'ancien contrôle unitaire.
+            # En mode recherche, on ne fait plus le fallback JSON : les dossiers
+            # doivent venir exclusivement de XXA_OCR_SEARCH_INDEX.
+            # Hors recherche, on conserve l'ancien contrôle unitaire pour l'affichage
+            # classique des lignes non encore indexées.
             if not tours:
-                fallback_rows.append(row)
+                if search_active:
+                    self._set_left_row_visual(row, "error", "Aucun dossier (TourNr) dans XXA_OCR_SEARCH_INDEX.")
+                else:
+                    fallback_rows.append(row)
                 continue
 
             kundennr = ""
@@ -814,8 +820,9 @@ class MainWindowValidationMixin:
 
             self._set_left_row_visual(row, "ok", f"OK : transporteur {kundennr} depuis le premier dossier + dossiers présents en base.")
 
-        for row in fallback_rows:
-            self.refresh_left_row_processing_state(row)
+        if not search_active:
+            for row in fallback_rows:
+                self.refresh_left_row_processing_state(row)
 
 
 
