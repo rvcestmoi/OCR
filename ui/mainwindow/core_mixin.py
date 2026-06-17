@@ -2058,6 +2058,69 @@ class MainWindowCoreMixin:
                     "La sauvegarde est faite, mais l'index de recherche n'a pas été alimenté :\n" + str(e)
                 )
 
+        # ✅ 3 bis) Alimentation de la table de reporting des modifications OCR.
+        # Cette table sert au suivi utilisateur/facture/dossier. Elle doit être
+        # alimentée à chaque sauvegarde, indépendamment de l'index de recherche.
+        reporting_error = None
+        try:
+            if hasattr(self, "reporting_repo") and self.reporting_repo is not None:
+                utilisateur = str(getattr(self, "current_username", "") or "").strip()
+                rech_nr = str(data.get("invoice_number") or "").strip()
+
+                try:
+                    reporting_tour_numbers = (
+                        self._extract_tournrs_from_saved(data)
+                        if hasattr(self, "_extract_tournrs_from_saved")
+                        else []
+                    )
+                except Exception:
+                    reporting_tour_numbers = []
+
+                if not reporting_tour_numbers:
+                    try:
+                        reporting_tour_numbers = [
+                            str((r or {}).get("tour_nr") or "").strip()
+                            for r in (data.get("folders") or [])
+                            if str((r or {}).get("tour_nr") or "").strip()
+                        ]
+                    except Exception:
+                        reporting_tour_numbers = []
+
+                # Le reporting est volontairement non bloquant : une erreur ici
+                # ne doit pas empêcher la sauvegarde JSON/SQL principale.
+                if utilisateur and rech_nr and reporting_tour_numbers:
+                    reporting_errors = self.reporting_repo.upsert_modifications_for_invoice(
+                        utilisateur=utilisateur,
+                        rech_nr=rech_nr,
+                        tour_nrs=reporting_tour_numbers,
+                        is_bloque=bool(data.get("blocked", False)),
+                    )
+                    if reporting_errors:
+                        reporting_error = " | ".join(reporting_errors)
+                        print("⚠️ Erreurs alimentation XXA_OCR_REPORTING_MODIFS: " + reporting_error)
+                else:
+                    missing_parts = []
+                    if not utilisateur:
+                        missing_parts.append("utilisateur")
+                    if not rech_nr:
+                        missing_parts.append("numéro de facture")
+                    if not reporting_tour_numbers:
+                        missing_parts.append("numéro de dossier")
+                    print(
+                        "⚠️ Reporting OCR non alimenté : données incomplètes ("
+                        + ", ".join(missing_parts)
+                        + ")"
+                    )
+        except Exception as e:
+            reporting_error = str(e)
+            print(f"⚠️ Erreur alimentation XXA_OCR_REPORTING_MODIFS: {e}")
+            if show_message:
+                QMessageBox.warning(
+                    self,
+                    "Reporting OCR",
+                    "La sauvegarde est faite, mais XXA_OCR_REPORTING_MODIFS n'a pas été alimentée :\n" + str(e)
+                )
+
         # Invalide l'ancien cache JSON de recherche : il ne doit plus imposer un
         # redémarrage pour voir les nouveaux dossiers/factures.
         try:
