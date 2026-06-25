@@ -1721,13 +1721,41 @@ class MainWindowValidationMixin:
                     self._dms_copied_paths[os.path.abspath(p)] = copied_path
 
         # split CMR pages en fichiers dédiés dans DMS
+        # Important : les liens cmr_page_links peuvent être portés par un document
+        # secondaire du groupe (ex : PDF CMR), et pas forcément par le PDF facture
+        # utilisé comme document principal de validation. On parcourt donc tous les
+        # documents du groupe au lieu de ne découper que pdf_path.
         try:
-            cmr_splits = self._split_cmr_pages_for_validation(pdf_path, target_dir, entry_id=str(getattr(self, "selected_invoice_entry_id", "") or ""))
-            self._cmr_splits = getattr(self, "_cmr_splits", {}) or {}
-            self._cmr_splits[pdf_path] = cmr_splits
-            for split_path in (cmr_splits or {}).values():
-                if split_path:
-                    self._dms_copied_paths[os.path.abspath(split_path)] = os.path.abspath(split_path)
+            self._cmr_splits = {}
+            entry_id = str(getattr(self, "selected_invoice_entry_id", "") or "").strip()
+
+            split_candidates = []
+            for p in [pdf_path, *((self.entry_pdf_paths or []))]:
+                p = str(p or "").strip()
+                if not p or not os.path.isfile(p):
+                    continue
+                abs_p = os.path.abspath(p)
+                if abs_p in {os.path.abspath(x) for x in split_candidates}:
+                    continue
+                split_candidates.append(p)
+
+            for p in split_candidates:
+                cmr_splits = self._split_cmr_pages_for_validation(
+                    p,
+                    target_dir,
+                    entry_id=entry_id,
+                )
+                if not cmr_splits:
+                    continue
+
+                # Stockage avec la clé originale et la clé absolue pour éviter les
+                # ratés si le chemin est relu sous une forme légèrement différente.
+                self._cmr_splits[p] = cmr_splits
+                self._cmr_splits[os.path.abspath(p)] = cmr_splits
+
+                for split_path in (cmr_splits or {}).values():
+                    if split_path:
+                        self._dms_copied_paths[os.path.abspath(split_path)] = os.path.abspath(split_path)
         except Exception:
             self._cmr_splits = getattr(self, "_cmr_splits", {}) or {}
 
@@ -1771,7 +1799,9 @@ class MainWindowValidationMixin:
                         continue
 
                     cmr_path = p
-                    file_splits = cmr_splits.get(p, {}) if isinstance(cmr_splits, dict) else {}
+                    file_splits = {}
+                    if isinstance(cmr_splits, dict):
+                        file_splits = cmr_splits.get(p, {}) or cmr_splits.get(os.path.abspath(p), {}) or {}
                     if isinstance(file_splits, dict) and page_no and page_no in file_splits:
                         cmr_path = file_splits.get(page_no, p)
 
