@@ -1113,14 +1113,21 @@ class MainWindowTransportTablesMixin:
         required = {}
         attached = {}
         legacy = {}
+        attachment_counts = defaultdict(int)
         try:
             required = self._get_required_orders_by_tour(set(tours)) or {}
             attached = self._get_cmr_attached_orders_for_entry() or {}
             legacy = getattr(self, "_cmr_legacy_cache", {}) or {}
+            if hasattr(self, "_collect_cmr_attachments_for_current_entry"):
+                for att_row in (self._collect_cmr_attachments_for_current_entry() or []):
+                    t = str((att_row or {}).get("tour_nr") or "").strip()
+                    if t:
+                        attachment_counts[t] += 1
         except Exception:
             required = {}
             attached = {}
             legacy = {}
+            attachment_counts = defaultdict(int)
 
         for tour in tours:
             req = set(required.get(tour, set()))
@@ -1130,8 +1137,10 @@ class MainWindowTransportTablesMixin:
 
             covered = set(att)
 
+            attachment_count = int(attachment_counts.get(tour, 0) or 0)
+
             if not req:
-                status[tour] = {"state": "unknown", "required": set(), "attached": att, "missing": []}
+                status[tour] = {"state": "unknown", "required": set(), "attached": att, "missing": [], "attachment_count": attachment_count}
             else:
                 missing = sorted(req - covered)
                 if not missing:
@@ -1140,7 +1149,7 @@ class MainWindowTransportTablesMixin:
                     state = "partial"
                 else:
                     state = "missing"
-                status[tour] = {"state": state, "required": req, "attached": covered, "missing": missing}
+                status[tour] = {"state": state, "required": req, "attached": covered, "missing": missing, "attachment_count": attachment_count}
 
         self._cmr_status_cache_key = key
         self._cmr_status_by_tour = status
@@ -1213,6 +1222,20 @@ class MainWindowTransportTablesMixin:
         vat_theo_le = self.folder_table.cellWidget(row, 2)
         return dossier_le, amount_le, vat_theo_le 
 
+    def _on_folder_cmr_icon_clicked(self, row: int):
+        """Ouvre la liste des CMR rattachées au dossier de la ligne."""
+        try:
+            dossier_le, _amount_le, _vat_theo_le = self._get_row_widgets(row)
+            tour_nr = (dossier_le.text() if dossier_le else "").strip()
+        except Exception:
+            tour_nr = ""
+
+        if not tour_nr:
+            return
+
+        if hasattr(self, "_show_cmr_attachments_dialog_for_tour"):
+            self._show_cmr_attachments_dialog_for_tour(tour_nr)
+
     def _add_folder_row(self, dossier: str = "", amount: str = "", vat_theo: str = ""):
         row = self.folder_table.rowCount()
         self.folder_table.insertRow(row)
@@ -1228,9 +1251,12 @@ class MainWindowTransportTablesMixin:
         vat_theo_le.setFocusPolicy(Qt.NoFocus)
         vat_theo_le.setStyleSheet("background-color: #f3f3f3;")
 
-        cmr_lbl = QLabel("")
-        cmr_lbl.setAlignment(Qt.AlignCenter)
-        cmr_lbl.setToolTip("CMR OK ?")
+        cmr_lbl = QPushButton("")
+        cmr_lbl.setFlat(True)
+        cmr_lbl.setStyleSheet("border: none; padding: 0px;")
+        cmr_lbl.setCursor(Qt.PointingHandCursor)
+        cmr_lbl.setToolTip("CMR OK ? Cliquez pour voir les CMR rattachées.")
+        cmr_lbl.clicked.connect(lambda _checked=False, r=row: self._on_folder_cmr_icon_clicked(r))
         self.folder_table.setCellWidget(row, 3, cmr_lbl)
         
         ab_lbl = QLabel("")
@@ -1397,19 +1423,21 @@ class MainWindowTransportTablesMixin:
                 req = set(cmr_status.get("required") or set())
                 attached = set(cmr_status.get("attached") or set())
                 missing = list(cmr_status.get("missing") or [])
+                attachment_count = int(cmr_status.get("attachment_count") or 0)
+                suffix_cmr = f" {attachment_count} CMR rattachée(s)." if attachment_count else ""
 
                 if state == "unknown" or not req:
                     cmr_lbl.setText("🧾❓")
-                    cmr_lbl.setToolTip("Aucune commande (AufNr) trouvée en BDD pour ce dossier.")
+                    cmr_lbl.setToolTip("Aucune commande (AufNr) trouvée en BDD pour ce dossier." + suffix_cmr + " Cliquez pour voir les CMR rattachées.")
                 elif state == "ok":
                     cmr_lbl.setText("🧾✅")
-                    cmr_lbl.setToolTip(f"Toutes les commandes ont une CMR ({len(req)}/{len(req)}).")
+                    cmr_lbl.setToolTip(f"Toutes les commandes ont une CMR ({len(req)}/{len(req)})." + suffix_cmr + " Cliquez pour voir/supprimer les CMR rattachées.")
                 elif state == "partial":
                     cmr_lbl.setText("🧾⚠️")
-                    cmr_lbl.setToolTip(f"CMR partielle: {len(attached)}/{len(req)}. Manque: {', '.join(missing[:10])}" + ("..." if len(missing) > 10 else ""))
+                    cmr_lbl.setToolTip(f"CMR partielle: {len(attached)}/{len(req)}. Manque: {', '.join(missing[:10])}" + ("..." if len(missing) > 10 else "") + "." + suffix_cmr + " Cliquez pour voir/supprimer les CMR rattachées.")
                 else:
                     cmr_lbl.setText("🧾❌")
-                    cmr_lbl.setToolTip(f"Aucune CMR sur les commandes. Attendu: {len(req)} commande(s).")
+                    cmr_lbl.setToolTip(f"Aucune CMR sur les commandes. Attendu: {len(req)} commande(s)." + suffix_cmr + " Cliquez pour voir les éventuels rattachements.")
 
 
 

@@ -182,6 +182,11 @@ class MainWindowCoreMixin:
                 self.lbl_page_info.setText("Image")
                 self.btn_prev_page.setEnabled(False)
                 self.btn_next_page.setEnabled(False)
+                try:
+                    if hasattr(self, "_refresh_pdf_context_markers"):
+                        self._refresh_pdf_context_markers()
+                except Exception:
+                    pass
                 return
 
             # Optimisation gros PDF : le viewer rend maintenant les pages à la demande.
@@ -200,6 +205,11 @@ class MainWindowCoreMixin:
                 doc.close()
 
             self.update_page_indicator()
+            try:
+                if hasattr(self, "_refresh_pdf_context_markers"):
+                    self._refresh_pdf_context_markers()
+            except Exception:
+                pass
 
         except Exception as e:
             QMessageBox.critical(self, "Erreur document", str(e))

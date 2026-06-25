@@ -50,6 +50,9 @@ class PdfViewer(QWidget):
         # Les coordonnées sont normalisées par rapport à la page non tournée.
         self._highlights: dict[str, dict] = {}
         self._active_highlight_key: str | None = None
+        # Décorations de page (cadre couleur, libellé discret en haut, etc.)
+        # Format: {page_index: {"border_color": ..., "label_text": ..., "label_color": ...}}
+        self._page_decorations: dict[int, dict] = {}
 
         self._init_ui()
 
@@ -91,6 +94,7 @@ class PdfViewer(QWidget):
         self._zoom_factor = 1.0
         self._auto_fit_width = True
         self.clear_highlights(refresh=False)
+        self.clear_page_decorations(refresh=False)
 
         if self.page_count() > 0:
             self.fit_to_width()
@@ -126,6 +130,7 @@ class PdfViewer(QWidget):
         self._zoom_factor = 1.0
         self._auto_fit_width = True
         self.clear_highlights(refresh=False)
+        self.clear_page_decorations(refresh=False)
 
         if self.page_count() > 0:
             self.fit_to_width()
@@ -275,6 +280,45 @@ class PdfViewer(QWidget):
         if refresh:
             self._refresh()
 
+    def clear_page_decorations(self, refresh: bool = True) -> None:
+        self._page_decorations = {}
+        if refresh:
+            self._refresh()
+
+    def set_page_decorations(self, decorations=None) -> None:
+        cleaned: dict[int, dict] = {}
+        if isinstance(decorations, list):
+            iterable = decorations
+        elif isinstance(decorations, dict):
+            iterable = []
+            for k, v in decorations.items():
+                if isinstance(v, dict):
+                    item = dict(v)
+                    item.setdefault("page", k)
+                    iterable.append(item)
+        else:
+            iterable = []
+
+        for item in iterable:
+            if not isinstance(item, dict):
+                continue
+            try:
+                page = int(item.get("page", item.get("page_index", 0)) or 0)
+            except Exception:
+                page = 0
+            page = max(0, page)
+            deco = {
+                "border_color": item.get("border_color"),
+                "label_text": str(item.get("label_text") or "").strip(),
+                "label_color": item.get("label_color"),
+                "label_background": item.get("label_background"),
+            }
+            if deco["border_color"] or deco["label_text"]:
+                cleaned[page] = deco
+
+        self._page_decorations = cleaned
+        self._refresh()
+
     def set_highlights(self, highlights=None, active_key: str | None = None, **kwargs) -> None:
         if highlights is None:
             highlights = kwargs.get("field_positions") or kwargs.get("positions") or {}
@@ -365,6 +409,22 @@ class PdfViewer(QWidget):
         except Exception:
             return None
 
+    def _to_qcolor(self, value, fallback: QColor) -> QColor:
+        if isinstance(value, QColor):
+            return QColor(value)
+        if isinstance(value, (tuple, list)) and len(value) in (3, 4):
+            try:
+                if len(value) == 3:
+                    return QColor(int(value[0]), int(value[1]), int(value[2]))
+                return QColor(int(value[0]), int(value[1]), int(value[2]), int(value[3]))
+            except Exception:
+                return QColor(fallback)
+        if isinstance(value, str) and value.strip():
+            c = QColor(value.strip())
+            if c.isValid():
+                return c
+        return QColor(fallback)
+
     def _position_page_index(self, pos: dict | None) -> int | None:
         if not isinstance(pos, dict):
             return None
@@ -372,6 +432,54 @@ class PdfViewer(QWidget):
             return max(0, int(pos.get("page", pos.get("page_index", 0)) or 0))
         except Exception:
             return None
+
+    def _paint_page_decorations(self, pixmap: QPixmap, page_index: int) -> QPixmap:
+        if pixmap.isNull() or not self._page_decorations:
+            return pixmap
+
+        deco = self._page_decorations.get(int(page_index))
+        if not isinstance(deco, dict):
+            return pixmap
+
+        page_w = max(1, pixmap.width())
+        page_h = max(1, pixmap.height())
+        out = QPixmap(pixmap)
+        painter = QPainter(out)
+        try:
+            border = deco.get("border_color")
+            if border:
+                color = self._to_qcolor(border, QColor(255, 140, 0, 215))
+                pen_width = max(5, int(min(page_w, page_h) * 0.0065))
+                painter.setPen(QPen(color, pen_width, Qt.SolidLine))
+                inset = max(4.0, pen_width * 0.8)
+                painter.drawRect(QRectF(inset, inset, max(1.0, page_w - inset * 2), max(1.0, page_h - inset * 2)))
+
+            label_text = str(deco.get("label_text") or "").strip()
+            if label_text:
+                label_color = self._to_qcolor(deco.get("label_color"), QColor(255, 140, 0, 235))
+                bg_color = self._to_qcolor(deco.get("label_background"), QColor(255, 255, 255, 208))
+
+                font = painter.font()
+                font_size = max(8, int(min(page_w, page_h) * 0.018))
+                font.setPointSize(font_size)
+                painter.setFont(font)
+                fm = painter.fontMetrics()
+                pad_x = max(8, int(font_size * 0.8))
+                pad_y = max(4, int(font_size * 0.35))
+                text_w = fm.horizontalAdvance(label_text)
+                rect_w = min(page_w - 20, text_w + pad_x * 2)
+                rect_h = fm.height() + pad_y * 2
+                rect_x = max(10.0, (page_w - rect_w) / 2.0)
+                rect_y = 10.0
+                painter.setPen(Qt.NoPen)
+                painter.setBrush(bg_color)
+                painter.drawRoundedRect(QRectF(rect_x, rect_y, rect_w, rect_h), 8, 8)
+                painter.setPen(QPen(label_color, 1))
+                painter.drawText(QRectF(rect_x + pad_x, rect_y + pad_y / 2.0, rect_w - pad_x * 2, rect_h), Qt.AlignCenter | Qt.AlignVCenter, label_text)
+        finally:
+            painter.end()
+
+        return out
 
     def _paint_highlights(self, pixmap: QPixmap, page_index: int) -> QPixmap:
         if pixmap.isNull() or not self._highlights:
@@ -492,7 +600,8 @@ class PdfViewer(QWidget):
             self.view_changed.emit()
             return
 
-        painted = self._paint_highlights(base_pixmap, self._current_page)
+        painted = self._paint_page_decorations(base_pixmap, self._current_page)
+        painted = self._paint_highlights(painted, self._current_page)
         pixmap = self._get_rotated_pixmap(painted)
 
         scaled = pixmap.scaled(

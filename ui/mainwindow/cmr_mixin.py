@@ -6,6 +6,77 @@ import fitz
 
 
 class MainWindowCmrMixin:
+    def _refresh_pdf_context_markers(self):
+        """Affiche un cadre rouge pour la facture et orange pour les pages CMR.
+
+        Sur les pages CMR, ajoute aussi en haut un petit bandeau orange avec
+        le ou les dossiers associés.
+        """
+        try:
+            viewer = getattr(self, "pdf_viewer", None)
+            if viewer is None or not hasattr(viewer, "set_page_decorations"):
+                return
+
+            doc_path = str(getattr(self, "view_pdf_path", None) or getattr(self, "current_pdf_path", None) or "").strip()
+            if not doc_path or not os.path.exists(doc_path):
+                viewer.clear_page_decorations()
+                return
+
+            page_count = 0
+            try:
+                page_count = int(viewer.page_count() or 0)
+            except Exception:
+                page_count = 0
+            if page_count <= 0:
+                page_count = self._get_pdf_page_count(doc_path)
+
+            decorations = []
+            is_main_invoice = False
+            try:
+                is_main_invoice = os.path.abspath(doc_path) == os.path.abspath(str(getattr(self, "current_pdf_path", "") or ""))
+            except Exception:
+                is_main_invoice = False
+
+            if page_count <= 0:
+                page_count = 1
+
+            for idx in range(page_count):
+                deco = {"page": idx}
+                page_no = idx + 1
+                page_links = self._get_cmr_page_links_for_page(doc_path, page_no)
+                if page_links:
+                    dossier_list = []
+                    seen = set()
+                    for link in page_links:
+                        tour_nr = str((link or {}).get("tour_nr") or "").strip()
+                        if tour_nr and tour_nr not in seen:
+                            seen.add(tour_nr)
+                            dossier_list.append(tour_nr)
+                    label = ""
+                    if dossier_list:
+                        label = ("Dossier associé : " if len(dossier_list) == 1 else "Dossiers associés : ") + ", ".join(dossier_list)
+                    deco.update({
+                        "border_color": (255, 140, 0, 235),
+                        "label_text": label,
+                        "label_color": (255, 140, 0, 245),
+                        "label_background": (255, 255, 255, 210),
+                    })
+                elif is_main_invoice:
+                    deco.update({
+                        "border_color": (215, 20, 20, 235),
+                    })
+
+                if deco.get("border_color") or deco.get("label_text"):
+                    decorations.append(deco)
+
+            viewer.set_page_decorations(decorations)
+        except Exception:
+            try:
+                if hasattr(self, "pdf_viewer") and hasattr(self.pdf_viewer, "clear_page_decorations"):
+                    self.pdf_viewer.clear_page_decorations()
+            except Exception:
+                pass
+
     def _get_folder_choices_for_entry(self, entry_id: str) -> list[dict]:
         """
         Retourne la liste des dossiers (tour_nr + amount_ht_ocr) UNIQUEMENT depuis
@@ -85,18 +156,24 @@ class MainWindowCmrMixin:
 
     def _build_cmr_pages_summary(self, pdf_path: str) -> str:
         page_count = self._get_pdf_page_count(pdf_path)
-        links = {int(x.get("page", 0) or 0): x for x in self._get_cmr_page_links(pdf_path)}
+        links_by_page = defaultdict(list)
+        for link in self._get_cmr_page_links(pdf_path):
+            try:
+                links_by_page[int(link.get("page", 0) or 0)].append(link)
+            except Exception:
+                continue
 
         if page_count <= 0:
             return ""
 
         lines = []
         for page_no in range(1, page_count + 1):
-            link = links.get(page_no)
-            if link:
-                lines.append(
-                    f"Page {page_no} → tournée {link.get('tour_nr', '')} / commande {link.get('auf_nr', '')}"
-                )
+            page_links = links_by_page.get(page_no, [])
+            if page_links:
+                parts = []
+                for link in page_links:
+                    parts.append(f"tournée {link.get('tour_nr', '')} / commande {link.get('auf_nr', '')}")
+                lines.append(f"Page {page_no} → " + " ; ".join(parts))
             else:
                 lines.append(f"Page {page_no} → non rattachée")
 
@@ -110,6 +187,9 @@ class MainWindowCmrMixin:
         - Les choix de dossiers viennent du tableau de droite (si l'entry_id est celui affiché),
           sinon fallback : lecture des JSON des docs du même entry_id.
         - Le rattachement est stocké au niveau PAGE dans `cmr_page_links`.
+        - Une même page peut porter plusieurs rattachements : au moment d'ajouter
+          un rattachement sur une page déjà utilisée, l'utilisateur choisit
+          Remplacer ou Ajouter.
         - Compatibilité ancienne logique conservée via cmr_tour_nr / cmr_auf_nr.
         """
         if not pdf_path:
@@ -174,19 +254,32 @@ class MainWindowCmrMixin:
         if not tour_nr:
             return
 
-        existing_page_link = self._get_cmr_page_link(pdf_path, page_no)
-        if existing_page_link:
-            resp = QMessageBox.question(
-                self,
-                "Rattachement CMR",
-                f"La page {page_no} est déjà rattachée à la tournée "
-                f"{existing_page_link.get('tour_nr', '')} / commande {existing_page_link.get('auf_nr', '')}.\n\n"
-                "Remplacer ce rattachement ?",
-                QMessageBox.Yes | QMessageBox.No,
-                QMessageBox.No,
+        existing_page_links = self._get_cmr_page_links_for_page(pdf_path, page_no)
+        mode = "replace"
+        if existing_page_links:
+            lines = []
+            for link in existing_page_links[:10]:
+                lines.append(f"- tournée {link.get('tour_nr', '')} / commande {link.get('auf_nr', '')}")
+            if len(existing_page_links) > 10:
+                lines.append(f"... + {len(existing_page_links) - 10} autre(s)")
+
+            msg = QMessageBox(self)
+            msg.setIcon(QMessageBox.Question)
+            msg.setWindowTitle("Rattachement CMR")
+            msg.setText(
+                f"La page {page_no} possède déjà {len(existing_page_links)} rattachement(s) :\n\n"
+                + "\n".join(lines)
+                + "\n\nQue veux-tu faire ?"
             )
-            if resp != QMessageBox.Yes:
+            btn_replace = msg.addButton("Remplacer", QMessageBox.AcceptRole)
+            btn_add = msg.addButton("Ajouter", QMessageBox.ActionRole)
+            btn_cancel = msg.addButton("Annuler", QMessageBox.RejectRole)
+            msg.setDefaultButton(btn_add)
+            msg.exec()
+            clicked = msg.clickedButton()
+            if clicked == btn_cancel:
                 return
+            mode = "add" if clicked == btn_add else "replace"
 
         try:
             if self.current_pdf_path == pdf_path:
@@ -207,26 +300,44 @@ class MainWindowCmrMixin:
         existing["tags"] = sorted(tags_set)
 
         existing["entry_id"] = entry_id
-        existing["cmr_attached_at"] = datetime.now().isoformat(timespec="seconds")
+        now_txt = datetime.now().isoformat(timespec="seconds")
+        existing["cmr_attached_at"] = now_txt
 
-        # Sauvegarde page -> tournée / commande
+        # Sauvegarde page -> tournée / commande.
+        # En mode ajout, on garde les autres rattachements de la même page.
         links = existing.get("cmr_page_links")
         if not isinstance(links, list):
             links = []
 
-        links = [x for x in links if int(x.get("page", 0) or 0) != int(page_no)]
+        if mode == "replace":
+            links = [x for x in links if int(x.get("page", 0) or 0) != int(page_no)]
+        else:
+            # éviter uniquement les doublons strictement identiques
+            for x in links:
+                if (
+                    int(x.get("page", 0) or 0) == int(page_no)
+                    and str(x.get("tour_nr") or "").strip() == tour_nr
+                    and str(x.get("auf_nr") or "").strip() == auf_nr
+                ):
+                    QMessageBox.information(
+                        self,
+                        "Rattacher CMR",
+                        f"Cette page est déjà rattachée au dossier {tour_nr} / commande {auf_nr}."
+                    )
+                    return
+
         links.append(
             {
                 "page": int(page_no),
                 "tour_nr": tour_nr,
                 "auf_nr": auf_nr,
-                "attached_at": datetime.now().isoformat(timespec="seconds"),
+                "attached_at": now_txt,
             }
         )
-        links.sort(key=lambda x: int(x.get("page", 0) or 0))
+        links.sort(key=lambda x: (int(x.get("page", 0) or 0), str(x.get("tour_nr") or ""), str(x.get("auf_nr") or "")))
         existing["cmr_page_links"] = links
 
-        # Compat ancienne logique: on conserve aussi la dernière page rattachée
+        # Compat ancienne logique: on conserve aussi le dernier rattachement posé.
         existing["cmr_tour_nr"] = tour_nr
         existing["cmr_auf_nr"] = auf_nr
 
@@ -234,24 +345,34 @@ class MainWindowCmrMixin:
         with open(json_path, "w", encoding="utf-8") as f:
             json.dump(existing, f, ensure_ascii=False, indent=2)
 
+        try:
+            self._invalidate_cmr_status_cache()
+        except Exception:
+            pass
+
         # Refresh UI gauche
+        cmr_count_for_page = len(self._get_cmr_page_links_for_page(pdf_path, page_no))
         for r in range(self.pdf_table.rowCount()):
             it0 = self.pdf_table.item(r, 0)
             if it0 and it0.data(Qt.UserRole) == pdf_path:
                 if page_count > 1:
-                    it0.setToolTip(f"CMR page {page_no} rattachée au dossier {tour_nr} / commande {auf_nr}")
+                    it0.setToolTip(
+                        f"CMR page {page_no} : {cmr_count_for_page} rattachement(s). "
+                        f"Dernier : dossier {tour_nr} / commande {auf_nr}"
+                    )
                 else:
                     it0.setToolTip(f"CMR rattachée au dossier {tour_nr} / commande {auf_nr}")
                 break
 
+        action_txt = "ajouté" if mode == "add" else "rattaché"
         if page_count > 1:
             self.statusBar().showMessage(
-                f"CMR page {page_no} rattachée au dossier {tour_nr} / commande {auf_nr}.",
+                f"CMR page {page_no} {action_txt} au dossier {tour_nr} / commande {auf_nr}.",
                 3000
             )
         else:
             self.statusBar().showMessage(
-                f"CMR rattachée au dossier {tour_nr} / commande {auf_nr}.",
+                f"CMR {action_txt} au dossier {tour_nr} / commande {auf_nr}.",
                 3000
             )
 
@@ -259,13 +380,8 @@ class MainWindowCmrMixin:
 
         try:
             if self.selected_invoice_entry_id and self.selected_invoice_entry_id.strip() == entry_id:
-                if hasattr(self, "_invalidate_cmr_status_cache"):
-                    self._invalidate_cmr_status_cache()
-                if hasattr(self, "_refresh_all_folder_row_statuses"):
-                    self._refresh_all_folder_row_statuses()
-                else:
-                    for r in range(self.folder_table.rowCount()):
-                        self._update_folder_row_status(r)
+                for r in range(self.folder_table.rowCount()):
+                    self._update_folder_row_status(r)
         except Exception:
             pass
 
@@ -282,6 +398,11 @@ class MainWindowCmrMixin:
                 current = self.tour_info.toPlainText().strip()
                 block = "CMR par page :\n" + summary
                 self.tour_info.setPlainText((current + "\n\n" + block).strip() if current else block)
+        except Exception:
+            pass
+
+        try:
+            self._refresh_pdf_context_markers()
         except Exception:
             pass
 
@@ -330,19 +451,35 @@ class MainWindowCmrMixin:
         self.attach_cmr_to_dossier_from_right_list(pdf_path, filename, entry_id=entry_id)
 
 
+    def _make_cmr_link_key(self, pdf_path: str, link: dict) -> str:
+        """Clé stable pour retrouver/supprimer un rattachement CMR."""
+        return "|".join(
+            [
+                os.path.abspath(str(pdf_path or "")),
+                str(int((link or {}).get("page", 0) or 0)),
+                str((link or {}).get("tour_nr") or "").strip(),
+                str((link or {}).get("auf_nr") or "").strip(),
+                str((link or {}).get("attached_at") or "").strip(),
+            ]
+        )
+
+    def _write_saved_invoice_json(self, pdf_path: str, data: dict) -> None:
+        """Écrit le JSON de sauvegarde associé à un document."""
+        json_path = self._get_saved_json_path(pdf_path)
+        os.makedirs(os.path.dirname(json_path), exist_ok=True)
+        with open(json_path, "w", encoding="utf-8") as f:
+            json.dump(data if isinstance(data, dict) else {}, f, ensure_ascii=False, indent=2)
+
     def _collect_cmr_attachments_for_current_entry(self) -> list[dict]:
         """
         Construit la liste des CMR rattachées (depuis les JSON des docs du même entry_id).
-        Version page-aware.
+        Version page-aware, avec chemins + clé de suppression/ouverture.
         """
         out: list[dict] = []
         seen = set()
 
         paths = self.entry_pdf_paths or []
         for p in paths:
-            if self.current_pdf_path and os.path.abspath(p) == os.path.abspath(self.current_pdf_path):
-                continue
-
             data = self._read_saved_invoice_json(p) or {}
 
             tags = data.get("tags") or []
@@ -358,13 +495,15 @@ class MainWindowCmrMixin:
                     auf_nr = str(link.get("auf_nr") or "").strip()
                     attached_at = str(link.get("attached_at") or "").strip()
 
-                    key = (os.path.basename(p), page_no, tour_nr, auf_nr)
+                    key = self._make_cmr_link_key(p, link)
                     if key in seen:
                         continue
                     seen.add(key)
 
                     out.append(
                         {
+                            "key": key,
+                            "pdf_path": p,
                             "filename": os.path.basename(p),
                             "page": page_no,
                             "tour_nr": tour_nr,
@@ -378,23 +517,233 @@ class MainWindowCmrMixin:
             if "cmr" not in tags_norm and not tour_nr:
                 continue
 
-            fn = os.path.basename(p)
-            key = (fn, 0, tour_nr)
+            legacy_link = {
+                "page": 0,
+                "tour_nr": tour_nr,
+                "auf_nr": str(data.get("cmr_auf_nr") or "").strip(),
+                "attached_at": str(data.get("cmr_attached_at") or "").strip(),
+            }
+            key = self._make_cmr_link_key(p, legacy_link)
             if key in seen:
                 continue
             seen.add(key)
 
             out.append(
                 {
-                    "filename": fn,
+                    "key": key,
+                    "pdf_path": p,
+                    "filename": os.path.basename(p),
                     "page": 0,
                     "tour_nr": tour_nr,
-                    "auf_nr": str(data.get("cmr_auf_nr") or "").strip(),
-                    "attached_at": str(data.get("cmr_attached_at") or "").strip(),
+                    "auf_nr": legacy_link["auf_nr"],
+                    "attached_at": legacy_link["attached_at"],
                 }
             )
 
         return out
+
+    def _get_cmr_attachments_for_tour(self, tour_nr: str) -> list[dict]:
+        tour_nr = str(tour_nr or "").strip()
+        if not tour_nr:
+            return []
+        return [x for x in self._collect_cmr_attachments_for_current_entry() if str(x.get("tour_nr") or "").strip() == tour_nr]
+
+    def _open_cmr_attachment(self, attachment: dict) -> None:
+        """Affiche le document CMR et positionne le viewer sur la page rattachée."""
+        if not isinstance(attachment, dict):
+            return
+        pdf_path = str(attachment.get("pdf_path") or "").strip()
+        if not pdf_path or not os.path.exists(pdf_path):
+            QMessageBox.warning(self, "CMR", "Fichier CMR introuvable.")
+            return
+
+        self.view_pdf_path = pdf_path
+        try:
+            if pdf_path in (self.entry_pdf_paths or []):
+                self.current_doc_index = self.entry_pdf_paths.index(pdf_path)
+        except Exception:
+            pass
+
+        self.display_pdf()
+
+        page_no = int(attachment.get("page", 0) or 0)
+        if page_no > 0:
+            try:
+                self.pdf_viewer.go_to_page(page_no - 1)
+            except Exception:
+                pass
+            try:
+                self.update_page_indicator()
+            except Exception:
+                pass
+
+        try:
+            self.update_doc_indicator()
+        except Exception:
+            pass
+
+        self.statusBar().showMessage(
+            f"CMR ouverte : {os.path.basename(pdf_path)}" + (f" page {page_no}" if page_no else ""),
+            3000,
+        )
+
+    def _delete_cmr_attachment(self, attachment: dict) -> bool:
+        """Supprime un seul rattachement CMR du JSON source."""
+        if not isinstance(attachment, dict):
+            return False
+        pdf_path = str(attachment.get("pdf_path") or "").strip()
+        key = str(attachment.get("key") or "").strip()
+        if not pdf_path or not key:
+            return False
+
+        data = self._read_saved_invoice_json(pdf_path) or {}
+        links = data.get("cmr_page_links")
+        if isinstance(links, list) and links:
+            new_links = []
+            removed = False
+            for link in links:
+                if self._make_cmr_link_key(pdf_path, link) == key and not removed:
+                    removed = True
+                    continue
+                new_links.append(link)
+
+            if not removed:
+                return False
+
+            data["cmr_page_links"] = new_links
+            if new_links:
+                last = new_links[-1]
+                data["cmr_tour_nr"] = str(last.get("tour_nr") or "").strip()
+                data["cmr_auf_nr"] = str(last.get("auf_nr") or "").strip()
+                data["cmr_attached_at"] = str(last.get("attached_at") or "").strip()
+            else:
+                data["cmr_tour_nr"] = ""
+                data["cmr_auf_nr"] = ""
+                data["cmr_attached_at"] = ""
+
+            self._write_saved_invoice_json(pdf_path, data)
+            try:
+                self._refresh_pdf_context_markers()
+            except Exception:
+                pass
+            try:
+                self._invalidate_cmr_status_cache()
+            except Exception:
+                pass
+            return True
+
+        # Compat ancien format sans cmr_page_links : on vide seulement les champs CMR.
+        if str(data.get("cmr_tour_nr") or "").strip():
+            data["cmr_tour_nr"] = ""
+            data["cmr_auf_nr"] = ""
+            data["cmr_attached_at"] = ""
+            self._write_saved_invoice_json(pdf_path, data)
+            try:
+                self._invalidate_cmr_status_cache()
+            except Exception:
+                pass
+            return True
+
+        return False
+
+    def _show_cmr_attachments_dialog_for_tour(self, tour_nr: str) -> None:
+        """Liste les CMR rattachées à un dossier, avec ouverture et suppression."""
+        tour_nr = str(tour_nr or "").strip()
+        if not tour_nr:
+            return
+
+        attachments = self._get_cmr_attachments_for_tour(tour_nr)
+        if not attachments:
+            QMessageBox.information(self, "CMR", f"Aucune CMR rattachée au dossier {tour_nr}.")
+            return
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle(f"CMR rattachées au dossier {tour_nr}")
+        dlg.resize(760, 360)
+        layout = QVBoxLayout(dlg)
+        layout.addWidget(QLabel(f"CMR rattachées au dossier {tour_nr} :"))
+
+        table = QTableWidget(len(attachments), 5, dlg)
+        table.setHorizontalHeaderLabels(["Fichier", "Page", "Commande", "Date rattachement", "Dossier"])
+        table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+        for col in range(1, 5):
+            table.horizontalHeader().setSectionResizeMode(col, QHeaderView.ResizeToContents)
+
+        for row, att in enumerate(attachments):
+            values = [
+                str(att.get("filename") or ""),
+                str(att.get("page") or ""),
+                str(att.get("auf_nr") or ""),
+                str(att.get("attached_at") or ""),
+                str(att.get("tour_nr") or ""),
+            ]
+            for col, value in enumerate(values):
+                item = QTableWidgetItem(value)
+                item.setData(Qt.UserRole, row)
+                table.setItem(row, col, item)
+
+        layout.addWidget(table)
+
+        btn_row = QHBoxLayout()
+        btn_open = QPushButton("Ouvrir")
+        btn_delete = QPushButton("Supprimer le rattachement")
+        btn_close = QPushButton("Fermer")
+        btn_row.addWidget(btn_open)
+        btn_row.addWidget(btn_delete)
+        btn_row.addStretch()
+        btn_row.addWidget(btn_close)
+        layout.addLayout(btn_row)
+
+        def selected_attachment():
+            r = table.currentRow()
+            if r < 0 and attachments:
+                r = 0
+                table.selectRow(0)
+            if r < 0 or r >= len(attachments):
+                return None
+            return attachments[r]
+
+        def do_open():
+            att = selected_attachment()
+            if not att:
+                return
+            dlg.accept()
+            self._open_cmr_attachment(att)
+
+        def do_delete():
+            att = selected_attachment()
+            if not att:
+                return
+            resp = QMessageBox.question(
+                dlg,
+                "Supprimer CMR",
+                "Supprimer ce rattachement CMR ?\n\n"
+                f"Fichier : {att.get('filename', '')}\n"
+                f"Page : {att.get('page', '')}\n"
+                f"Commande : {att.get('auf_nr', '')}",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if resp != QMessageBox.Yes:
+                return
+            if self._delete_cmr_attachment(att):
+                dlg.accept()
+                try:
+                    for r in range(self.folder_table.rowCount()):
+                        self._update_folder_row_status(r)
+                except Exception:
+                    pass
+                QMessageBox.information(self, "CMR", "Rattachement supprimé.")
+            else:
+                QMessageBox.warning(self, "CMR", "Impossible de supprimer le rattachement.")
+
+        btn_open.clicked.connect(do_open)
+        btn_delete.clicked.connect(do_delete)
+        btn_close.clicked.connect(dlg.reject)
+        table.cellDoubleClicked.connect(lambda _r, _c: do_open())
+        if attachments:
+            table.selectRow(0)
+        dlg.exec()
 
     def _get_current_invoice_tours(self) -> set[str]:
         tours = set()
@@ -822,6 +1171,10 @@ class MainWindowCmrMixin:
         """
         Extrait et écrit un PDF par page CMR rattachée à ce document.
         Retourne mapping {page_no -> path_pdf}.
+
+        Une page peut désormais contenir plusieurs rattachements CMR. On ne coupe
+        donc qu'une seule fois la page, puis toutes les lignes d'export DMS qui
+        pointent vers cette page réutilisent le même PDF découpé.
         """
         pdf_path = str(pdf_path or "").strip()
         target_dir = str(target_dir or "").strip()
@@ -832,6 +1185,18 @@ class MainWindowCmrMixin:
         if not isinstance(links, list) or not links:
             return {}
 
+        links_by_page: dict[int, list[dict]] = defaultdict(list)
+        for link in links:
+            try:
+                page_no = int(link.get("page", 0) or 0)
+            except Exception:
+                page_no = 0
+            if page_no > 0:
+                links_by_page[page_no].append(link)
+
+        if not links_by_page:
+            return {}
+
         os.makedirs(target_dir, exist_ok=True)
         doc = fitz.open(pdf_path)
         try:
@@ -839,14 +1204,16 @@ class MainWindowCmrMixin:
             src_name = os.path.basename(pdf_path)
             base_name, ext = os.path.splitext(src_name)
 
-            for link in links:
-                page_no = int(link.get("page", 0) or 0)
+            for page_no, page_links in sorted(links_by_page.items()):
                 if page_no <= 0 or page_no > doc.page_count:
                     continue
 
-                tour_nr = re.sub(r"[^0-9A-Za-z_-]", "", str(link.get("tour_nr") or "").strip())
-                auf_nr = re.sub(r"[^0-9A-Za-z_-]", "", str(link.get("auf_nr") or "").strip())
+                first = page_links[0] if page_links else {}
+                tour_nr = re.sub(r"[^0-9A-Za-z_-]", "", str(first.get("tour_nr") or "").strip())
+                auf_nr = re.sub(r"[^0-9A-Za-z_-]", "", str(first.get("auf_nr") or "").strip())
                 suffix = [f"CMR_p{page_no:02d}"]
+                if len(page_links) > 1:
+                    suffix.append(f"MULTI{len(page_links)}")
                 if tour_nr:
                     suffix.append(f"T{tour_nr}")
                 if auf_nr:
@@ -886,7 +1253,7 @@ class MainWindowCmrMixin:
                         tags = []
                     tags = sorted({*(tags or []), "cmr"})
                     new_data["tags"] = tags
-                    new_data["cmr_page_links"] = [link]
+                    new_data["cmr_page_links"] = page_links
                     new_data["source_split_from"] = src_name
                     new_data["source_split_page"] = page_no
 
@@ -907,34 +1274,57 @@ class MainWindowCmrMixin:
         data = self._read_saved_invoice_json(pdf_path) or {}
         links = data.get("cmr_page_links")
         if isinstance(links, list):
-            return links
+            return [x for x in links if isinstance(x, dict)]
         return []
 
-    def _save_cmr_page_link(self, pdf_path: str, page_no: int, tour_nr: str, auf_nr: str):
+    def _get_cmr_page_links_for_page(self, pdf_path: str, page_no: int) -> list[dict]:
+        out = []
+        for link in self._get_cmr_page_links(pdf_path):
+            try:
+                if int(link.get("page", 0) or 0) == int(page_no):
+                    out.append(link)
+            except Exception:
+                continue
+        return out
+
+    def _save_cmr_page_link(self, pdf_path: str, page_no: int, tour_nr: str, auf_nr: str, mode: str = "replace"):
         data = self._read_saved_invoice_json(pdf_path) or {}
         links = data.get("cmr_page_links")
         if not isinstance(links, list):
             links = []
 
-        new_links = [x for x in links if int(x.get("page", 0) or 0) != int(page_no)]
+        if mode != "add":
+            new_links = [x for x in links if int(x.get("page", 0) or 0) != int(page_no)]
+        else:
+            new_links = list(links)
+
+        now_txt = datetime.now().isoformat(timespec="seconds")
+        if mode == "add":
+            for x in new_links:
+                if (
+                    int(x.get("page", 0) or 0) == int(page_no)
+                    and str(x.get("tour_nr") or "").strip() == str(tour_nr or "").strip()
+                    and str(x.get("auf_nr") or "").strip() == str(auf_nr or "").strip()
+                ):
+                    return
+
         new_links.append(
             {
                 "page": int(page_no),
                 "tour_nr": str(tour_nr or "").strip(),
                 "auf_nr": str(auf_nr or "").strip(),
-                "attached_at": datetime.now().isoformat(timespec="seconds"),
+                "attached_at": now_txt,
             }
         )
-        new_links.sort(key=lambda x: int(x.get("page", 0) or 0))
+        new_links.sort(key=lambda x: (int(x.get("page", 0) or 0), str(x.get("tour_nr") or ""), str(x.get("auf_nr") or "")))
 
         data["cmr_page_links"] = new_links
         data["cmr_tour_nr"] = str(tour_nr or "").strip()
         data["cmr_auf_nr"] = str(auf_nr or "").strip()
+        data["cmr_attached_at"] = now_txt
 
         self._write_saved_invoice_json(pdf_path, data)
 
     def _get_cmr_page_link(self, pdf_path: str, page_no: int) -> dict | None:
-        for link in self._get_cmr_page_links(pdf_path):
-            if int(link.get("page", 0) or 0) == int(page_no):
-                return link
-        return None
+        links = self._get_cmr_page_links_for_page(pdf_path, page_no)
+        return links[0] if links else None
