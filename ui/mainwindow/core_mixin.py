@@ -985,8 +985,8 @@ class MainWindowCoreMixin:
 
     def _validate_invoice_date_for_validation(self) -> bool:
         raw = str(self.date_input.text() or "").strip()
-        _date_obj, normalized = self._parse_invoice_date_strict(raw)
-        if not normalized:
+        date_obj, normalized = self._parse_invoice_date_strict(raw)
+        if not normalized or date_obj is None:
             QMessageBox.warning(
                 self,
                 "Validation impossible",
@@ -999,6 +999,37 @@ class MainWindowCoreMixin:
                 self.date_input.selectAll()
             except Exception:
                 pass
+            return False
+
+        # Règle métier : la date facture doit être comprise entre aujourd'hui - 90 jours
+        # et aujourd'hui inclus. Cela évite de valider une facture future ou trop ancienne.
+        try:
+            from datetime import date, timedelta
+            today = date.today()
+            min_allowed = today - timedelta(days=90)
+            if date_obj > today or date_obj < min_allowed:
+                QMessageBox.warning(
+                    self,
+                    "Validation impossible",
+                    "La date facture doit être comprise entre le "
+                    f"{min_allowed.strftime('%d/%m/%Y')} et le {today.strftime('%d/%m/%Y')}.\n\n"
+                    f"Date saisie : {normalized}"
+                )
+                try:
+                    self.date_input.setText(normalized)
+                    self.date_input.setStyleSheet("background-color: #ffe6e6;")
+                    self.date_input.setFocus()
+                    self.date_input.selectAll()
+                except Exception:
+                    pass
+                return False
+        except Exception:
+            # Si la vérification de plage échoue pour une raison inattendue, on bloque par sécurité.
+            QMessageBox.warning(
+                self,
+                "Validation impossible",
+                "Impossible de contrôler la plage autorisée de la date facture."
+            )
             return False
 
         if raw != normalized:
