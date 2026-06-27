@@ -177,7 +177,7 @@ class TransporterRepository(BaseRepository):
                 rows_affected = self.execute_rowcount(
                     """
                     UPDATE xxakunbank
-                    SET IBAN = ?, SWIFT = ?
+                    SET IBAN = ?, SWIFT = ?, IsDefault = 1
                     WHERE KundenNr = ?
                       AND LfdNr IS NULL
                     """,
@@ -187,7 +187,7 @@ class TransporterRepository(BaseRepository):
                 rows_affected = self.execute_rowcount(
                     """
                     UPDATE xxakunbank
-                    SET IBAN = ?, SWIFT = ?
+                    SET IBAN = ?, SWIFT = ?, IsDefault = 1
                     WHERE KundenNr = ?
                       AND LfdNr = ?
                     """,
@@ -197,8 +197,8 @@ class TransporterRepository(BaseRepository):
         else:
             rows_affected = self.execute_rowcount(
                 """
-                INSERT INTO xxakunbank (KundenNr, IBAN, SWIFT, LfdNr)
-                VALUES (?, ?, ?, 1)
+                INSERT INTO xxakunbank (KundenNr, IBAN, SWIFT, LfdNr, IsDefault)
+                VALUES (?, ?, ?, 1, 1)
                 """,
                 (kundennr, iban, bic),
             )
