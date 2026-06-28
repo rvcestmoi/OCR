@@ -611,6 +611,15 @@ class MainWindow(
         self.shortcut_save_supplier.setContext(Qt.ApplicationShortcut)
         self.shortcut_save_supplier.activated.connect(self.on_ctrl_m_save_supplier_model)
 
+        try:
+            manual_dms_enabled = bool(get_ui_value(load_settings(), "enable_manual_dms_reexport_shortcut", False))
+        except Exception:
+            manual_dms_enabled = False
+        if manual_dms_enabled:
+            self.shortcut_reexport_dms_cmr = QShortcut(QKeySequence("Ctrl+D"), self)
+            self.shortcut_reexport_dms_cmr.setContext(Qt.ApplicationShortcut)
+            self.shortcut_reexport_dms_cmr.activated.connect(self.on_ctrl_d_reexport_dms_cmr_only)
+
         self.shortcut_zoom_in = QShortcut(QKeySequence.ZoomIn, self)
         self.shortcut_zoom_in.setContext(Qt.ApplicationShortcut)
         self.shortcut_zoom_in.activated.connect(self.on_zoom_in)

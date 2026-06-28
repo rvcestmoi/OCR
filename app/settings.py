@@ -36,6 +36,7 @@ DEFAULT_SETTINGS = {
         "max_pages_error": 50,
         "max_pages_validated": 200,
         "show_rebuild_search_index_button": False,
+        "enable_manual_dms_reexport_shortcut": False,
     },
     "vat": {
         "allowed_rates": [0, 20]

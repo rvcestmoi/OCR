@@ -851,6 +851,52 @@ class MainWindowValidationMixin:
         self.save_supplier_model(show_message=False)
 
 
+    def on_ctrl_d_reexport_dms_cmr_only(self):
+        """Réexport manuel DMS limité aux CMR.
+
+        Ne copie pas la facture, ne génère aucune ligne CSV de type Facture,
+        ne modifie pas WinSped, LISINVOICE_EDTRANS ou les statuts OCR.
+        """
+        try:
+            from app.settings import load_settings, get_ui_value
+            enabled = bool(get_ui_value(load_settings(), "enable_manual_dms_reexport_shortcut", False))
+        except Exception:
+            enabled = False
+
+        if not enabled:
+            self.statusBar().showMessage("Réexport DMS CMR désactivé dans la configuration.", 3000)
+            return
+
+        if not getattr(self, "current_pdf_path", None):
+            QMessageBox.information(self, "Réexport DMS CMR", "Aucun dossier sélectionné.")
+            return
+
+        try:
+            if not getattr(self, "entry_pdf_paths", None):
+                self.build_entry_pdf_group()
+        except Exception:
+            pass
+
+        try:
+            source_path = self._get_validation_document_path() or getattr(self, "current_pdf_path", "")
+            dms_path = self._copy_validated_pdf_to_dms(pdf_path=source_path, cmr_only=True)
+            csv_path = self._export_validation_csv(cmr_only=True)
+        except Exception as e:
+            QMessageBox.warning(
+                self,
+                "Réexport DMS CMR",
+                "Le réexport DMS CMR a échoué :\n" + str(e)
+            )
+            return
+
+        msg = "Réexport DMS CMR terminé."
+        if dms_path:
+            msg += f"\n\nPremier PDF CMR exporté :\n{dms_path}"
+        if csv_path:
+            msg += f"\n\nCSV CMR exporté :\n{csv_path}"
+        QMessageBox.information(self, "Réexport DMS CMR", msg)
+
+
     def _format_percent(self, v: float | None) -> str:
         if v is None:
             return ""
@@ -1668,7 +1714,7 @@ class MainWindowValidationMixin:
 
         return True
     
-    def _copy_validated_pdf_to_dms(self, pdf_path: str | None = None):
+    def _copy_validated_pdf_to_dms(self, pdf_path: str | None = None, cmr_only: bool = False):
         pdf_path = str(pdf_path or getattr(self, "current_pdf_path", "") or "").strip()
         if not pdf_path or not os.path.isfile(pdf_path):
             raise FileNotFoundError("PDF courant introuvable.")
@@ -1703,30 +1749,29 @@ class MainWindowValidationMixin:
             shutil.copy2(src_path, dest_path)
             return dest_path
 
-        self._dms_copied_paths = getattr(self, "_dms_copied_paths", {}) or {}
+        self._dms_copied_paths = {}
+        self._cmr_splits = {}
 
-        # Copie principal
-        copied_main_path = copy_src_to_target(pdf_path)
-        if copied_main_path:
-            self._dms_copied_paths[os.path.abspath(pdf_path)] = copied_main_path
+        copied_main_path = ""
 
-        # Copier tous les fichiers du même groupe (entry_pdf_paths)
-        for p in (self.entry_pdf_paths or []):
-            if not p:
-                continue
-            p = str(p or "").strip()
-            if p and p != pdf_path:
-                copied_path = copy_src_to_target(p)
-                if copied_path:
-                    self._dms_copied_paths[os.path.abspath(p)] = copied_path
+        # Export normal validation : on garde l'ancien comportement, facture + pièces jointes.
+        # Réexport manuel CMR uniquement : on ne copie pas la facture, ni les pièces jointes
+        # non CMR. On ne sort que les pages/fichiers qui portent un rattachement CMR.
+        if not cmr_only:
+            copied_main_path = copy_src_to_target(pdf_path)
+            if copied_main_path:
+                self._dms_copied_paths[os.path.abspath(pdf_path)] = copied_main_path
 
-        # split CMR pages en fichiers dédiés dans DMS
-        # Important : les liens cmr_page_links peuvent être portés par un document
-        # secondaire du groupe (ex : PDF CMR), et pas forcément par le PDF facture
-        # utilisé comme document principal de validation. On parcourt donc tous les
-        # documents du groupe au lieu de ne découper que pdf_path.
+            for p in (self.entry_pdf_paths or []):
+                if not p:
+                    continue
+                p = str(p or "").strip()
+                if p and p != pdf_path:
+                    copied_path = copy_src_to_target(p)
+                    if copied_path:
+                        self._dms_copied_paths[os.path.abspath(p)] = copied_path
+
         try:
-            self._cmr_splits = {}
             entry_id = str(getattr(self, "selected_invoice_entry_id", "") or "").strip()
 
             split_candidates = []
@@ -1737,49 +1782,85 @@ class MainWindowValidationMixin:
                 abs_p = os.path.abspath(p)
                 if abs_p in {os.path.abspath(x) for x in split_candidates}:
                     continue
+
+                if cmr_only:
+                    # En mode CMR-only, on ignore totalement les documents sans lien CMR.
+                    try:
+                        data = self._read_saved_invoice_json(p) or {}
+                    except Exception:
+                        data = {}
+                    has_page_links = isinstance(data.get("cmr_page_links"), list) and bool(data.get("cmr_page_links"))
+                    has_legacy_link = bool(str(data.get("cmr_tour_nr") or "").strip() and str(data.get("cmr_auf_nr") or "").strip())
+                    if not has_page_links and not has_legacy_link:
+                        continue
+
                 split_candidates.append(p)
 
             for p in split_candidates:
-                cmr_splits = self._split_cmr_pages_for_validation(
-                    p,
-                    target_dir,
-                    entry_id=entry_id,
-                )
-                if not cmr_splits:
+                try:
+                    data = self._read_saved_invoice_json(p) or {}
+                except Exception:
+                    data = {}
+                has_page_links = isinstance(data.get("cmr_page_links"), list) and bool(data.get("cmr_page_links"))
+                has_legacy_link = bool(str(data.get("cmr_tour_nr") or "").strip() and str(data.get("cmr_auf_nr") or "").strip())
+
+                try:
+                    cmr_splits = self._split_cmr_pages_for_validation(
+                        p,
+                        target_dir,
+                        entry_id=entry_id,
+                    )
+                except Exception:
+                    cmr_splits = {}
+
+                if cmr_splits:
+                    self._cmr_splits[p] = cmr_splits
+                    self._cmr_splits[os.path.abspath(p)] = cmr_splits
+
+                    for split_path in (cmr_splits or {}).values():
+                        if split_path:
+                            self._dms_copied_paths[os.path.abspath(split_path)] = os.path.abspath(split_path)
                     continue
 
-                # Stockage avec la clé originale et la clé absolue pour éviter les
-                # ratés si le chemin est relu sous une forme légèrement différente.
-                self._cmr_splits[p] = cmr_splits
-                self._cmr_splits[os.path.abspath(p)] = cmr_splits
+                # Fallback : si le document porte des rattachements CMR mais n'a pas pu
+                # être découpé, on copie le document CMR complet. Cela évite d'exporter
+                # la facture en mode CMR-only tout en conservant une pièce jointe CMR.
+                if has_page_links or has_legacy_link:
+                    copied_path = copy_src_to_target(p)
+                    if copied_path:
+                        self._dms_copied_paths[os.path.abspath(p)] = copied_path
 
-                for split_path in (cmr_splits or {}).values():
-                    if split_path:
-                        self._dms_copied_paths[os.path.abspath(split_path)] = os.path.abspath(split_path)
         except Exception:
             self._cmr_splits = getattr(self, "_cmr_splits", {}) or {}
 
+        if cmr_only:
+            # Retour indicatif : premier fichier CMR copié/découpé.
+            cmr_paths = [v for v in (self._dms_copied_paths or {}).values() if v]
+            return str(cmr_paths[0] if cmr_paths else "")
+
         return copied_main_path or ""
     
-    def _collect_validation_csv_rows(self) -> list[list[str]]:
+    def _collect_validation_csv_rows(self, include_invoice: bool = True) -> list[list[str]]:
         """
         Retourne les lignes CSV :
         dossier ; aufintnr ; aufnr ; type ; chemin_document
         """
         rows: list[list[str]] = []
 
-        # 1) Lignes facture : une ligne par dossier
-        invoice_tours = sorted({
-            str(r.get("tour_nr") or "").strip()
-            for r in (self.get_folder_rows() or [])
-            if str(r.get("tour_nr") or "").strip()
-        })
+        # 1) Lignes facture : une ligne par dossier.
+        # En réexport manuel CMR-only, include_invoice=False => aucune ligne Facture.
+        if include_invoice:
+            invoice_tours = sorted({
+                str(r.get("tour_nr") or "").strip()
+                for r in (self.get_folder_rows() or [])
+                if str(r.get("tour_nr") or "").strip()
+            })
 
-        invoice_path = str(getattr(self, "_last_validation_invoice_pdf_path", "") or self._get_validation_document_path() or getattr(self, "current_pdf_path", "") or "").strip()
-        invoice_path_copied = str(self._dms_copied_paths.get(os.path.abspath(invoice_path), invoice_path) or "").strip()
+            invoice_path = str(getattr(self, "_last_validation_invoice_pdf_path", "") or self._get_validation_document_path() or getattr(self, "current_pdf_path", "") or "").strip()
+            invoice_path_copied = str(self._dms_copied_paths.get(os.path.abspath(invoice_path), invoice_path) or "").strip()
 
-        for tour_nr in invoice_tours:
-            rows.append([tour_nr, "", "", "Facture", invoice_path_copied])
+            for tour_nr in invoice_tours:
+                rows.append([tour_nr, "", "", "Facture", invoice_path_copied])
 
         # 2) Lignes CMR : une ligne par couple dossier / aufnr
         seen = set()
@@ -1829,12 +1910,13 @@ class MainWindowValidationMixin:
                         aufintnr = self.tour_repo.get_aufintnr_by_aufnr(aufnr)
                     except Exception:
                         aufintnr = ""
-                    rows.append([tour_nr, aufintnr, aufnr, "CMR", str(p or "").strip()])
+                    cmr_path = str(self._dms_copied_paths.get(os.path.abspath(p), p) or "").strip()
+                    rows.append([tour_nr, aufintnr, aufnr, "CMR", cmr_path])
 
         return rows
 
 
-    def _export_validation_csv(self) -> str:
+    def _export_validation_csv(self, cmr_only: bool = False) -> str:
         """
         Crée un CSV horodaté dans le dossier configurable.
         Retourne le chemin du fichier créé.
@@ -1848,10 +1930,13 @@ class MainWindowValidationMixin:
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         invoice_no = str(self.invoice_number_input.text() or "").strip()
         safe_invoice_no = re.sub(r'[<>:"/\\\\|?*]+', "_", invoice_no) if invoice_no else "SANS_NUMERO"
-        filename = f"{ts}_{safe_invoice_no}.csv"
+        prefix = "CMR_" if cmr_only else ""
+        filename = f"{ts}_{prefix}{safe_invoice_no}.csv"
         csv_path = os.path.join(target_dir, filename)
 
-        rows = self._collect_validation_csv_rows()
+        rows = self._collect_validation_csv_rows(include_invoice=not cmr_only)
+        if cmr_only and not rows:
+            raise RuntimeError("Aucune CMR rattachée à exporter.")
 
         with open(csv_path, "w", encoding="utf-8-sig", newline="") as f:
             writer = csv.writer(f, delimiter=";")
