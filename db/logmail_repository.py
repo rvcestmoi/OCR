@@ -469,7 +469,18 @@ class LogmailRepository(BaseRepository):
         """
         row = self.fetch_one(query, (entry_id,))
         status = str((row or {}).get("processing_status") or "pending").strip().lower()
-        return "ecart" if status == "eccarts" else status
+        return self._normalize_processing_status(status)
+
+
+    def _normalize_processing_status(self, status: str | None, *, default: str = "pending") -> str:
+        st = str(status or "").strip().lower()
+        if st == "eccarts":
+            return "ecart"
+        if st in {"aux_vide", "aux_vides", "auxvide", "auxvides", "aux-empty", "aux_empty"}:
+            return "aux_empty"
+        if st in {"pending", "validated", "error", "ecart"}:
+            return st
+        return default
 
 
     def get_processing_status_map_for_entries(self, entry_ids: list[str]) -> dict[str, str]:
@@ -496,7 +507,7 @@ class LogmailRepository(BaseRepository):
                 entry_id = str(r.get("entry_id") or "").strip()
                 status = str(r.get("processing_status") or "pending").strip().lower()
                 if entry_id:
-                    out[entry_id] = ("ecart" if status == "eccarts" else status) or "pending"
+                    out[entry_id] = self._normalize_processing_status(status)
 
         return out
 
@@ -504,12 +515,11 @@ class LogmailRepository(BaseRepository):
     def set_processing_status_for_entry(self, entry_id: str, status: str) -> None:
         entry_id = str(entry_id or "").strip()
         status = str(status or "").strip().lower()
-        if status == "eccarts":
-            status = "ecart"
+        status = self._normalize_processing_status(status, default="")
 
         if not entry_id:
             return
-        if status not in {"pending", "validated", "error", "ecart"}:
+        if status not in {"pending", "validated", "error", "ecart", "aux_empty"}:
             raise ValueError(f"Statut invalide: {status}")
 
         query = """
@@ -561,9 +571,8 @@ class LogmailRepository(BaseRepository):
         st = str(status or "").strip().lower()
         if not st or st == "draft":
             return None
-        if st == "eccarts":
-            st = "ecart"
-        if st in {"pending", "validated", "error", "ecart"}:
+        st = self._normalize_processing_status(st, default="")
+        if st in {"pending", "validated", "error", "ecart", "aux_empty"}:
             return st
         return None
 
@@ -576,9 +585,8 @@ class LogmailRepository(BaseRepository):
         st = str(status or "").strip().lower()
         if st in {"", "draft"}:
             return "pending"
-        if st == "eccarts":
-            st = "ecart"
-        if st in {"pending", "validated", "error", "ecart"}:
+        st = self._normalize_processing_status(st, default="")
+        if st in {"pending", "validated", "error", "ecart", "aux_empty"}:
             return st
         return "pending"
 
@@ -1072,7 +1080,8 @@ class LogmailRepository(BaseRepository):
         déjà limitées/chargées dans l'UI).
         """
         status = str(status or "pending").strip().lower()
-        if status not in {"pending", "validated", "error", "ecart"}:
+        status = self._normalize_processing_status(status)
+        if status not in {"pending", "validated", "error", "ecart", "aux_empty"}:
             status = "pending"
 
         normalized_search = str(search_query or "").strip()
@@ -1180,7 +1189,8 @@ class LogmailRepository(BaseRepository):
         sur les groupes déjà dédoublonnés par entry_id.
         """
         status = str(status or "pending").strip().lower()
-        if status not in {"pending", "validated", "error", "ecart"}:
+        status = self._normalize_processing_status(status)
+        if status not in {"pending", "validated", "error", "ecart", "aux_empty"}:
             status = "pending"
 
         try:
@@ -1373,9 +1383,8 @@ class LogmailRepository(BaseRepository):
             return []
 
         normalized_status = str(status or "").strip().lower()
-        if normalized_status == "eccarts":
-            normalized_status = "ecart"
-        if normalized_status and normalized_status not in {"pending", "validated", "error", "ecart"}:
+        normalized_status = self._normalize_processing_status(normalized_status, default="")
+        if normalized_status and normalized_status not in {"pending", "validated", "error", "ecart", "aux_empty"}:
             normalized_status = ""
 
         rows_out: list[dict] = []
@@ -1500,11 +1509,10 @@ class LogmailRepository(BaseRepository):
         ]
 
         if status is not None:
-            normalized_status = str(status or "").strip().lower()
-            if normalized_status == "eccarts":
-                normalized_status = "ecart"
-            set_parts.append("processing_status = ?")
-            params.append(normalized_status)
+            normalized_status = self._normalize_processing_status(status, default="")
+            if normalized_status:
+                set_parts.append("processing_status = ?")
+                params.append(normalized_status)
 
         params.append(entry_id)
 

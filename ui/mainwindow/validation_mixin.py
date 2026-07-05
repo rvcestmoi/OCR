@@ -8,6 +8,56 @@ from .workers import LinkDownloadWorker, LinkPostProcessWorker, _DownloadCancele
 
 class MainWindowValidationMixin:
 
+    def _normalize_aux_empty_status(self, status: str | None) -> str:
+        st = str(status or "").strip().lower()
+        if st in {"aux_vide", "aux_vides", "auxvide", "auxvides", "aux-empty", "aux_empty"}:
+            return "aux_empty"
+        return st
+
+    def _block_validate_if_empty_aux_account(self) -> bool:
+        """Bloque la validation si le compte auxiliaire est vide ou invalide.
+
+        Règle métier : le compte auxiliaire est obligatoire et doit commencer
+        par 0. Si le champ est vide, l'utilisateur peut encore basculer la
+        facture dans le filtre "Aux Vides".
+        """
+        aux_value = ""
+        try:
+            aux_value = str(self.transporter_aux_input.text() or "").strip()
+        except Exception:
+            aux_value = ""
+
+        if aux_value and aux_value.startswith("0"):
+            return True
+
+        try:
+            self.transporter_aux_input.setStyleSheet("background-color: #fff5f5; border: 2px solid #dc3545;")
+            self.transporter_aux_input.setFocus()
+        except Exception:
+            pass
+
+        if aux_value:
+            QMessageBox.warning(
+                self,
+                "Compte auxiliaire invalide",
+                "Validation impossible : le compte auxiliaire doit commencer par 0.\n\n"
+                f"Compte saisi : {aux_value}"
+            )
+            return False
+
+        resp = QMessageBox.question(
+            self,
+            "Compte auxiliaire vide",
+            "Le compte auxiliaire est vide, voulez-vous le déplacer vers la table des comptes vides ?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+
+        if resp == QMessageBox.Yes:
+            self._mark_current_entry_as_aux_empty(reason="transporter_aux_account_empty")
+
+        return False
+
     def _get_validation_document_path(self) -> str | None:
         view_path = str(getattr(self, "view_pdf_path", "") or "").strip()
         current_path = str(getattr(self, "current_pdf_path", "") or "").strip()
@@ -40,6 +90,8 @@ class MainWindowValidationMixin:
             self.statusBar().showMessage("Aucun PDF sélectionné.", 3000)
             return
         if hasattr(self, "_warn_if_invoice_validated_locked") and self._warn_if_invoice_validated_locked("valider à nouveau"):
+            return
+        if not self._block_validate_if_empty_aux_account():
             return
         if not self._block_validate_if_missing_cmr():
             return
@@ -153,16 +205,10 @@ class MainWindowValidationMixin:
         self._last_validation_invoice_pdf_path = validation_pdf_path
         self.save_current_data(status="validated", show_message=False, pdf_path=validation_pdf_path)
 
+        # La mise à jour de XXAKun.KtoKreA/KtoKre est volontairement manuelle
+        # via le bouton 💾 près du champ Cpte a. La validation ne modifie pas
+        # silencieusement la fiche transporteur.
         aux_update_error = ""
-        kundennr_for_aux = str(getattr(self, "selected_kundennr", "") or "").strip()
-        aux_value = str(self.transporter_aux_input.text() or "").strip()
-        if kundennr_for_aux and aux_value:
-            try:
-                self.transporter_repo.update_ktoKreA(kundennr_for_aux, aux_value)
-                if hasattr(self, "_set_transporter_aux_locked"):
-                    self._set_transporter_aux_locked(True, aux_value)
-            except Exception as e:
-                aux_update_error = str(e)
 
         entry_id = str(getattr(self, "selected_invoice_entry_id", "") or "").strip()
         if entry_id:
@@ -329,7 +375,27 @@ class MainWindowValidationMixin:
             return "draft"
 
     def set_left_filter(self, mode: str):
+        mode = self._normalize_aux_empty_status(mode)
+        if mode == "auxempty":
+            mode = "aux_empty"
         self.left_filter_mode = mode
+
+        # Quand le filtre est changé par code (ex: déplacement vers Aux Vides),
+        # on coche aussi le bon bouton pour que l'interface reste cohérente.
+        try:
+            button_by_mode = {
+                "pending": getattr(self, "btn_filter_pending", None),
+                "validated": getattr(self, "btn_filter_validated", None),
+                "errors": getattr(self, "btn_filter_errors", None),
+                "error": getattr(self, "btn_filter_errors", None),
+                "ecart": getattr(self, "btn_filter_ecart", None),
+                "aux_empty": getattr(self, "btn_filter_aux_empty", None),
+            }
+            btn = button_by_mode.get(mode)
+            if btn is not None:
+                btn.setChecked(True)
+        except Exception:
+            pass
 
         current_folder = str(getattr(self, "current_folder_path", "") or "").strip()
         if current_folder and os.path.isdir(current_folder):
@@ -2033,6 +2099,43 @@ class MainWindowValidationMixin:
                 pass
 
 
+    def _mark_current_entry_as_aux_empty(self, reason: str = "transporter_aux_account_empty", extra: dict | None = None) -> None:
+        """Met l'entrée dans le listing Aux Vides + trace dans le JSON."""
+        target_pdf_path = self._get_validation_document_path()
+        try:
+            self.save_current_data(status="aux_empty", show_message=False, pdf_path=target_pdf_path)
+        except Exception:
+            pass
+
+        # Le statut est appliqué à tout le groupe entry_id, pas seulement au PDF
+        # affiché, pour que la facture apparaisse correctement dans le filtre.
+        try:
+            entry_id = str(getattr(self, "selected_invoice_entry_id", "") or "").strip()
+            if not entry_id and target_pdf_path:
+                entry_id = str(self._resolve_current_entry_id(target_pdf_path) or "").strip()
+            if entry_id:
+                self.logmail_repo.set_processing_status_for_entry(entry_id, "aux_empty")
+        except Exception:
+            pass
+
+        payload = {"aux_empty_reason": reason} if reason else {}
+        if extra:
+            payload.update(extra)
+
+        self._add_tag_to_current_json("aux_empty", extra=payload or None, pdf_path=target_pdf_path)
+
+        try:
+            self.set_left_filter("aux_empty")
+        except Exception:
+            try:
+                self.load_folder(self.current_folder_path)
+            except Exception:
+                pass
+
+        try:
+            self.statusBar().showMessage("Facture déplacée vers Aux Vides.", 2500)
+        except Exception:
+            pass
 
 
     def _mark_current_entry_as_eccarts(self, reason: str = "ht_amount_mismatch", extra: dict | None = None) -> None:

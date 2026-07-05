@@ -615,6 +615,8 @@ class MainWindowDocumentsMixin:
             sql_status = "error"
         elif mode == "ecart":
             sql_status = "ecart"
+        elif mode in {"aux_vide", "aux_vides", "auxvide", "auxvides", "aux-empty"}:
+            sql_status = "aux_empty"
         else:
             sql_status = mode
 
@@ -624,6 +626,7 @@ class MainWindowDocumentsMixin:
         max_pages_error = int(get_ui_value(settings, "max_pages_error", 50))
         max_pages_validated = int(get_ui_value(settings, "max_pages_validated", 200))
         max_pages_ecart = int(get_ui_value(settings, "max_pages_ecart", max_pages_error))
+        max_pages_aux_empty = int(get_ui_value(settings, "max_pages_aux_empty", max_pages_error))
 
         if sql_status == "pending":
             display_limit = max_pages_pending
@@ -633,6 +636,8 @@ class MainWindowDocumentsMixin:
             display_limit = max_pages_validated
         elif sql_status == "ecart":
             display_limit = max_pages_ecart
+        elif sql_status == "aux_empty":
+            display_limit = max_pages_aux_empty
         else:
             display_limit = None
 
@@ -1340,6 +1345,8 @@ class MainWindowDocumentsMixin:
             status = str(it0.data(Qt.UserRole + 1) or "pending").strip().lower()
             if status == "eccarts":
                 status = "ecart"
+            elif status in {"aux_vide", "aux_vides", "auxvide", "auxvides", "aux-empty"}:
+                status = "aux_empty"
 
             # 1) filtre statut
             if mode == "pending":
@@ -1350,6 +1357,8 @@ class MainWindowDocumentsMixin:
                 status_visible = (status == "error")
             elif mode == "ecart":
                 status_visible = (status == "ecart")
+            elif mode == "aux_empty":
+                status_visible = (status == "aux_empty")
             else:
                 status_visible = True
 

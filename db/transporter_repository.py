@@ -272,12 +272,22 @@ class TransporterRepository(BaseRepository):
 
 
     def update_ktoKreA(self, kundennr: str, konto_aux: str):
+        """Met à jour le compte auxiliaire transporteur.
+
+        Règle métier ED-TRANS :
+        - KtoKreA reçoit le compte auxiliaire saisi ;
+        - KtoKre reçoit le KundenNr du transporteur.
+        """
         query = """
             UPDATE XXAKun
-            SET KtoKreA = ?, KtoKre = 4
+            SET KtoKreA = ?, KtoKre = ?
             WHERE KundenNr = ?
         """
-        self.execute(query, (konto_aux, kundennr))
+        try:
+            return self.execute_rowcount(query, (konto_aux, kundennr, kundennr))
+        except AttributeError:
+            self.execute(query, (konto_aux, kundennr, kundennr))
+            return 0
 
 
     def get_lkz_by_kundennr(self, kundennr: str) -> str:

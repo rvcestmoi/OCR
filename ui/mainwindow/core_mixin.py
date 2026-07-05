@@ -926,7 +926,11 @@ class MainWindowCoreMixin:
             if pdf_path:
                 data = self._read_saved_invoice_json(pdf_path) or {}
                 json_status = str(data.get("status") or "").strip().lower()
-                if json_status in {"pending", "validated", "error", "ecart"}:
+                if json_status == "eccarts":
+                    json_status = "ecart"
+                elif json_status in {"aux_vide", "aux_vides", "auxvide", "auxvides", "aux-empty"}:
+                    json_status = "aux_empty"
+                if json_status in {"pending", "validated", "error", "ecart", "aux_empty"}:
                     return json_status
         except Exception:
             pass
@@ -935,12 +939,18 @@ class MainWindowCoreMixin:
             entry_id = str(self._resolve_current_entry_id() or "").strip()
             if entry_id:
                 sql_status = str(self.logmail_repo.get_processing_status_for_entry(entry_id) or "").strip().lower()
-                if sql_status in {"pending", "validated", "error", "ecart"}:
+                if sql_status in {"aux_vide", "aux_vides", "auxvide", "auxvides", "aux-empty"}:
+                    sql_status = "aux_empty"
+                if sql_status in {"pending", "validated", "error", "ecart", "aux_empty"}:
                     return sql_status
         except Exception:
             pass
 
-        return status if status in {"pending", "validated", "error", "ecart"} else "pending"
+        if status == "eccarts":
+            status = "ecart"
+        elif status in {"aux_vide", "aux_vides", "auxvide", "auxvides", "aux-empty"}:
+            status = "aux_empty"
+        return status if status in {"pending", "validated", "error", "ecart", "aux_empty"} else "pending"
 
     def _parse_invoice_date_strict(self, value: str):
         """Retourne (date_obj, date_normalisee) si la date facture est réellement valide.
@@ -1050,7 +1060,7 @@ class MainWindowCoreMixin:
         Pour verrouiller une facture validée, la BDD doit primer sur un JSON
         éventuellement ancien ou localement modifié.
         """
-        allowed = {"pending", "validated", "error", "ecart", "eccarts", "draft"}
+        allowed = {"pending", "validated", "error", "ecart", "eccarts", "draft", "aux_empty", "aux_vide", "aux_vides", "auxvide", "auxvides", "aux-empty"}
         status = str(default or "pending").strip().lower()
 
         try:
@@ -1065,6 +1075,8 @@ class MainWindowCoreMixin:
                 sql_status = str(self.logmail_repo.get_processing_status_for_entry(entry_id) or "").strip().lower()
                 if sql_status == "eccarts":
                     sql_status = "ecart"
+                elif sql_status in {"aux_vide", "aux_vides", "auxvide", "auxvides", "aux-empty"}:
+                    sql_status = "aux_empty"
                 if sql_status in allowed:
                     return sql_status
         except Exception:
@@ -1077,6 +1089,8 @@ class MainWindowCoreMixin:
                 json_status = str(data.get("status") or "").strip().lower()
                 if json_status == "eccarts":
                     json_status = "ecart"
+                elif json_status in {"aux_vide", "aux_vides", "auxvide", "auxvides", "aux-empty"}:
+                    json_status = "aux_empty"
                 if json_status in allowed:
                     return json_status
         except Exception:
@@ -1084,6 +1098,8 @@ class MainWindowCoreMixin:
 
         if status == "eccarts":
             status = "ecart"
+        elif status in {"aux_vide", "aux_vides", "auxvide", "auxvides", "aux-empty"}:
+            status = "aux_empty"
         return status if status in allowed else "pending"
 
     def _is_invoice_already_validated(self, pdf_path: str | None = None, entry_id: str | None = None) -> bool:
@@ -1903,6 +1919,8 @@ class MainWindowCoreMixin:
         requested_status = str(status or "draft").strip().lower()
         if requested_status == "eccarts":
             requested_status = "ecart"
+        elif requested_status in {"aux_vide", "aux_vides", "auxvide", "auxvides", "aux-empty"}:
+            requested_status = "aux_empty"
 
         if self._warn_if_invoice_validated_locked("sauvegarder/modifier", pdf_path=pdf_path):
             return False

@@ -48,7 +48,35 @@ class MainWindowTransportTablesMixin:
         dossier_le.setToolTip("")
         return False
 
-    def _set_transporter_aux_locked(self, locked: bool, value: str = ""):
+    def _is_valid_transporter_aux_account(self, value: str) -> bool:
+        return bool(str(value or "").strip().startswith("0"))
+
+    def _set_transporter_aux_db_update_allowed(self, allowed: bool) -> None:
+        self._transporter_aux_db_update_allowed = bool(allowed)
+        self._update_transporter_aux_db_button_state()
+
+    def _update_transporter_aux_db_button_state(self, *args) -> None:
+        btn = getattr(self, "btn_transporter_aux_save", None)
+        if btn is None:
+            return
+
+        allowed = bool(getattr(self, "_transporter_aux_db_update_allowed", False))
+        kundennr = str(getattr(self, "selected_kundennr", "") or "").strip()
+        value = str(getattr(self, "transporter_aux_input", None).text() if getattr(self, "transporter_aux_input", None) else "" or "").strip()
+
+        btn.setEnabled(bool(allowed and kundennr))
+        if not kundennr:
+            btn.setToolTip("Impossible de mettre à jour : transporteur non déterminé.")
+        elif not allowed:
+            btn.setToolTip("Mise à jour BDD non nécessaire : le compte auxiliaire BDD est déjà renseigné et commence par 0.")
+        elif not value:
+            btn.setToolTip("Saisis un compte auxiliaire commençant par 0 avant la mise à jour BDD.")
+        elif not self._is_valid_transporter_aux_account(value):
+            btn.setToolTip("Le compte saisi ne commence pas par 0 : il sera refusé à la validation.")
+        else:
+            btn.setToolTip("Mettre à jour XXAKun.KtoKreA avec ce compte et XXAKun.KtoKre avec le KundenNr.")
+
+    def _set_transporter_aux_locked(self, locked: bool, value: str = "", allow_db_update: bool | None = None):
         self._transporter_aux_locked = bool(locked)
         self.transporter_aux_input.blockSignals(True)
         self.transporter_aux_input.setText(str(value or "").strip())
@@ -56,7 +84,12 @@ class MainWindowTransportTablesMixin:
         self.transporter_aux_input.setFocusPolicy(Qt.NoFocus if locked else Qt.StrongFocus)
         self.transporter_aux_input.setClearButtonEnabled(not locked)
         self.transporter_aux_input.blockSignals(False)
+        if allow_db_update is not None:
+            self._transporter_aux_db_update_allowed = bool(allow_db_update)
+        elif bool(locked):
+            self._transporter_aux_db_update_allowed = False
         self._refresh_transporter_aux_style()
+        self._update_transporter_aux_db_button_state()
 
     def _refresh_transporter_aux_style(self):
         locked = bool(getattr(self, "_transporter_aux_locked", True))
@@ -70,6 +103,134 @@ class MainWindowTransportTablesMixin:
             extra = "border: 2px solid #dc3545;"
 
         self.transporter_aux_input.setStyleSheet(f"background-color: {bg}; {extra}")
+
+    def _resolve_kundennr_for_aux_refresh(self) -> tuple[str, str]:
+        """Retourne le KundenNr transporteur courant pour actualiser le compte auxiliaire."""
+        kundennr = str(getattr(self, "selected_kundennr", "") or "").strip()
+        if kundennr:
+            return kundennr, ""
+
+        try:
+            kundennr, source_tour_nr, err = self._resolve_transporter_from_first_folder()
+            if err:
+                return "", err
+            if not kundennr:
+                if source_tour_nr:
+                    return "", f"Aucun KundenNr transporteur trouvé sur le dossier {source_tour_nr}."
+                return "", "Aucun transporteur déterminé : renseigne d'abord un dossier."
+            self.selected_kundennr = kundennr
+            self.transporter_selected_mode = True
+            return kundennr, ""
+        except Exception as e:
+            return "", str(e)
+
+    def on_refresh_transporter_aux_clicked(self):
+        """Relit XXAKun.KtoKreA en BDD pour le transporteur courant."""
+        kundennr, err = self._resolve_kundennr_for_aux_refresh()
+        if err or not kundennr:
+            QMessageBox.information(
+                self,
+                "Actualisation compte auxiliaire",
+                err or "Impossible de déterminer le transporteur courant."
+            )
+            return
+
+        try:
+            aux_row = self.transporter_repo.get_ktoKreA_by_kundennr(kundennr)
+            db_aux = str((aux_row or {}).get("KtoKreA") or "").strip()
+
+            # La BDD est la source de vérité pour cette actualisation manuelle.
+            self._pending_saved_transporter_aux = ""
+            self._pending_saved_transporter_aux_kundennr = ""
+
+            if db_aux and self._is_valid_transporter_aux_account(db_aux):
+                self._set_transporter_aux_locked(True, db_aux, allow_db_update=False)
+                msg = f"Compte auxiliaire actualisé depuis la BDD pour le transporteur {kundennr} : {db_aux}."
+            else:
+                # Si la BDD est vide ou invalide, on laisse le champ modifiable
+                # et le bouton 💾 permet de corriger XXAKun.
+                self._set_transporter_aux_locked(False, db_aux, allow_db_update=True)
+                if db_aux:
+                    msg = f"Compte auxiliaire BDD invalide pour le transporteur {kundennr} : {db_aux}. Corrige puis clique sur 💾."
+                else:
+                    msg = f"Aucun compte auxiliaire renseigné en BDD pour le transporteur {kundennr}. Saisis le compte puis clique sur 💾."
+
+            if hasattr(self, "statusBar"):
+                self.statusBar().showMessage(msg, 5000)
+
+        except Exception as e:
+            QMessageBox.warning(
+                self,
+                "Actualisation compte auxiliaire",
+                "Erreur pendant la relecture du compte auxiliaire en base :\n" + str(e)
+            )
+
+    def on_save_transporter_aux_to_db_clicked(self):
+        """Met à jour XXAKun.KtoKreA/KtoKre pour le transporteur courant."""
+        kundennr, err = self._resolve_kundennr_for_aux_refresh()
+        if err or not kundennr:
+            QMessageBox.information(
+                self,
+                "Mise à jour compte auxiliaire",
+                err or "Impossible de déterminer le transporteur courant."
+            )
+            return
+
+        aux_value = str(self.transporter_aux_input.text() or "").strip()
+        if not aux_value:
+            QMessageBox.warning(
+                self,
+                "Mise à jour compte auxiliaire",
+                "Le compte auxiliaire est vide. Saisis un compte commençant par 0 avant de mettre à jour la base."
+            )
+            self.transporter_aux_input.setFocus()
+            return
+
+        if not self._is_valid_transporter_aux_account(aux_value):
+            QMessageBox.warning(
+                self,
+                "Mise à jour compte auxiliaire",
+                "Le compte auxiliaire doit commencer par 0 avant d'être enregistré en base."
+            )
+            self.transporter_aux_input.setFocus()
+            return
+
+        resp = QMessageBox.question(
+            self,
+            "Mise à jour compte auxiliaire",
+            f"Mettre à jour le transporteur {kundennr} ?\n\n"
+            f"KtoKreA = {aux_value}\n"
+            f"KtoKre  = {kundennr}",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if resp != QMessageBox.Yes:
+            return
+
+        try:
+            rowcount = self.transporter_repo.update_ktoKreA(kundennr, aux_value)
+            if rowcount == 0:
+                QMessageBox.warning(
+                    self,
+                    "Mise à jour compte auxiliaire",
+                    f"Aucune ligne XXAKun mise à jour pour le transporteur {kundennr}."
+                )
+                return
+
+            self._set_transporter_aux_locked(True, aux_value, allow_db_update=False)
+            self._pending_saved_transporter_aux = ""
+            self._pending_saved_transporter_aux_kundennr = ""
+            if hasattr(self, "statusBar"):
+                self.statusBar().showMessage(
+                    f"Compte auxiliaire mis à jour en BDD pour le transporteur {kundennr}.",
+                    5000
+                )
+        except Exception as e:
+            QMessageBox.warning(
+                self,
+                "Mise à jour compte auxiliaire",
+                "Erreur pendant la mise à jour XXAKun :\n" + str(e)
+            )
 
     def _normalize_iban_for_compare(self, value: str) -> str:
         return (
@@ -541,11 +702,13 @@ class MainWindowTransportTablesMixin:
             pending_aux_kundennr = str(getattr(self, "_pending_saved_transporter_aux_kundennr", "") or "").strip()
             pending_aux_value = str(getattr(self, "_pending_saved_transporter_aux", "") or "").strip()
 
-            if db_aux:
-                self._set_transporter_aux_locked(True, db_aux)
+            if db_aux and self._is_valid_transporter_aux_account(db_aux):
+                self._set_transporter_aux_locked(True, db_aux, allow_db_update=False)
             else:
-                candidate_aux = pending_aux_value if pending_aux_kundennr == kundennr else ""
-                self._set_transporter_aux_locked(False, candidate_aux)
+                candidate_aux = db_aux or (pending_aux_value if pending_aux_kundennr == kundennr else "")
+                # Valeur BDD vide ou ne commençant pas par 0 : on laisse modifiable
+                # pour correction, et le bouton 💾 devient disponible.
+                self._set_transporter_aux_locked(False, candidate_aux, allow_db_update=True)
 
             transporter_name = str(transporter.get("name1", "") or "").strip()
             if transporter_name and kundennr:
