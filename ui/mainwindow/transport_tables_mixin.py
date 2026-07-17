@@ -32,8 +32,38 @@ class MainWindowTransportTablesMixin:
         except Exception as e:
             return False, str(e)
 
+    def _is_tour_already_in_printed_shipments(self, tour_nr: str, kunden_nr: str | None = None) -> tuple[bool, str]:
+        """Retourne si le dossier existe déjà dans XXAV_InvC_PrintedShipments.
+
+        Cette vérification dépend du transporteur courant :
+        TourNr = numéro de dossier, FANr = KundenNr transporteur, AufDK = 'K'.
+        """
+        tour_nr = str(tour_nr or "").strip()
+        kunden_nr = str(kunden_nr or getattr(self, "selected_kundennr", "") or "").strip()
+        if not tour_nr or not kunden_nr:
+            return False, ""
+
+        cache = getattr(self, "_printed_shipment_tour_exists_cache", None)
+        if cache is None:
+            cache = {}
+            self._printed_shipment_tour_exists_cache = cache
+
+        key = (tour_nr, kunden_nr)
+        if key in cache:
+            return bool(cache[key]), ""
+
+        try:
+            exists = bool(self.lisinvoice_repo.printed_shipment_exists(tour_nr, kunden_nr))
+            cache[key] = exists
+            return exists, ""
+        except Exception as e:
+            return False, str(e)
+
     def _apply_tour_invoicing_style(self, dossier_le: QLineEdit, tour_nr: str) -> bool:
-        """Affiche le n° de dossier en rouge s'il est déjà en facturation."""
+        """Affiche le n° de dossier en rouge s'il est déjà dans LISINVOICE_EDTRANS,
+        ou en orange s'il existe déjà dans XXAV_InvC_PrintedShipments pour le
+        transporteur courant.
+        """
         already_invoiced, err = self._is_tour_already_in_lisinvoice(tour_nr)
 
         if err:
@@ -41,9 +71,23 @@ class MainWindowTransportTablesMixin:
             return False
 
         if already_invoiced:
-            dossier_le.setStyleSheet("color:#dc3545;")
+            dossier_le.setStyleSheet("color:#dc3545; font-weight:bold;")
             dossier_le.setToolTip("Le dossier est déjà en facturation (LISINVOICE_EDTRANS).")
             return True
+
+        kunden_nr = str(getattr(self, "selected_kundennr", "") or "").strip()
+        already_printed, printed_err = self._is_tour_already_in_printed_shipments(tour_nr, kunden_nr)
+        if printed_err:
+            dossier_le.setToolTip(f"Erreur contrôle factures imprimées XXAV_InvC_PrintedShipments : {printed_err}")
+            return False
+
+        if already_printed:
+            dossier_le.setStyleSheet("color:#fd7e14; font-weight:bold;")
+            dossier_le.setToolTip(
+                "Le dossier existe déjà dans XXAV_InvC_PrintedShipments "
+                f"pour le transporteur {kunden_nr} (FANr={kunden_nr}, AufDK='K')."
+            )
+            return False
 
         dossier_le.setToolTip("")
         return False
@@ -611,6 +655,13 @@ class MainWindowTransportTablesMixin:
 
     def _refresh_transporter_from_first_folder(self):
         self.load_transporter_information(force_by_kundennr=False)
+        # Le contrôle orange XXAV_InvC_PrintedShipments dépend du KundenNr du
+        # transporteur. Quand le premier dossier change, on doit donc recalculer
+        # toutes les lignes après résolution du transporteur.
+        try:
+            self._refresh_all_folder_row_statuses()
+        except Exception:
+            pass
 
     def load_transporter_information(self, force_by_kundennr: bool = False):
         """Charge le transporteur depuis le premier dossier uniquement.
@@ -693,6 +744,10 @@ class MainWindowTransportTablesMixin:
                     )
                 try:
                     self.update_transporter_vs_dossiers_status()
+                except Exception:
+                    pass
+                try:
+                    self._refresh_all_folder_row_statuses()
                 except Exception:
                     pass
                 return
@@ -782,6 +837,14 @@ class MainWindowTransportTablesMixin:
 
             try:
                 self.update_transporter_vs_dossiers_status()
+            except Exception:
+                pass
+
+            # Recalcule immédiatement le rouge/orange des dossiers une fois le
+            # KundenNr transporteur connu. Sans ça, le orange n'apparaissait
+            # qu'après modification d'un champ.
+            try:
+                self._refresh_all_folder_row_statuses()
             except Exception:
                 pass
 
@@ -1205,6 +1268,8 @@ class MainWindowTransportTablesMixin:
             self._europal_cache = {}
         if not hasattr(self, "_lisinvoice_tour_exists_cache") or self._lisinvoice_tour_exists_cache is None:
             self._lisinvoice_tour_exists_cache = {}
+        if not hasattr(self, "_printed_shipment_tour_exists_cache") or self._printed_shipment_tour_exists_cache is None:
+            self._printed_shipment_tour_exists_cache = {}
 
         missing_kosten = [t for t in tours if t not in self._kosten_cache]
         if missing_kosten:
@@ -1254,6 +1319,21 @@ class MainWindowTransportTablesMixin:
                         self._lisinvoice_tour_exists_cache[t] = t in existing
             except Exception:
                 pass
+
+        kunden_nr = str(getattr(self, "selected_kundennr", "") or "").strip()
+        if kunden_nr:
+            missing_printed = [
+                t for t in tours
+                if (t, kunden_nr) not in self._printed_shipment_tour_exists_cache
+            ]
+            if missing_printed:
+                try:
+                    if hasattr(self.lisinvoice_repo, "get_existing_printed_shipment_tournrs"):
+                        existing_printed = self.lisinvoice_repo.get_existing_printed_shipment_tournrs(missing_printed, kunden_nr) or set()
+                        for t in missing_printed:
+                            self._printed_shipment_tour_exists_cache[(t, kunden_nr)] = t in existing_printed
+                except Exception:
+                    pass
 
         try:
             self._prepare_cmr_status_cache(tours)

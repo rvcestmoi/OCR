@@ -680,6 +680,16 @@ class MainWindowCoreMixin:
             self.check_bank_information()
         self.load_transporter_information(force_by_kundennr=False)
 
+        # Important : le contrôle orange XXAV_InvC_PrintedShipments dépend du
+        # KundenNr transporteur. Au premier chargement, les lignes dossiers sont
+        # créées avant que le transporteur soit résolu, donc on repasse les
+        # statuts juste après le chargement du transporteur.
+        try:
+            if hasattr(self, "_refresh_all_folder_row_statuses"):
+                self._refresh_all_folder_row_statuses()
+        except Exception:
+            pass
+
         # Charger l'expéditeur depuis logmail
         entry_id = getattr(self, "selected_invoice_entry_id", None)
         if entry_id:

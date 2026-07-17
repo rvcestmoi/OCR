@@ -37,6 +37,10 @@ DEFAULT_SETTINGS = {
         "max_pages_validated": 200,
         "show_rebuild_search_index_button": False,
         "enable_manual_dms_reexport_shortcut": False,
+        "background_ocr_enabled": False,
+        "background_ocr_stop_time": "06:00",
+        "background_ocr_batch_size": 200,
+        "background_ocr_hide_window": True,
     },
     "vat": {
         "allowed_rates": [0, 20]

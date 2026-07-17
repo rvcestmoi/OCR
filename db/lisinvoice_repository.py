@@ -119,16 +119,55 @@ class LISInvoiceRepository(BaseRepository):
         row = self.fetch_one(sql, (tour_nr,))
         return row is not None
 
-    def row_exists(self, rech_nr: str, kunden_nr, tour_nr: str) -> bool:
+
+    def printed_shipment_exists(self, tour_nr: str, kunden_nr) -> bool:
+        """Retourne si la tournée existe déjà côté factures imprimées WinSped.
+
+        Contrôle demandé en plus de LISINVOICE_EDTRANS :
+        XXAV_InvC_PrintedShipments où TourNr = dossier, FANr = KundenNr transporteur, AufDK = 'K'.
+        """
+        tour_nr = str(tour_nr or "").strip()
+        kunden_nr = str(kunden_nr or "").strip()
+        if not tour_nr or not kunden_nr:
+            return False
+
         sql = """
             SELECT TOP 1 1 AS ok
-            FROM dbo.LISINVOICE_EDTRANS
-            WHERE RechNr = ?
-              AND KundenNr = ?
-              AND TourNr = ?
+            FROM dbo.XXAV_InvC_PrintedShipments
+            WHERE LTRIM(RTRIM(CAST(TourNr AS VARCHAR(20)))) = ?
+              AND LTRIM(RTRIM(CAST(FANr AS VARCHAR(20)))) = ?
+              AND AufDK = 'K'
         """
-        row = self.fetch_one(sql, (rech_nr, kunden_nr, tour_nr))
+        row = self.fetch_one(sql, (tour_nr, kunden_nr))
         return row is not None
+
+    def get_existing_printed_shipment_tournrs(self, tour_numbers: list[str], kunden_nr) -> set[str]:
+        """Retourne les TourNr déjà présents dans XXAV_InvC_PrintedShipments
+        pour le KundenNr transporteur donné.
+        """
+        kunden_nr = str(kunden_nr or "").strip()
+        tour_numbers = [str(t).strip() for t in (tour_numbers or []) if str(t).strip()]
+        if not kunden_nr or not tour_numbers:
+            return set()
+
+        out: set[str] = set()
+        chunk_size = 200
+        for i in range(0, len(tour_numbers), chunk_size):
+            chunk = tour_numbers[i:i + chunk_size]
+            placeholders = ",".join(["?"] * len(chunk))
+            sql = f"""
+                SELECT DISTINCT LTRIM(RTRIM(CAST(TourNr AS VARCHAR(20)))) AS TourNr
+                FROM dbo.XXAV_InvC_PrintedShipments
+                WHERE LTRIM(RTRIM(CAST(TourNr AS VARCHAR(20)))) IN ({placeholders})
+                  AND LTRIM(RTRIM(CAST(FANr AS VARCHAR(20)))) = ?
+                  AND AufDK = 'K'
+            """
+            rows = self.fetch_all(sql, tuple(chunk) + (kunden_nr,)) or []
+            for r in rows:
+                t = str(r.get("TourNr") or r.get("tournr") or "").strip()
+                if t:
+                    out.add(t)
+        return out
 
     def get_existing_tournrs(self, tour_numbers: list[str]) -> set[str]:
         """Retourne les TourNr déjà présents dans LISINVOICE_EDTRANS en batch.
