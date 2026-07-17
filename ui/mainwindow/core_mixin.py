@@ -1,6 +1,7 @@
 from __future__ import annotations
 import fitz
 import pytesseract
+from datetime import timedelta
 from .common import *
 from .workers import LinkDownloadWorker, LinkPostProcessWorker, _DownloadCanceled
 from ocr.invoice_parser import normalize_date_format
@@ -8,6 +9,226 @@ from ocr.supplier_model import validate_iban, validate_bic
 
 
 class MainWindowCoreMixin:
+
+    def _is_background_ocr_mode(self) -> bool:
+        return bool(getattr(self, "_background_ocr_mode", False))
+
+    def _init_background_ocr_deadline(self):
+        """Calcule l'heure d'arrêt du mode arrière-plan.
+
+        Si le logiciel est lancé avant 06h00, l'arrêt est aujourd'hui à 06h00.
+        S'il est lancé après 06h00, l'arrêt est le lendemain à 06h00.
+        """
+        try:
+            from app.settings import load_settings, get_ui_value
+            stop_txt = str(get_ui_value(load_settings(), "background_ocr_stop_time", "06:00") or "06:00").strip()
+        except Exception:
+            stop_txt = "06:00"
+
+        m = re.match(r"^\s*(\d{1,2})[:hH](\d{2})\s*$", stop_txt)
+        if m:
+            hh = max(0, min(23, int(m.group(1))))
+            mm = max(0, min(59, int(m.group(2))))
+        else:
+            hh, mm = 6, 0
+
+        now = datetime.now()
+        deadline = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
+        if deadline <= now:
+            deadline = deadline + timedelta(days=1)
+        self._background_ocr_deadline = deadline
+        return deadline
+
+    def _background_ocr_should_stop(self) -> bool:
+        deadline = getattr(self, "_background_ocr_deadline", None)
+        if deadline is None:
+            deadline = self._init_background_ocr_deadline()
+        try:
+            return datetime.now() >= deadline
+        except Exception:
+            return False
+
+    def _background_log(self, message: str) -> None:
+        try:
+            print(f"[OCR BACKGROUND] {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} - {message}", flush=True)
+        except Exception:
+            pass
+        try:
+            self.statusBar().showMessage(str(message or ""), 5000)
+        except Exception:
+            pass
+
+    def start_background_ocr_mode(self):
+        """Lance le traitement OCR en arrière-plan.
+
+        Ce mode reprend la logique du bouton OCRiser, mais :
+        - lit toutes les entrées SQL pending sans limite max_pages_pending ;
+        - ne montre pas les popups d'erreur OCR profond ;
+        - s'arrête automatiquement à l'heure configurée, 06:00 par défaut.
+        """
+        if getattr(self, "_background_ocr_running", False):
+            return
+        self._background_ocr_mode = True
+        self._background_ocr_running = True
+        deadline = self._init_background_ocr_deadline()
+        self._background_log(f"Démarrage OCR arrière-plan. Arrêt prévu : {deadline.strftime('%d/%m/%Y %H:%M')}.")
+        QTimer.singleShot(0, self._run_background_ocr_loop)
+
+    def _background_ocr_get_batch_size(self) -> int:
+        try:
+            from app.settings import load_settings, get_ui_value
+            return max(1, int(get_ui_value(load_settings(), "background_ocr_batch_size", 200) or 200))
+        except Exception:
+            return 200
+
+    def _background_ocr_resolve_document_path(self, row: dict) -> tuple[str, list[str]]:
+        folder = str(getattr(self, "current_folder_path", None) or getattr(self, "DEFAULT_PDF_FOLDER", "") or "").strip()
+        if not folder:
+            return "", []
+
+        entry_id = str((row or {}).get("entry_id") or "").strip()
+        stored_filename = str((row or {}).get("nom_pdf") or "").strip()
+
+        candidate_names: list[str] = []
+        if stored_filename:
+            candidate_names.append(stored_filename)
+
+        if entry_id:
+            try:
+                for f in (self.logmail_repo.get_files_for_entry(entry_id) or []):
+                    name = str((f or {}).get("nom_pdf") or "").strip()
+                    if name and name not in candidate_names:
+                        candidate_names.append(name)
+            except Exception:
+                pass
+
+        group_paths: list[str] = []
+        for name in candidate_names:
+            path = os.path.join(folder, name)
+            if not os.path.exists(path):
+                continue
+            try:
+                if not is_supported_document(path):
+                    continue
+            except Exception:
+                continue
+            if path not in group_paths:
+                group_paths.append(path)
+
+        if not group_paths:
+            return "", []
+
+        chosen = group_paths[0]
+        try:
+            if hasattr(self, "_choose_representative_pdf"):
+                candidate = str(self._choose_representative_pdf(group_paths) or "").strip()
+                if candidate and os.path.exists(candidate):
+                    chosen = candidate
+        except Exception:
+            pass
+
+        return chosen, group_paths
+
+    def _background_ocr_prepare_document_context(self, pdf_path: str, group_paths: list[str], row: dict) -> None:
+        self.current_pdf_path = pdf_path
+        self.view_pdf_path = pdf_path
+        self.entry_pdf_paths = list(group_paths or [pdf_path])
+        try:
+            self.current_doc_index = self.entry_pdf_paths.index(pdf_path)
+        except Exception:
+            self.current_doc_index = 0
+        self.selected_invoice_entry_id = str((row or {}).get("entry_id") or "").strip() or None
+        self.selected_invoice_filename = os.path.basename(str(pdf_path or ""))
+
+    def _background_ocr_process_one(self, pdf_path: str, group_paths: list[str], row: dict) -> bool:
+        if not pdf_path or not os.path.exists(pdf_path):
+            return False
+        if not is_ocr_allowed_document(pdf_path):
+            return False
+        if self._has_saved_json_for_pdf(pdf_path):
+            return False
+
+        self._background_ocr_prepare_document_context(pdf_path, group_paths, row)
+        self.clear_fields()
+        QApplication.processEvents()
+
+        self.analyze_pdf(show_message=False, document_path=pdf_path, auto_save=False)
+        if self._background_ocr_should_stop():
+            raise _DownloadCanceled()
+
+        ok = self.save_current_data(status="pending", show_message=False, pdf_path=pdf_path)
+        if ok:
+            try:
+                self._set_left_row_status(pdf_path, "pending")
+            except Exception:
+                pass
+        return bool(ok)
+
+    def _run_background_ocr_loop(self):
+        previous_pdf = getattr(self, "current_pdf_path", None)
+        processed = skipped = errors = 0
+        offset = 0
+        fetch = self._background_ocr_get_batch_size()
+        folder = str(getattr(self, "DEFAULT_PDF_FOLDER", "") or "").strip()
+        if folder:
+            self.current_folder_path = folder
+
+        try:
+            while not self._background_ocr_should_stop():
+                rows = self.logmail_repo.get_document_rows_for_folder_page(
+                    folder,
+                    "pending",
+                    offset=offset,
+                    fetch=fetch,
+                    search_query=None,
+                    date_mail_from=None,
+                    date_mail_to=None,
+                ) or []
+                if not rows:
+                    break
+                offset += len(rows)
+
+                for row in rows:
+                    if self._background_ocr_should_stop():
+                        raise _DownloadCanceled()
+                    try:
+                        pdf_path, group_paths = self._background_ocr_resolve_document_path(row)
+                        if not pdf_path:
+                            skipped += 1
+                            continue
+                        self._background_log(f"OCR : {os.path.basename(pdf_path)}")
+                        if self._background_ocr_process_one(pdf_path, group_paths, row):
+                            processed += 1
+                        else:
+                            skipped += 1
+                    except _DownloadCanceled:
+                        raise
+                    except Exception as e:
+                        errors += 1
+                        try:
+                            pdf_path = locals().get("pdf_path") or ""
+                            if pdf_path:
+                                self._set_left_row_status(pdf_path, "error")
+                        except Exception:
+                            pass
+                        self._background_log(f"Erreur OCR sur {locals().get('pdf_path', '')}: {e}")
+                    QApplication.processEvents()
+
+                if len(rows) < fetch:
+                    break
+
+            if self._background_ocr_should_stop():
+                self._background_log("Arrêt automatique à l'heure limite.")
+        except _DownloadCanceled:
+            self._background_log("Arrêt automatique à l'heure limite.")
+        finally:
+            self.current_pdf_path = previous_pdf
+            self._background_ocr_running = False
+            self._background_log(f"OCR arrière-plan terminé. Traités={processed}, ignorés={skipped}, erreurs={errors}.")
+            try:
+                QApplication.quit()
+            except Exception:
+                pass
 
     def _bind_active_field_click(self, field):
         """Rend un champ actif au clic sans casser le comportement natif Qt.
@@ -831,19 +1052,26 @@ class MainWindowCoreMixin:
     def analyze_pdf(self, checked: bool = False, show_message: bool = False, document_path: str | None = None, auto_save: bool = True):
 
         active_doc_path = self._get_active_document_path(document_path)
+        silent = bool(getattr(self, "_background_ocr_mode", False))
         if not active_doc_path:
-            QMessageBox.warning(self, "Analyse OCR", "Aucun document sélectionné.")
+            if not silent:
+                QMessageBox.warning(self, "Analyse OCR", "Aucun document sélectionné.")
+            else:
+                self._background_log("OCR ignoré : aucun document sélectionné.")
             return
 
         if self._warn_if_invoice_validated_locked("relancer l'OCR", pdf_path=active_doc_path):
             return
 
         if not is_ocr_allowed_document(active_doc_path):
-            QMessageBox.information(
-                self,
-                "Analyse OCR",
-                "Ce document est une image. Il peut être affiché dans l'application, mais il n'est pas OCRisé."
-            )
+            if not silent:
+                QMessageBox.information(
+                    self,
+                    "Analyse OCR",
+                    "Ce document est une image. Il peut être affiché dans l'application, mais il n'est pas OCRisé."
+                )
+            else:
+                self._background_log(f"OCR ignoré : format non OCRisable ({os.path.basename(active_doc_path)}).")
             return
         try:
             # 1) prélecture rapide : première page uniquement
@@ -907,16 +1135,21 @@ class MainWindowCoreMixin:
             if not final_iban or not validate_iban(final_iban) or not final_bic or not validate_bic(final_bic):
                 self.statusBar().showMessage("OCR normal terminé, lancement OCR profond...", 2000)
                 QApplication.processEvents()
-                self.analyze_pdf_deep(document_path=document_path, auto_save=False)
+                self.analyze_pdf_deep(document_path=document_path, auto_save=False, silent_errors=silent)
 
             if auto_save:
                 self._auto_save_after_ocr(pdf_path=active_doc_path)
             else:
                 self.statusBar().showMessage("OCR terminé.", 3000)
+        except _DownloadCanceled:
+            raise
         except Exception as e:
-            QMessageBox.critical(self, "Erreur OCR", str(e))
-        if show_message:
-            QMessageBox.information(...)
+            if silent:
+                self._background_log(f"Erreur OCR : {e}")
+            else:
+                QMessageBox.critical(self, "Erreur OCR", str(e))
+        if show_message and not silent:
+            QMessageBox.information(self, "OCR", "OCR terminé.")
 
     def _get_existing_status_for_current_pdf(self, default: str = "pending", pdf_path: str | None = None) -> str:
         status = str(default or "pending").strip().lower()
@@ -1109,12 +1342,13 @@ class MainWindowCoreMixin:
         if not self._is_invoice_already_validated(pdf_path=pdf_path):
             return False
 
-        QMessageBox.warning(
-            self,
-            "Facture déjà validée",
-            "Cette facture est déjà validée et ne peut plus être modifiée.\n\n"
-            f"Action refusée : {action}."
-        )
+        if not getattr(self, "_background_ocr_mode", False):
+            QMessageBox.warning(
+                self,
+                "Facture déjà validée",
+                "Cette facture est déjà validée et ne peut plus être modifiée.\n\n"
+                f"Action refusée : {action}."
+            )
         try:
             self.statusBar().showMessage("Facture déjà validée : modification refusée.", 5000)
         except Exception:
@@ -1213,10 +1447,14 @@ class MainWindowCoreMixin:
         dlg.setAutoReset(False)
         dlg.setValue(0)
         return dlg
-    def analyze_pdf_deep(self, checked: bool = False, document_path: str | None = None, auto_save: bool = True):
+    def analyze_pdf_deep(self, checked: bool = False, document_path: str | None = None, auto_save: bool = True, silent_errors: bool = False):
         active_doc_path = self._get_active_document_path(document_path)
+        silent = bool(silent_errors or getattr(self, "_background_ocr_mode", False))
         if not active_doc_path:
-            QMessageBox.warning(self, "OCR profond", "Aucun document sélectionné.")
+            if not silent:
+                QMessageBox.warning(self, "OCR profond", "Aucun document sélectionné.")
+            else:
+                self._background_log("OCR profond ignoré : aucun document sélectionné.")
             return
 
         if self._warn_if_invoice_validated_locked("relancer l'OCR profond", pdf_path=active_doc_path):
@@ -1224,11 +1462,14 @@ class MainWindowCoreMixin:
 
         progress = None
         try:
-            progress = self._build_progress_dialog("OCR profond", "Préparation OCR profond…", 1)
-            progress.show()
-            QApplication.processEvents()
+            if not silent:
+                progress = self._build_progress_dialog("OCR profond", "Préparation OCR profond…", 1)
+                progress.show()
+                QApplication.processEvents()
 
             def _on_progress(current: int, total: int, label: str):
+                if self._is_background_ocr_mode() and self._background_ocr_should_stop():
+                    raise _DownloadCanceled()
                 if progress is None:
                     return
                 total = max(1, int(total or 1))
@@ -1247,7 +1488,10 @@ class MainWindowCoreMixin:
                 QApplication.processEvents()
 
             if not deep_text:
-                QMessageBox.information(self, "OCR profond", "Aucun texte exploitable n'a été trouvé par Tesseract.")
+                if not silent:
+                    QMessageBox.information(self, "OCR profond", "Aucun texte exploitable n'a été trouvé par Tesseract.")
+                else:
+                    self._background_log(f"OCR profond sans texte : {os.path.basename(active_doc_path)}")
                 return
 
             current_text = (self.ocr_text_view.toPlainText() or "").strip()
@@ -1275,8 +1519,6 @@ class MainWindowCoreMixin:
             self.check_bank_information()
             self.load_transporter_information(force_by_kundennr=False)
 
-            # OCR profond : même règle, la valeur trouvée dans le document prime
-            # sur une ancienne valeur déjà présente à l'écran.
             best = extract_best_bank_ids(merged_text)
             current_iban = self.iban_input.text().strip()
             current_bic = self.bic_input.text().strip()
@@ -1303,15 +1545,22 @@ class MainWindowCoreMixin:
             else:
                 self.statusBar().showMessage("OCR profond terminé.", 4000)
         except _DownloadCanceled:
-            self.statusBar().showMessage("OCR profond annulé.", 4000)
+            if silent:
+                self._background_log("OCR profond interrompu par l'arrêt automatique.")
+            else:
+                self.statusBar().showMessage("OCR profond annulé.", 4000)
+            raise
         except pytesseract.TesseractNotFoundError:
-            QMessageBox.critical(
-                self,
-                "OCR profond",
-                "Tesseract est introuvable. Vérifie le chemin 'tesseract_path' dans settings/app_settings.json.",
-            )
+            msg = "Tesseract est introuvable. Vérifie le chemin 'tesseract_path' dans settings/app_settings.json."
+            if silent:
+                self._background_log("Erreur OCR profond : " + msg)
+            else:
+                QMessageBox.critical(self, "OCR profond", msg)
         except Exception as e:
-            QMessageBox.critical(self, "OCR profond", str(e))
+            if silent:
+                self._background_log(f"Erreur OCR profond : {e}")
+            else:
+                QMessageBox.critical(self, "OCR profond", str(e))
         finally:
             if progress is not None:
                 progress.close()
