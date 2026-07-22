@@ -356,7 +356,6 @@ class PdfViewer(QWidget):
                 if page is not None and 0 <= page < self.page_count():
                     self._current_page = page
                 self._refresh()
-                QTimer.singleShot(0, lambda: self._scroll_to_highlight(self._highlights.get(self._active_highlight_key or "")))
                 return
 
         # fallback : si seule la clé est donnée, on tente de l'utiliser dans les highlights existants
@@ -366,7 +365,6 @@ class PdfViewer(QWidget):
             if page is not None and 0 <= page < self.page_count():
                 self._current_page = page
             self._refresh()
-            QTimer.singleShot(0, lambda: self._scroll_to_highlight(self._highlights.get(key)))
         else:
             self._active_highlight_key = None
             self._refresh()

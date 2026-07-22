@@ -71,7 +71,7 @@ class MainWindowTransportTablesMixin:
             return False
 
         if already_invoiced:
-            dossier_le.setStyleSheet("color:#dc3545; font-weight:bold;")
+            dossier_le.setStyleSheet("color:#dc3545;")
             dossier_le.setToolTip("Le dossier est déjà en facturation (LISINVOICE_EDTRANS).")
             return True
 
@@ -82,7 +82,7 @@ class MainWindowTransportTablesMixin:
             return False
 
         if already_printed:
-            dossier_le.setStyleSheet("color:#fd7e14; font-weight:bold;")
+            dossier_le.setStyleSheet("color:#fd7e14;")
             dossier_le.setToolTip(
                 "Le dossier existe déjà dans XXAV_InvC_PrintedShipments "
                 f"pour le transporteur {kunden_nr} (FANr={kunden_nr}, AufDK='K')."
@@ -1733,7 +1733,7 @@ class MainWindowTransportTablesMixin:
 
         if db_kosten is None:
             if already_invoiced:
-                dossier_le.setStyleSheet("background-color:#ffe6e6; color:#dc3545; font-weight:bold;")
+                dossier_le.setStyleSheet("background-color:#ffe6e6; color:#dc3545;")
                 dossier_le.setToolTip("Le dossier est déjà en facturation (LISINVOICE_EDTRANS), mais la tournée est introuvable dans xxatour.")
             else:
                 dossier_le.setStyleSheet("background-color: #ffe6e6;")

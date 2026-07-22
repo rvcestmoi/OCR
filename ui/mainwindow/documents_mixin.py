@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from .common import *
 from .workers import LinkDownloadWorker, LinkPostProcessWorker, _DownloadCanceled
+import fitz
 
 
 class MainWindowDocumentsMixin:
@@ -104,11 +105,137 @@ class MainWindowDocumentsMixin:
         act_block = menu.addAction("Options de blocage")
         act_block.setEnabled(bool(self.view_pdf_path or self.current_pdf_path))
 
+        menu.addSeparator()
+
+        act_save_all = menu.addAction("Enregistrer tout en PDF...")
+        act_save_all.setEnabled(bool(self.current_pdf_path or self.view_pdf_path or getattr(self, "entry_pdf_paths", None)))
+
         chosen = menu.exec(getattr(self.pdf_viewer, "label", self.pdf_viewer).mapToGlobal(pos))
         if chosen == act_pal:
             self.open_pallet_details_dialog()
         elif chosen == act_block:
             self.open_block_options_dialog()
+        elif chosen == act_save_all:
+            self.save_all_documents_as_merged_pdf()
+
+    def save_all_documents_as_merged_pdf(self):
+        """Fusionne tous les documents du groupe courant dans un seul PDF.
+
+        Action appelée depuis le clic droit sur l'aperçu PDF :
+        - demande un dossier de destination ;
+        - prend tous les documents du groupe entry_id, dans l'ordre affiché ;
+        - fusionne toutes les pages PDF/images dans un seul PDF.
+        """
+        try:
+            if not getattr(self, "entry_pdf_paths", None):
+                self.build_entry_pdf_group()
+        except Exception:
+            pass
+
+        paths = []
+        seen = set()
+        for p in (getattr(self, "entry_pdf_paths", None) or []):
+            p = str(p or "").strip()
+            if not p or not os.path.exists(p) or not is_supported_document(p):
+                continue
+            ap = os.path.abspath(p)
+            if ap in seen:
+                continue
+            seen.add(ap)
+            paths.append(p)
+
+        fallback_path = str(getattr(self, "view_pdf_path", None) or getattr(self, "current_pdf_path", None) or "").strip()
+        if not paths and fallback_path and os.path.exists(fallback_path) and is_supported_document(fallback_path):
+            paths = [fallback_path]
+
+        if not paths:
+            QMessageBox.information(self, "Enregistrer tout", "Aucun document à fusionner.")
+            return
+
+        target_dir = QFileDialog.getExistingDirectory(
+            self,
+            "Choisir le dossier d'enregistrement",
+            os.path.dirname(paths[0]) if paths else "",
+        )
+        if not target_dir:
+            return
+
+        invoice_no = ""
+        try:
+            invoice_no = str(self.invoice_number_input.text() or "").strip()
+        except Exception:
+            invoice_no = ""
+
+        if not invoice_no:
+            try:
+                invoice_no = os.path.splitext(os.path.basename(str(getattr(self, "current_pdf_path", "") or paths[0])))[0]
+            except Exception:
+                invoice_no = "documents"
+
+        safe_name = re.sub(r'[<>:"/\\|?*]+', "_", invoice_no).strip(" ._") or "documents"
+        output_path = os.path.join(target_dir, f"{safe_name}_fusion.pdf")
+        if os.path.exists(output_path):
+            base, ext = os.path.splitext(output_path)
+            i = 1
+            while True:
+                candidate = f"{base}_{i}{ext}"
+                if not os.path.exists(candidate):
+                    output_path = candidate
+                    break
+                i += 1
+
+        errors = []
+        merged = fitz.open()
+        try:
+            for src_path in paths:
+                try:
+                    ext = os.path.splitext(src_path)[1].lower()
+                    if ext == ".pdf":
+                        with fitz.open(src_path) as src_doc:
+                            if src_doc.page_count > 0:
+                                merged.insert_pdf(src_doc)
+                    elif is_image_document(src_path):
+                        # PyMuPDF convertit l'image en PDF mono-page en conservant les dimensions.
+                        with fitz.open(src_path) as img_doc:
+                            pdf_bytes = img_doc.convert_to_pdf()
+                        with fitz.open("pdf", pdf_bytes) as img_pdf:
+                            if img_pdf.page_count > 0:
+                                merged.insert_pdf(img_pdf)
+                    else:
+                        errors.append(f"{os.path.basename(src_path)} : format non supporté")
+                except Exception as e:
+                    errors.append(f"{os.path.basename(src_path)} : {e}")
+
+            if merged.page_count <= 0:
+                raise RuntimeError("Aucune page n'a pu être fusionnée.")
+
+            merged.save(output_path)
+        except Exception as e:
+            QMessageBox.warning(self, "Enregistrer tout", "La fusion a échoué :\n" + str(e))
+            return
+        finally:
+            try:
+                merged.close()
+            except Exception:
+                pass
+
+        if errors:
+            QMessageBox.warning(
+                self,
+                "Enregistrer tout",
+                "PDF fusionné créé :\n"
+                + output_path
+                + "\n\nCertains documents n'ont pas pu être ajoutés :\n"
+                + "\n".join(errors[:12])
+                + (f"\n... + {len(errors) - 12} autre(s)" if len(errors) > 12 else "")
+            )
+        else:
+            QMessageBox.information(self, "Enregistrer tout", "PDF fusionné créé :\n" + output_path)
+
+        try:
+            self.statusBar().showMessage(f"PDF fusionné créé : {output_path}", 5000)
+        except Exception:
+            pass
 
     def open_pallet_details_dialog(self):
         from ui.pallet_details_dialog import PalletDetailsDialog
