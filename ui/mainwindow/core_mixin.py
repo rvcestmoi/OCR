@@ -2412,6 +2412,7 @@ class MainWindowCoreMixin:
                         rech_nr=rech_nr,
                         tour_nrs=reporting_tour_numbers,
                         is_bloque=bool(data.get("blocked", False)),
+                        is_validated=(normalized_status == "validated"),
                     )
                     if reporting_errors:
                         reporting_error = " | ".join(reporting_errors)

@@ -27,6 +27,7 @@ class ReportingRepository(BaseRepository):
                     RechNr VARCHAR(100) NOT NULL,
                     TourNr VARCHAR(20) NOT NULL,
                     IsBloque BIT NOT NULL CONSTRAINT DF_XXA_OCR_REPORTING_MODIFS_IsBloque DEFAULT (0),
+                    IsValidated BIT NOT NULL CONSTRAINT DF_XXA_OCR_REPORTING_MODIFS_IsValidated DEFAULT (0),
                     IsLastModifierForTour BIT NOT NULL CONSTRAINT DF_XXA_OCR_REPORTING_MODIFS_IsLastModifierForTour DEFAULT (0),
                     DateCreation DATETIME2(0) NOT NULL CONSTRAINT DF_XXA_OCR_REPORTING_MODIFS_DateCreation DEFAULT SYSDATETIME(),
                     CONSTRAINT PK_XXA_OCR_REPORTING_MODIFS PRIMARY KEY CLUSTERED (IdReporting ASC),
@@ -39,6 +40,13 @@ class ReportingRepository(BaseRepository):
                 CREATE INDEX IX_XXA_OCR_REPORTING_MODIFS_RechNr
                     ON dbo.XXA_OCR_REPORTING_MODIFS (RechNr);
             END
+
+            IF COL_LENGTH('dbo.XXA_OCR_REPORTING_MODIFS', 'IsValidated') IS NULL
+            BEGIN
+                ALTER TABLE dbo.XXA_OCR_REPORTING_MODIFS
+                ADD IsValidated BIT NOT NULL
+                    CONSTRAINT DF_XXA_OCR_REPORTING_MODIFS_IsValidated DEFAULT (0);
+            END
         """
         self.execute(sql)
 
@@ -49,6 +57,7 @@ class ReportingRepository(BaseRepository):
         rech_nr: str,
         tour_nr: str,
         is_bloque: bool,
+        is_validated: bool = False,
     ) -> None:
         utilisateur = str(utilisateur or "").strip()
         rech_nr = str(rech_nr or "").strip()
@@ -72,6 +81,7 @@ class ReportingRepository(BaseRepository):
             UPDATE dbo.XXA_OCR_REPORTING_MODIFS
             SET DateModification = SYSDATETIME(),
                 IsBloque = ?,
+                IsValidated = CASE WHEN ? = 1 THEN 1 ELSE IsValidated END,
                 IsLastModifierForTour = 1
             WHERE Utilisateur = ?
               AND RechNr = ?
@@ -86,11 +96,13 @@ class ReportingRepository(BaseRepository):
                     RechNr,
                     TourNr,
                     IsBloque,
+                    IsValidated,
                     IsLastModifierForTour
                 )
                 VALUES
                 (
                     SYSDATETIME(),
+                    ?,
                     ?,
                     ?,
                     ?,
@@ -102,11 +114,13 @@ class ReportingRepository(BaseRepository):
             COMMIT TRANSACTION;
         """
         is_bloque_db = 1 if is_bloque else 0
+        is_validated_db = 1 if is_validated else 0
         self.execute(
             sql,
             (
                 tour_nr,
                 is_bloque_db,
+                is_validated_db,
                 utilisateur,
                 rech_nr,
                 tour_nr,
@@ -114,6 +128,7 @@ class ReportingRepository(BaseRepository):
                 rech_nr,
                 tour_nr,
                 is_bloque_db,
+                is_validated_db,
             ),
         )
 
@@ -124,6 +139,7 @@ class ReportingRepository(BaseRepository):
         rech_nr: str,
         tour_nrs: list[str],
         is_bloque: bool,
+        is_validated: bool = False,
     ) -> list[str]:
         """Upsert une ligne par dossier et retourne les erreurs éventuelles."""
         self.ensure_table_exists()
@@ -141,6 +157,7 @@ class ReportingRepository(BaseRepository):
                     rech_nr=rech_nr,
                     tour_nr=tour_nr,
                     is_bloque=is_bloque,
+                    is_validated=is_validated,
                 )
             except Exception as e:
                 errors.append(f"{tour_nr} : {e}")
