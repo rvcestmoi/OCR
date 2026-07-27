@@ -422,11 +422,10 @@ class MainWindow(
 
 
         # --- Volet info dossier / tournée ---
-        self.tour_info = QPlainTextEdit()
-        self.tour_info.setReadOnly(True)
-        self.tour_info.setMaximumHeight(140)
-        self.tour_info.setPlaceholderText("Informations dossier / tournée…")
-        center_panel.addWidget(self.tour_info)
+        # Supprimé de l'interface : l'encadré sous le PDF n'est plus affiché.
+        # On garde l'attribut à None pour préserver la compatibilité avec les
+        # méthodes existantes qui testent sa présence.
+        self.tour_info = None
         # =========================
         # Panneau droit (form)
         # =========================

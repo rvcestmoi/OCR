@@ -953,7 +953,10 @@ class MainWindowTransportTablesMixin:
 
     def load_tour_information(self, tour_nr: str):
         self.last_loaded_tour_nr = (tour_nr or "").strip()
-        self.tour_info.clear()
+        tour_widget = getattr(self, "tour_info", None)
+        if tour_widget is None:
+            return
+        tour_widget.clear()
         tour_nr = (tour_nr or "").strip()
 
         if not tour_nr:
