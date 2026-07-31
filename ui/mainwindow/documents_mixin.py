@@ -775,6 +775,8 @@ class MainWindowDocumentsMixin:
 
         rows_to_add = []
         lkz_cache: dict[str, str] = {}
+        kto_aux_cache: dict[str, str] = {}
+        transporter_name_cache: dict[str, str] = {}
         seen_entry_ids: set[str] = set()
 
         def _split_index_tours(value) -> list[str]:
@@ -966,74 +968,25 @@ class MainWindowDocumentsMixin:
 
             for row_index, (rep_filename, rep_path, entry_id, group_paths, status, invoice_date, iban, bic, date_mail, expediteur, sujet, transporter_name, indexed_tours, transporter_kundennr) in enumerate(rows_to_add):
                 real_filename = os.path.basename(rep_path)
-                display_filename = format_left_table_filename(real_filename)
-                it0 = QTableWidgetItem(display_filename)
-                it0.setToolTip(real_filename)
-                it0.setData(Qt.UserRole, rep_path)
-                it0.setData(Qt.UserRole + 6, real_filename)
-                it0.setData(Qt.UserRole + 1, status)
-                it0.setData(Qt.UserRole + 4, entry_id)
-                it0.setData(Qt.UserRole + 5, group_paths)
-                it0.setData(Qt.UserRole + 8, self._normalize_left_mail_date_value(date_mail))
 
                 # Les numéros de dossier utilisés pour la recherche viennent
                 # exclusivement de XXA_OCR_SEARCH_INDEX. On ne relit plus les JSON
                 # pour compléter les anciennes lignes non indexées.
                 folders_for_search = list(indexed_tours or [])
 
-                extra_search_values = list(folders_for_search or [])
-                try:
-                    if date_mail:
-                        extra_search_values.append(str(date_mail))
-                        if hasattr(date_mail, "strftime"):
-                            extra_search_values.append(date_mail.strftime("%d/%m/%Y %H:%M"))
-                    if expediteur:
-                        extra_search_values.append(expediteur)
-                    if sujet:
-                        extra_search_values.append(sujet)
-                    if transporter_name:
-                        extra_search_values.append(transporter_name)
-                except Exception:
-                    pass
-                it0.setData(Qt.UserRole + 7, extra_search_values)
-                it0.setData(Qt.UserRole + 9, folders_for_search)
-                it0.setData(Qt.UserRole + 10, transporter_kundennr)
-
-                tooltip_parts = [real_filename]
-                if folders_for_search:
-                    folders_txt = "Dossier(s) : " + ", ".join(folders_for_search[:10])
-                    if len(folders_for_search) > 10:
-                        folders_txt += "…"
-                    tooltip_parts.append(folders_txt)
-                if date_mail:
-                    tooltip_parts.append(f"Date mail : {date_mail}")
-                if expediteur:
-                    tooltip_parts.append(f"Expéditeur : {expediteur}")
-                if transporter_name:
-                    tooltip_parts.append(f"Transporteur : {transporter_name}")
-                if len(tooltip_parts) > 1:
-                    it0.setToolTip("\n".join(tooltip_parts))
-
-                table.setItem(row_index, 0, it0)
-                table.setItem(row_index, 1, QTableWidgetItem(invoice_date))
-                table.setItem(row_index, 2, QTableWidgetItem(iban))
-                table.setItem(row_index, 3, QTableWidgetItem(bic))
+                invoice_date = str(invoice_date or "").strip()
+                iban = str(iban or "").strip()
+                bic = str(bic or "").strip()
 
                 if (not current_search_query) and (not invoice_date or not iban or not bic):
                     # Hors recherche uniquement : on conserve l'ancien complément
-                    # d'affichage depuis le JSON. En recherche, aucune lecture JSON
-                    # ne doit compléter les résultats.
+                    # technique depuis le JSON. Ces infos ne sont plus affichées
+                    # dans la table, mais restent utilisées pour préremplir les champs
+                    # quand la facture est sélectionnée.
                     j_date, j_iban, j_bic = self._get_saved_date_iban_bic_for_pdf(rep_path)
                     new_date = invoice_date or j_date
                     new_iban = iban or j_iban
                     new_bic = bic or j_bic
-
-                    if new_date and not invoice_date:
-                        table.item(row_index, 1).setText(new_date)
-                    if new_iban and not iban:
-                        table.item(row_index, 2).setText(new_iban)
-                    if new_bic and not bic:
-                        table.item(row_index, 3).setText(new_bic)
 
                     try:
                         if entry_id and (new_date or new_iban or new_bic):
@@ -1049,6 +1002,32 @@ class MainWindowDocumentsMixin:
 
                     invoice_date, iban, bic = new_date, new_iban, new_bic
 
+                transporter_kundennr = str(transporter_kundennr or "").strip()
+                transporter_name = str(transporter_name or "").strip()
+
+                if transporter_kundennr and not transporter_name:
+                    try:
+                        if transporter_kundennr not in transporter_name_cache:
+                            rec = self.transporter_repo.find_transporter_by_kundennr(transporter_kundennr) or {}
+                            transporter_name_cache[transporter_kundennr] = str(
+                                rec.get("name1") or rec.get("Name1") or rec.get("NAME1") or ""
+                            ).strip()
+                        transporter_name = transporter_name_cache.get(transporter_kundennr, "")
+                    except Exception:
+                        transporter_name = ""
+
+                kto_aux = ""
+                if transporter_kundennr:
+                    try:
+                        if transporter_kundennr not in kto_aux_cache:
+                            rec = self.transporter_repo.get_ktoKreA_by_kundennr(transporter_kundennr) or {}
+                            kto_aux_cache[transporter_kundennr] = str(
+                                rec.get("KtoKreA") or rec.get("ktokrea") or rec.get("KtoKrea") or ""
+                            ).strip()
+                        kto_aux = kto_aux_cache.get(transporter_kundennr, "")
+                    except Exception:
+                        kto_aux = ""
+
                 lkz = ""
                 if transporter_kundennr:
                     try:
@@ -1063,7 +1042,73 @@ class MainWindowDocumentsMixin:
                     # Hors recherche uniquement : ancien complément pays depuis le JSON.
                     # En recherche, la liste reste exclusive à l'index SQL.
                     lkz = self._get_country_for_document(rep_path, iban, bic)
-                table.setItem(row_index, 4, QTableWidgetItem(lkz))
+
+                display_transporter = transporter_name or (f"Transporteur {transporter_kundennr}" if transporter_kundennr else "Transporteur non déterminé")
+                mail_display = self._format_left_mail_date_display(date_mail)
+
+                it0 = QTableWidgetItem(display_transporter)
+                it0.setData(Qt.UserRole, rep_path)
+                it0.setData(Qt.UserRole + 6, real_filename)
+                it0.setData(Qt.UserRole + 1, status)
+                it0.setData(Qt.UserRole + 4, entry_id)
+                it0.setData(Qt.UserRole + 5, group_paths)
+                it0.setData(Qt.UserRole + 8, self._normalize_left_mail_date_value(date_mail))
+                it0.setData(Qt.UserRole + 9, folders_for_search)
+                it0.setData(Qt.UserRole + 10, transporter_kundennr)
+                it0.setData(Qt.UserRole + 11, invoice_date)
+                it0.setData(Qt.UserRole + 12, iban)
+                it0.setData(Qt.UserRole + 13, bic)
+                it0.setData(Qt.UserRole + 14, kto_aux)
+                it0.setData(Qt.UserRole + 15, transporter_name)
+                it0.setData(Qt.UserRole + 16, date_mail)
+
+                extra_search_values = list(folders_for_search or [])
+                try:
+                    extra_search_values.extend([
+                        real_filename,
+                        invoice_date,
+                        iban,
+                        bic,
+                        mail_display,
+                        str(date_mail or ""),
+                        expediteur,
+                        sujet,
+                        transporter_name,
+                        transporter_kundennr,
+                        kto_aux,
+                        lkz,
+                    ])
+                    if date_mail and hasattr(date_mail, "strftime"):
+                        extra_search_values.append(date_mail.strftime("%d/%m/%Y %H:%M"))
+                        extra_search_values.append(date_mail.strftime("%Y-%m-%d %H:%M:%S"))
+                except Exception:
+                    pass
+                it0.setData(Qt.UserRole + 7, [v for v in extra_search_values if str(v or "").strip()])
+
+                tooltip_parts = []
+                if transporter_name:
+                    tooltip_parts.append(f"Transporteur : {transporter_name}")
+                if transporter_kundennr:
+                    tooltip_parts.append(f"KundenNr : {transporter_kundennr}")
+                if kto_aux:
+                    tooltip_parts.append(f"Compte auxiliaire : {kto_aux}")
+                if date_mail:
+                    tooltip_parts.append(f"Date mail : {date_mail}")
+                if folders_for_search:
+                    folders_txt = "Dossier(s) : " + ", ".join(folders_for_search[:10])
+                    if len(folders_for_search) > 10:
+                        folders_txt += "…"
+                    tooltip_parts.append(folders_txt)
+                if expediteur:
+                    tooltip_parts.append(f"Expéditeur : {expediteur}")
+                if sujet:
+                    tooltip_parts.append(f"Sujet : {sujet}")
+                tooltip_parts.append(f"Fichier : {real_filename}")
+                it0.setToolTip("\n".join(tooltip_parts))
+
+                table.setItem(row_index, 0, it0)
+                table.setItem(row_index, 1, QTableWidgetItem(kto_aux))
+                table.setItem(row_index, 2, QTableWidgetItem(mail_display))
         finally:
             table.blockSignals(False)
             table.setUpdatesEnabled(old_updates)
@@ -1168,12 +1213,10 @@ class MainWindowDocumentsMixin:
     
 
     def _update_left_table_date_iban_bic(self, pdf_path: str, invoice_date: str, iban: str, bic: str):
-        """Met à jour en temps réel Date / IBAN / BIC / Pays du tableau de gauche pour un PDF."""
+        """Met à jour les données techniques invisibles Date / IBAN / BIC de la ligne de gauche."""
         if not pdf_path:
             return
         if not hasattr(self, "pdf_table") or self.pdf_table is None:
-            return
-        if self.pdf_table.columnCount() < 5:
             return
 
         invoice_date = (invoice_date or "").strip()
@@ -1194,10 +1237,11 @@ class MainWindowDocumentsMixin:
                 continue
             p = it0.data(Qt.UserRole)
             if p == pdf_path:
-                self.pdf_table.setItem(row, 1, QTableWidgetItem(invoice_date))
-                self.pdf_table.setItem(row, 2, QTableWidgetItem(iban))
-                self.pdf_table.setItem(row, 3, QTableWidgetItem(bic))
-                self.pdf_table.setItem(row, 4, QTableWidgetItem(lkz))
+                it0.setData(Qt.UserRole + 11, invoice_date)
+                it0.setData(Qt.UserRole + 12, iban)
+                it0.setData(Qt.UserRole + 13, bic)
+                if self.pdf_table.columnCount() >= 4:
+                    self.pdf_table.setItem(row, 3, QTableWidgetItem(lkz))
                 return
 
 
@@ -1208,10 +1252,8 @@ class MainWindowDocumentsMixin:
             self.load_default_folder()
 
     def refresh_left_table_saved_infos(self):
-        """Recharge IBAN/BIC pour chaque PDF de la table."""
+        """Recharge Date facture / IBAN / BIC en données invisibles pour chaque ligne."""
         if not hasattr(self, "pdf_table") or self.pdf_table is None:
-            return
-        if self.pdf_table.columnCount() < 4:
             return
 
         for row in range(self.pdf_table.rowCount()):
@@ -1224,32 +1266,19 @@ class MainWindowDocumentsMixin:
                 continue
 
             invoice_date, iban, bic = self._get_saved_date_iban_bic_for_pdf(pdf_path)
-
-            it1 = self.pdf_table.item(row, 1)
-            if it1 is None:
-                self.pdf_table.setItem(row, 1, QTableWidgetItem(invoice_date))
-            else:
-                it1.setText(invoice_date)
-
-            it2 = self.pdf_table.item(row, 2)
-            if it2 is None:
-                self.pdf_table.setItem(row, 2, QTableWidgetItem(iban))
-            else:
-                it2.setText(iban)
-
-            it3 = self.pdf_table.item(row, 3)
-            if it3 is None:
-                self.pdf_table.setItem(row, 3, QTableWidgetItem(bic))
-            else:
-                it3.setText(bic)
+            it0.setData(Qt.UserRole + 11, invoice_date)
+            it0.setData(Qt.UserRole + 12, iban)
+            it0.setData(Qt.UserRole + 13, bic)
 
             lkz = self._get_country_for_document(pdf_path, iban, bic)
-            it4 = self.pdf_table.item(row, 4)
-            if it4 is None:
-                self.pdf_table.setItem(row, 4, QTableWidgetItem(lkz))
-            else:
-                it4.setText(lkz)
+            if self.pdf_table.columnCount() >= 4:
+                it4 = self.pdf_table.item(row, 3)
+                if it4 is None:
+                    self.pdf_table.setItem(row, 3, QTableWidgetItem(lkz))
+                else:
+                    it4.setText(lkz)
         self.apply_left_table_search_filter()
+
 
     def _get_saved_folder_numbers_for_pdf(self, pdf_path: str) -> list[str]:
         pdf_path = str(pdf_path or "").strip()
@@ -1373,6 +1402,29 @@ class MainWindowDocumentsMixin:
 
         return ""
 
+    def _format_left_mail_date_display(self, value) -> str:
+        """Format court de la date mail pour la table de gauche."""
+        if not value:
+            return ""
+        try:
+            if hasattr(value, "strftime"):
+                return value.strftime("%d/%m/%Y %H:%M")
+        except Exception:
+            pass
+
+        raw = str(value or "").strip()
+        if not raw:
+            return ""
+
+        m = re.search(r"\b(\d{4})-(\d{1,2})-(\d{1,2})(?:[ T](\d{1,2}):(\d{2}))?", raw)
+        if m:
+            txt = f"{int(m.group(3)):02d}/{int(m.group(2)):02d}/{m.group(1)}"
+            if m.group(4) and m.group(5):
+                txt += f" {int(m.group(4)):02d}:{m.group(5)}"
+            return txt
+
+        return raw
+
     def _get_left_mail_date_filter_range(self):
         """Retourne (début inclus, fin exclue) pour le filtre date_mail SQL."""
         cb = getattr(self, "left_mail_date_filter_checkbox", None)
@@ -1456,9 +1508,6 @@ class MainWindowDocumentsMixin:
         query = (getattr(self, "left_search_input", None).text() if getattr(self, "left_search_input", None) else "")
         query = (query or "").strip().lower()
 
-        country_q = (getattr(self, "left_country_filter_input", None).text() if getattr(self, "left_country_filter_input", None) else "")
-        country_q = (country_q or "").strip().lower()
-
         mail_date_day = self._get_left_mail_date_filter_day()
 
         cols_count = self.pdf_table.columnCount()
@@ -1523,15 +1572,7 @@ class MainWindowDocumentsMixin:
             else:
                 mail_date_visible = True
 
-            # 4) filtre pays (col 4)
-            if country_q and cols_count >= 5:
-                it = self.pdf_table.item(row, 4)
-                lkz_txt = str(it.text() if it else "").strip().lower()
-                country_visible = lkz_txt.startswith(country_q)
-            else:
-                country_visible = True
-
-            self.pdf_table.setRowHidden(row, not (status_visible and search_visible and mail_date_visible and country_visible))
+            self.pdf_table.setRowHidden(row, not (status_visible and search_visible and mail_date_visible))
 
 
     def _get_country_for_document(self, pdf_path: str, iban: str | None, bic: str | None) -> str:
@@ -1573,7 +1614,7 @@ class MainWindowDocumentsMixin:
         return ""
 
     def _update_left_row_for_entry(self, entry_id: str, invoice_date: str, iban: str, bic: str, country: str = ""):
-        """Met à jour la ligne 'groupe' (1 ligne par entry_id) dans la table de gauche."""
+        """Met à jour les données techniques invisibles d'une ligne groupe."""
         if not entry_id or not hasattr(self, "pdf_table") or self.pdf_table is None:
             return
         entry_id = str(entry_id).strip()
@@ -1583,18 +1624,12 @@ class MainWindowDocumentsMixin:
             if not it0:
                 continue
 
-            row_entry_id = str(it0.data(Qt.UserRole + 4) or "").strip()  # ✅ entry_id stocké dans la table
+            row_entry_id = str(it0.data(Qt.UserRole + 4) or "").strip()
             if row_entry_id != entry_id:
                 continue
 
-            # Cols existantes: 0 Nom | 1 Date | 2 IBAN | 3 BIC | (4 Pays si tu l'as)
-            if self.pdf_table.columnCount() >= 2:
-                self.pdf_table.setItem(row, 1, QTableWidgetItem((invoice_date or "").strip()))
-            if self.pdf_table.columnCount() >= 3:
-                self.pdf_table.setItem(row, 2, QTableWidgetItem((iban or "").strip()))
-            if self.pdf_table.columnCount() >= 4:
-                self.pdf_table.setItem(row, 3, QTableWidgetItem((bic or "").strip()))
-            if self.pdf_table.columnCount() >= 5:
-                self.pdf_table.setItem(row, 4, QTableWidgetItem((country or "").strip()))
-
+            it0.setData(Qt.UserRole + 11, (invoice_date or "").strip())
+            it0.setData(Qt.UserRole + 12, (iban or "").strip())
+            it0.setData(Qt.UserRole + 13, (bic or "").strip())
             return
+

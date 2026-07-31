@@ -525,19 +525,16 @@ class MainWindowCoreMixin:
         self.current_match_index = -1
         self.search_counter_label.setText("0 / 0")
 
-        # ✅ Pré-remplir depuis la BDD (liste de gauche) quand dispo
-        # Objectif : les champs "légers" (date/iban/bic) viennent prioritairement de SQL,
-        # et le JSON reste pour les champs lourds (OCR, dossiers, TVA, etc.).
+        # ✅ Pré-remplir depuis les données SQL stockées dans la ligne de gauche.
+        # Les colonnes visibles n'affichent plus Date/IBAN/BIC, mais ces valeurs
+        # restent stockées en Qt.UserRole pour alimenter les champs.
         try:
             row = self.pdf_table.currentRow() if hasattr(self, "pdf_table") else -1
             if row is not None and row >= 0 and getattr(self, "pdf_table", None) is not None:
-                it_date = self.pdf_table.item(row, 1)  # Date (col 1)
-                it_iban = self.pdf_table.item(row, 2)  # IBAN (col 2)
-                it_bic  = self.pdf_table.item(row, 3)  # BIC  (col 3)
-
-                db_date = (it_date.text() if it_date else "").strip()
-                db_iban = (it_iban.text() if it_iban else "").strip()
-                db_bic  = (it_bic.text() if it_bic else "").strip()
+                it0 = self.pdf_table.item(row, 0)
+                db_date = str(it0.data(Qt.UserRole + 11) or "").strip() if it0 else ""
+                db_iban = str(it0.data(Qt.UserRole + 12) or "").strip() if it0 else ""
+                db_bic = str(it0.data(Qt.UserRole + 13) or "").strip() if it0 else ""
 
                 if db_date:
                     self.date_input.setText(normalize_date_format(db_date))
@@ -2961,8 +2958,6 @@ class MainWindowCoreMixin:
             return
         if not hasattr(self, "pdf_table"):
             return
-        if self.pdf_table.columnCount() < 4:
-            return
 
         invoice_date = (invoice_date or "").strip()
         iban = (iban or "").strip()
@@ -2974,10 +2969,11 @@ class MainWindowCoreMixin:
                 continue
             p = it0.data(Qt.UserRole)
             if p == pdf_path:
-                self.pdf_table.setItem(row, 1, QTableWidgetItem(invoice_date))
-                self.pdf_table.setItem(row, 2, QTableWidgetItem(iban))
-                self.pdf_table.setItem(row, 3, QTableWidgetItem(bic))
+                it0.setData(Qt.UserRole + 11, invoice_date)
+                it0.setData(Qt.UserRole + 12, iban)
+                it0.setData(Qt.UserRole + 13, bic)
                 return
+
             
     def _claim_selected_entry(self, entry_id: str | None):
         entry_id = str(entry_id or "").strip()

@@ -739,7 +739,6 @@ class MainWindowTransportTablesMixin:
                 if not self.transporter_info.toPlainText().strip():
                     self.transporter_info.setPlainText(
                         f"Transporteur déterminé par le dossier {source_tour_nr}.\n"
-                        f"KundenNr : {kundennr}\n"
                         "❌ Fiche transporteur introuvable."
                     )
                 try:
@@ -766,20 +765,15 @@ class MainWindowTransportTablesMixin:
                 self._set_transporter_aux_locked(False, candidate_aux, allow_db_update=True)
 
             transporter_name = str(transporter.get("name1", "") or "").strip()
-            if transporter_name and kundennr:
-                display_text = f"{transporter_name} ({kundennr})"
-            elif transporter_name:
-                display_text = transporter_name
-            else:
-                display_text = kundennr
-            self._set_transporter_input_locked(display_text)
+            ustid = str(transporter.get("UstId", "") or transporter.get("USTID", "") or transporter.get("USTIDNR", "") or "").strip()
+            self._set_transporter_input_locked(transporter_name or kundennr)
 
             banks = self.bank_repo.get_all_bank_infos_by_kundennr(kundennr)
 
             lines = []
             lines.append(f"Transporteur déterminé par le dossier : {source_tour_nr}")
-            lines.append(f"KundenNr : {kundennr}")
-            lines.append(f"Transporteur : {str(transporter.get('name1', '') or '').strip()}")
+            lines.append(f"Transporteur : {transporter_name}")
+            lines.append(f"N° TVA : {ustid or '(non renseigné)'}")
 
             address_line = [
                 str(transporter.get("Strasse", "") or "").strip(),
@@ -789,13 +783,8 @@ class MainWindowTransportTablesMixin:
             ]
             address_line = [p for p in address_line if p]
 
-            ustid = str(transporter.get("UstId", "") or transporter.get("USTIDNR", "") or "").strip()
-
             if address_line:
                 lines.append("Adresse : " + ", ".join(address_line))
-
-            if ustid:
-                lines.append(f"N°TVA : {ustid}")
 
             if banks:
                 lines.append("")

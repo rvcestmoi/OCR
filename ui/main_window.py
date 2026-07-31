@@ -187,16 +187,16 @@ class MainWindow(
 
         self.pdf_table = QTableWidget(left_top_widget)
         self.pdf_table.setObjectName("pdf_table")
-        # Cols: 0 Nom | 1 Date | 2 IBAN | 3 BIC | 4 Pays (LKZ)
-        self.pdf_table.setColumnCount(5)
-        self.pdf_table.setHorizontalHeaderLabels(["Nom du fichier", "Date", "IBAN", "BIC", "Pays"])
+        # Cols visibles: 0 Transporteur | 1 Cpte aux. | 2 Date mail
+        # Les données techniques invisibles (chemin PDF, entry_id, date facture, IBAN, BIC, etc.)
+        # restent stockées dans les Qt.UserRole du premier item.
+        self.pdf_table.setColumnCount(3)
+        self.pdf_table.setHorizontalHeaderLabels(["Transporteur", "Cpte aux.", "Date mail"])
 
         hdr = self.pdf_table.horizontalHeader()
         hdr.setSectionResizeMode(0, QHeaderView.Stretch)
         hdr.setSectionResizeMode(1, QHeaderView.ResizeToContents)
         hdr.setSectionResizeMode(2, QHeaderView.ResizeToContents)
-        hdr.setSectionResizeMode(3, QHeaderView.ResizeToContents)
-        hdr.setSectionResizeMode(4, QHeaderView.ResizeToContents)
 
         self.pdf_table.setSelectionBehavior(QTableWidget.SelectRows)
         self.pdf_table.setEditTriggers(QTableWidget.NoEditTriggers)
@@ -227,16 +227,7 @@ class MainWindow(
         self.btn_filter_aux_empty = QPushButton("🧾 Aux Vides")
         self.btn_filter_aux_empty.setCheckable(True)
 
-        # Filtre pays (LKZ) – ne filtre que sur la colonne "Pays"
-        self.left_country_filter_input = QLineEdit()
-        self.left_country_filter_input.setPlaceholderText("Pays (ex: FR)")
-        self.left_country_filter_input.setClearButtonEnabled(True)
-        self.left_country_filter_input.setMaximumWidth(110)
-        self.left_country_filter_input.textChanged.connect(self.apply_left_table_search_filter)
-
         filter_bar.addStretch(1)
-        filter_bar.addWidget(QLabel("Pays:"))
-        filter_bar.addWidget(self.left_country_filter_input)
 
         self._filter_group = QButtonGroup(self)
         self._filter_group.setExclusive(True)
@@ -262,7 +253,7 @@ class MainWindow(
         self.btn_filter_aux_empty.clicked.connect(lambda: self.set_left_filter("aux_empty"))
 
         self.left_search_input = QLineEdit()
-        self.left_search_input.setPlaceholderText("🔎 Rechercher fichier / date / IBAN / BIC / dossier…")
+        self.left_search_input.setPlaceholderText("🔎 Rechercher transporteur / compte aux. / date mail / dossier…")
         self.left_search_input.textChanged.connect(self.on_left_search_text_changed)
         left_layout.addWidget(self.left_search_input)
 
