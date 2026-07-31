@@ -975,15 +975,35 @@ class MainWindowTransportTablesMixin:
             if missing:
                 header += f" | CMR manquantes: {', '.join(missing)}"
 
+            def _fmt_place(pays, cp, ville):
+                pays = str(pays or "").strip()
+                cp = str(cp or "").strip()
+                ville = str(ville or "").strip()
+                parts = []
+                if pays:
+                    parts.append(pays)
+                if cp:
+                    parts.append(cp)
+                if ville:
+                    parts.append(ville)
+                return " ".join(parts)
+
+            chargement_place = _fmt_place(
+                info.get("ChargementPays", ""),
+                info.get("ChargementCP", ""),
+                info.get("ChargementVille", ""),
+            )
+            livraison_place = _fmt_place(
+                info.get("LivraisonPays", ""),
+                info.get("LivraisonCP", ""),
+                info.get("LivraisonVille", ""),
+            )
+
             txt = (
                 f"{header}\n"
                 f"TourNr : {info.get('TourNr', tour_nr)} {this_icon}\n"
-                f"Départ : {info.get('Depart', '')}\n"
-                f"Arrivée : {info.get('Arrivee', '')}\n"
-                f"Date Tour : {info.get('DateTour', '')}\n"
-                f"Date Livraison : {info.get('DateLivraison', '')}\n"
-                f"Total Poids : {info.get('Total_Poids', '')}\n"
-                f"Total MPL : {info.get('Total_MPL', '')}"
+                f"Chargement : {info.get('DateChargement', '')} · {info.get('ChargementName1', '')}, {chargement_place}\n"
+                f"Livraison : {info.get('DateLivraison', '')} · {info.get('LivraisonName1', '')}, {livraison_place}"
             )
 
             self.tour_info.setPlainText(txt)

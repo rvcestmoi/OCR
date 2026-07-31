@@ -701,6 +701,23 @@ class MainWindowCoreMixin:
         else:
             self.sender_input.clear()
 
+        # Afficher automatiquement les informations du premier dossier chargé.
+        # Avant, ce volet n'était alimenté qu'après un clic dans le champ dossier.
+        try:
+            first_tour_nr = ""
+            if hasattr(self, "_get_first_folder_number"):
+                first_tour_nr = str(self._get_first_folder_number() or "").strip()
+            elif hasattr(self, "get_folder_numbers"):
+                nums = self.get_folder_numbers() or []
+                first_tour_nr = str(nums[0] or "").strip() if nums else ""
+
+            if first_tour_nr and hasattr(self, "load_tour_information"):
+                self.load_tour_information(first_tour_nr)
+            elif hasattr(self, "tour_info") and self.tour_info is not None:
+                self.tour_info.clear()
+        except Exception:
+            pass
+
         # Verrouiller l'édition si la facture est déjà validée. La vérification
         # relit la BDD en priorité pour éviter qu'un JSON local ancien autorise
         # une modification sur une facture déjà validée par un autre utilisateur.

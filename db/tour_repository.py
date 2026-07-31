@@ -179,36 +179,73 @@ class TourRepository(BaseRepository):
             return None
     
     def get_tour_extended_info(self, tour_nr: str) -> Optional[Dict[str, Any]]:
+        """Retourne les informations lisibles du dossier affichées sous le PDF.
+
+        Affichage attendu côté UI :
+        - une ligne chargement : date, Name1 du client, pays, CP, ville
+        - une ligne livraison : date, Name1 du client, pays, CP, ville
+
+        On part d'une commande XXASLAuf de la tournée pour avoir BelNr/EmpNr,
+        BelVonDat/EntVonDat et les adresses commande. Les champs XXATour restent
+        en secours si l'adresse commande est vide.
+        """
         tour_nr = (tour_nr or "").strip()
         if not tour_nr:
             return None
 
         query = """
-        WITH allpos AS (
-            SELECT
-                SUM(pos.TatsGew) AS totalPoids,
-                SUM(pos.LMAnz)   AS TotMpl,
-                LTRIM(RTRIM(CAST(auf.TourNr AS VARCHAR(20)))) AS TourNr
-            FROM XXAV_FR_MainAufIntNrByLegs leg
-            LEFT JOIN XXASLAuf auf ON auf.AufIntNr = leg.leg_AufIntNr
-            LEFT JOIN xxaaufpos pos ON pos.AufIntNr = leg.MAIN_AufIntNr
-            WHERE LTRIM(RTRIM(CAST(auf.TourNr AS VARCHAR(20)))) = ?
-            GROUP BY LTRIM(RTRIM(CAST(auf.TourNr AS VARCHAR(20))))
-        )
         SELECT
             LTRIM(RTRIM(CAST(tour.TourNr AS VARCHAR(20)))) AS TourNr,
-            tour.BelOrt AS Depart,
-            tour.EmgOrt AS Arrivee,
-            CONVERT(VARCHAR(10), tour.TourDatum, 103)   AS DateTour,
-            CONVERT(VARCHAR(10), tour.TourEntDat, 103)  AS DateLivraison,
-            COALESCE(pos.totalPoids, 0) AS Total_Poids,
-            COALESCE(pos.TotMpl, 0)     AS Total_MPL
+
+            CONVERT(VARCHAR(10), COALESCE(auf.BelVonDat, tour.TourDatum), 103) AS DateChargement,
+            LTRIM(RTRIM(COALESCE(kun_chargement.Name1, ''))) AS ChargementName1,
+            COALESCE(
+                NULLIF(LTRIM(RTRIM(CAST(auf.BELLKZ AS VARCHAR(20)))), ''),
+                NULLIF(LTRIM(RTRIM(CAST(tour.BELLKZ AS VARCHAR(20)))), ''),
+                ''
+            ) AS ChargementPays,
+            COALESCE(
+                NULLIF(LTRIM(RTRIM(CAST(auf.BelPLZ AS VARCHAR(20)))), ''),
+                NULLIF(LTRIM(RTRIM(CAST(tour.BelPLZ AS VARCHAR(20)))), ''),
+                ''
+            ) AS ChargementCP,
+            COALESCE(
+                NULLIF(LTRIM(RTRIM(CAST(auf.BelOrt AS VARCHAR(100)))), ''),
+                NULLIF(LTRIM(RTRIM(CAST(tour.BelOrt AS VARCHAR(100)))), ''),
+                ''
+            ) AS ChargementVille,
+
+            CONVERT(VARCHAR(10), COALESCE(auf.EntVonDat, tour.TourEntDat), 103) AS DateLivraison,
+            LTRIM(RTRIM(COALESCE(kun_livraison.Name1, ''))) AS LivraisonName1,
+            COALESCE(
+                NULLIF(LTRIM(RTRIM(CAST(auf.EmgLKZ AS VARCHAR(20)))), ''),
+                NULLIF(LTRIM(RTRIM(CAST(tour.EmgLKZ AS VARCHAR(20)))), ''),
+                ''
+            ) AS LivraisonPays,
+            COALESCE(
+                NULLIF(LTRIM(RTRIM(CAST(auf.EmgPLZ AS VARCHAR(20)))), ''),
+                NULLIF(LTRIM(RTRIM(CAST(tour.EmgPLZ AS VARCHAR(20)))), ''),
+                ''
+            ) AS LivraisonCP,
+            COALESCE(
+                NULLIF(LTRIM(RTRIM(CAST(auf.EmgOrt AS VARCHAR(100)))), ''),
+                NULLIF(LTRIM(RTRIM(CAST(tour.EmgOrt AS VARCHAR(100)))), ''),
+                ''
+            ) AS LivraisonVille
         FROM XXATour tour
-        LEFT JOIN allpos pos
-            ON pos.TourNr = LTRIM(RTRIM(CAST(tour.TourNr AS VARCHAR(20))))
+        OUTER APPLY (
+            SELECT TOP 1 sl.*
+            FROM XXASLAuf sl
+            WHERE LTRIM(RTRIM(CAST(sl.TourNr AS VARCHAR(20)))) = LTRIM(RTRIM(CAST(tour.TourNr AS VARCHAR(20))))
+            ORDER BY sl.AufNr
+        ) auf
+        LEFT JOIN XXAKun kun_chargement
+            ON kun_chargement.KundenNr = auf.BelNr
+        LEFT JOIN XXAKun kun_livraison
+            ON kun_livraison.KundenNr = auf.EmpNr
         WHERE LTRIM(RTRIM(CAST(tour.TourNr AS VARCHAR(20)))) = ?
         """
-        return self.fetch_one(query, (tour_nr, tour_nr))   
+        return self.fetch_one(query, (tour_nr,))   
 
 
     def get_palette_details_with_trajet_by_tournrs(self, tour_numbers: List[str]) -> List[Dict[str, Any]]:
