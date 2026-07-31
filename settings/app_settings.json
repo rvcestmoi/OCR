@@ -14,7 +14,7 @@
   },
     "db": {
     "server": "THINKPAD-HRO1",
-    "database": "DB228794",
+    "database": "DB228794_29052026",
 
     "trusted_connection": true,
 
@@ -26,7 +26,13 @@
   "ui": {
     "max_pages_pending": 60,
     "max_pages_error": 5,
-    "max_pages_validated": 20
+    "max_pages_validated": 20,
+	"show_rebuild_search_index_button": true,
+	"enable_manual_dms_reexport_shortcut": true,
+	"background_ocr_enabled": false,
+    "background_ocr_stop_time": "06:00",
+    "background_ocr_batch_size": 200,
+    "background_ocr_hide_window": true
   },
   "vat": {
     "allowed_rates": [0, 20]
