@@ -398,6 +398,7 @@ class MainWindow(
         self.pdf_viewer.text_selected.connect(self.fill_active_field)
         self.pdf_viewer.text_selected.connect(self.append_ocr_text)
         self.pdf_viewer.view_changed.connect(self.update_view_indicator)
+        self.pdf_viewer.view_changed.connect(self._update_cmr_attach_dialog_context_label)
         center_panel.addWidget(self.pdf_viewer)
 
         # --- Clic droit sur la zone PDF ---

@@ -181,16 +181,12 @@ class MainWindowCmrMixin:
 
     def attach_cmr_to_dossier_from_right_list(self, pdf_path: str, filename: str, entry_id: str | None = None):
         """
-        Rattache la PAGE actuellement affichée d'un PDF CMR à un dossier/commande
-        du même entry_id.
+        Ouvre la sélection de commande pour rattacher la PAGE CMR affichée.
 
-        - Les choix de dossiers viennent du tableau de droite (si l'entry_id est celui affiché),
-          sinon fallback : lecture des JSON des docs du même entry_id.
-        - Le rattachement est stocké au niveau PAGE dans `cmr_page_links`.
-        - Une même page peut porter plusieurs rattachements : au moment d'ajouter
-          un rattachement sur une page déjà utilisée, l'utilisateur choisit
-          Remplacer ou Ajouter.
-        - Compatibilité ancienne logique conservée via cmr_tour_nr / cmr_auf_nr.
+        Important : la fenêtre est volontairement NON MODALE. L'utilisateur peut
+        donc changer de document ou de page dans l'aperçu principal avant de
+        valider le rattachement. Au clic sur OK, on utilise toujours le document
+        et la page courants, pas ceux qui étaient affichés à l'ouverture.
         """
         if not pdf_path:
             return
@@ -203,12 +199,6 @@ class MainWindowCmrMixin:
         if not entry_id:
             QMessageBox.information(self, "Rattacher CMR", "Impossible de déterminer l'entry_id de ce document.")
             return
-
-        page_count = self._get_pdf_page_count(pdf_path)
-        page_no = self._get_current_pdf_page_number()
-
-        if page_count > 0 and page_no > page_count:
-            page_no = 1
 
         folders = self._get_folder_choices_for_entry(entry_id)
         if not folders:
@@ -239,19 +229,155 @@ class MainWindowCmrMixin:
         except Exception:
             details_rows = []
 
-        title = "Rattacher CMR à une commande"
-        if is_image_document(pdf_path):
-            title += " (image)"
-        elif page_count > 1:
-            title += f" (page {page_no}/{page_count})"
+        # Si une fenêtre de rattachement est déjà ouverte, on la remplace pour
+        # éviter deux validations concurrentes.
+        old_dlg = getattr(self, "_cmr_attach_dialog", None)
+        try:
+            if old_dlg is not None:
+                old_dlg.close()
+        except Exception:
+            pass
 
-        dlg = FolderSelectDialog(tour_numbers, details_rows, parent=self, title=title)
-        if dlg.exec() != QDialog.Accepted or not dlg.selected_tour_nr or not dlg.selected_auf_nr:
+        dlg = FolderSelectDialog(tour_numbers, details_rows, parent=self, title="Rattacher CMR à une commande")
+        dlg.setModal(False)
+        dlg.setWindowModality(Qt.NonModal)
+        dlg.setAttribute(Qt.WA_DeleteOnClose, True)
+
+        # Bandeau de contexte : il indique quel document/page sera utilisé si
+        # l'utilisateur valide maintenant. Il est mis à jour quand la page ou le
+        # document change dans le viewer principal.
+        context_label = QLabel("")
+        context_label.setWordWrap(True)
+        context_label.setStyleSheet(
+            "background:#fff7e6; color:#7a4a00; border:1px solid #f0c36d; "
+            "border-radius:4px; padding:6px;"
+        )
+        try:
+            dlg.layout().insertWidget(1, context_label)
+        except Exception:
+            pass
+        dlg._cmr_context_label = context_label
+        dlg._cmr_entry_id = entry_id
+
+        dlg.accepted.connect(lambda d=dlg: self._on_cmr_attach_dialog_accepted(d))
+        dlg.rejected.connect(lambda d=dlg: self._clear_cmr_attach_dialog(d))
+        dlg.destroyed.connect(lambda *_: self._clear_cmr_attach_dialog(dlg))
+
+        self._cmr_attach_dialog = dlg
+        self._update_cmr_attach_dialog_context_label()
+        dlg.show()
+        dlg.raise_()
+        dlg.activateWindow()
+
+    def _clear_cmr_attach_dialog(self, dlg=None) -> None:
+        try:
+            current = getattr(self, "_cmr_attach_dialog", None)
+            if dlg is None or current is dlg:
+                self._cmr_attach_dialog = None
+        except Exception:
+            self._cmr_attach_dialog = None
+
+    def _current_cmr_document_context(self, entry_id: str | None = None) -> dict:
+        pdf_path = str(getattr(self, "view_pdf_path", None) or getattr(self, "current_pdf_path", None) or "").strip()
+        if not pdf_path or not os.path.exists(pdf_path):
+            return {}
+
+        entry_id = str(entry_id or getattr(self, "selected_invoice_entry_id", "") or "").strip()
+        filename = os.path.basename(pdf_path)
+        try:
+            page_count = self._get_pdf_page_count(pdf_path)
+        except Exception:
+            page_count = 0
+        try:
+            page_no = self._get_current_pdf_page_number()
+        except Exception:
+            page_no = 1
+        if page_count > 0 and page_no > page_count:
+            page_no = 1
+
+        return {
+            "pdf_path": pdf_path,
+            "filename": filename,
+            "entry_id": entry_id,
+            "page_no": max(1, int(page_no or 1)),
+            "page_count": max(0, int(page_count or 0)),
+        }
+
+    def _update_cmr_attach_dialog_context_label(self) -> None:
+        dlg = getattr(self, "_cmr_attach_dialog", None)
+        if dlg is None:
+            return
+        label = getattr(dlg, "_cmr_context_label", None)
+        if label is None:
             return
 
-        tour_nr = str(dlg.selected_tour_nr).strip()
-        auf_nr = str(dlg.selected_auf_nr).strip()
-        if not tour_nr:
+        expected_entry_id = str(getattr(dlg, "_cmr_entry_id", "") or "").strip()
+        current_entry_id = str(getattr(self, "selected_invoice_entry_id", "") or "").strip()
+        ctx = self._current_cmr_document_context(expected_entry_id)
+        if not ctx:
+            label.setText("Aucun document affiché. Sélectionne une page CMR dans l'aperçu principal avant de valider.")
+            return
+
+        page_txt = f"page {ctx['page_no']}"
+        if int(ctx.get("page_count") or 0) > 0:
+            page_txt += f" / {ctx['page_count']}"
+
+        warning = ""
+        if expected_entry_id and current_entry_id and expected_entry_id != current_entry_id:
+            warning = "\n⚠️ La facture sélectionnée a changé : annule puis relance le rattachement CMR."
+
+        label.setText(
+            "Document/page qui sera rattaché  :\n"
+            f"{ctx['filename']} · {page_txt}"
+            + warning
+        )
+
+    def _on_cmr_attach_dialog_accepted(self, dlg) -> None:
+        try:
+            entry_id = str(getattr(dlg, "_cmr_entry_id", "") or "").strip()
+            tour_nr = str(getattr(dlg, "selected_tour_nr", "") or "").strip()
+            auf_nr = str(getattr(dlg, "selected_auf_nr", "") or "").strip()
+        except Exception:
+            entry_id = ""
+            tour_nr = ""
+            auf_nr = ""
+        finally:
+            self._clear_cmr_attach_dialog(dlg)
+
+        if not tour_nr or not auf_nr:
+            return
+
+        current_entry_id = str(getattr(self, "selected_invoice_entry_id", "") or "").strip()
+        if entry_id and current_entry_id and entry_id != current_entry_id:
+            QMessageBox.warning(
+                self,
+                "Rattacher CMR",
+                "La facture sélectionnée a changé pendant le rattachement.\n"
+                "Relance le bouton Rattacher CMR sur la bonne facture."
+            )
+            return
+
+        self._save_cmr_attachment_to_current_document(tour_nr=tour_nr, auf_nr=auf_nr, entry_id=entry_id)
+
+    def _save_cmr_attachment_to_current_document(self, tour_nr: str, auf_nr: str, entry_id: str | None = None) -> None:
+        ctx = self._current_cmr_document_context(entry_id)
+        if not ctx:
+            QMessageBox.information(self, "Rattacher CMR", "Aucun document affiché.")
+            return
+
+        pdf_path = ctx["pdf_path"]
+        page_no = int(ctx["page_no"])
+        page_count = int(ctx.get("page_count") or 0)
+        entry_id = str(entry_id or ctx.get("entry_id") or "").strip()
+        tour_nr = str(tour_nr or "").strip()
+        auf_nr = str(auf_nr or "").strip()
+        if not entry_id:
+            try:
+                entry_id = str(self.logmail_repo.get_entry_id_for_file(os.path.basename(pdf_path)) or "").strip()
+            except Exception:
+                entry_id = ""
+        if not entry_id:
+            QMessageBox.information(self, "Rattacher CMR", "Impossible de déterminer l'entry_id de ce document.")
             return
 
         existing_page_links = self._get_cmr_page_links_for_page(pdf_path, page_no)
@@ -282,7 +408,7 @@ class MainWindowCmrMixin:
             mode = "add" if clicked == btn_add else "replace"
 
         try:
-            if self.current_pdf_path == pdf_path:
+            if os.path.abspath(str(getattr(self, "current_pdf_path", "") or "")) == os.path.abspath(pdf_path):
                 self.save_current_data(show_message=False)
         except Exception:
             pass
@@ -303,8 +429,6 @@ class MainWindowCmrMixin:
         now_txt = datetime.now().isoformat(timespec="seconds")
         existing["cmr_attached_at"] = now_txt
 
-        # Sauvegarde page -> tournée / commande.
-        # En mode ajout, on garde les autres rattachements de la même page.
         links = existing.get("cmr_page_links")
         if not isinstance(links, list):
             links = []
@@ -312,7 +436,6 @@ class MainWindowCmrMixin:
         if mode == "replace":
             links = [x for x in links if int(x.get("page", 0) or 0) != int(page_no)]
         else:
-            # éviter uniquement les doublons strictement identiques
             for x in links:
                 if (
                     int(x.get("page", 0) or 0) == int(page_no)
@@ -337,7 +460,6 @@ class MainWindowCmrMixin:
         links.sort(key=lambda x: (int(x.get("page", 0) or 0), str(x.get("tour_nr") or ""), str(x.get("auf_nr") or "")))
         existing["cmr_page_links"] = links
 
-        # Compat ancienne logique: on conserve aussi le dernier rattachement posé.
         existing["cmr_tour_nr"] = tour_nr
         existing["cmr_auf_nr"] = auf_nr
 
@@ -350,19 +472,21 @@ class MainWindowCmrMixin:
         except Exception:
             pass
 
-        # Refresh UI gauche
         cmr_count_for_page = len(self._get_cmr_page_links_for_page(pdf_path, page_no))
-        for r in range(self.pdf_table.rowCount()):
-            it0 = self.pdf_table.item(r, 0)
-            if it0 and it0.data(Qt.UserRole) == pdf_path:
-                if page_count > 1:
-                    it0.setToolTip(
-                        f"CMR page {page_no} : {cmr_count_for_page} rattachement(s). "
-                        f"Dernier : dossier {tour_nr} / commande {auf_nr}"
-                    )
-                else:
-                    it0.setToolTip(f"CMR rattachée au dossier {tour_nr} / commande {auf_nr}")
-                break
+        try:
+            for r in range(self.pdf_table.rowCount()):
+                it0 = self.pdf_table.item(r, 0)
+                if it0 and it0.data(Qt.UserRole) == pdf_path:
+                    if page_count > 1:
+                        it0.setToolTip(
+                            f"CMR page {page_no} : {cmr_count_for_page} rattachement(s). "
+                            f"Dernier : dossier {tour_nr} / commande {auf_nr}"
+                        )
+                    else:
+                        it0.setToolTip(f"CMR rattachée au dossier {tour_nr} / commande {auf_nr}")
+                    break
+        except Exception:
+            pass
 
         action_txt = "ajouté" if mode == "add" else "rattaché"
         if page_count > 1:
@@ -391,7 +515,6 @@ class MainWindowCmrMixin:
         except Exception:
             pass
 
-        # Si tu as un panneau d'info sous le PDF, tu peux y afficher le résumé des pages CMR
         try:
             summary = self._build_cmr_pages_summary(pdf_path)
             if summary and hasattr(self, "tour_info") and self.tour_info is not None:
