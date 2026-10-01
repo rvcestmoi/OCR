@@ -250,12 +250,13 @@ class TourRepository(BaseRepository):
 
     def get_palette_details_with_trajet_by_tournrs(self, tour_numbers: List[str]) -> List[Dict[str, Any]]:
         """
-        Retourne les lignes palettes/poids + trajet CMR + AufNr pour une liste de TourNr.
+        Retourne les informations nécessaires au rattachement CMR pour une liste de TourNr.
 
-        Important :
-        - le trajet doit être récupéré au niveau COMMANDE (XXASLAuf), pas au niveau tournée
-        - le champ Trajet renvoyé est donc propre à chaque AufNr
-        - en secours, on retombe sur les champs de tournée si les champs commande sont vides
+        Affichage popup : une ligne par commande avec :
+        - Chargement : DateChargement · Name1, Pays CP Ville
+        - Livraison   : DateLivraison · Name1, Pays CP Ville
+
+        Les VPE / palettes restent volontairement exclus de l'affichage CMR.
         """
         tour_numbers = [str(t).strip() for t in (tour_numbers or []) if str(t).strip()]
         if not tour_numbers:
@@ -266,11 +267,45 @@ class TourRepository(BaseRepository):
                 SELECT
                     LTRIM(RTRIM(CAST(auf.TourNr AS VARCHAR(20)))) AS Dossier,
                     LTRIM(RTRIM(CAST(auf.AufNr AS VARCHAR(50)))) AS AufNr,
-                    pos.VPE,
-                    SUM(pos.VPEAnz) AS Palettes,
-                    SUM(pos.TatsGew) AS Poids,
+
+                    MAX(LTRIM(RTRIM(CONVERT(VARCHAR(10), CAST(auf.BelVonDat AS DATE), 103)))) AS DateChargement,
+                    MAX(LTRIM(RTRIM(CAST(kun_chargement.Name1 AS VARCHAR(255))))) AS ChargementName1,
+                    COALESCE(
+                        NULLIF(MAX(LTRIM(RTRIM(CAST(auf.BELLKZ AS VARCHAR(20))))), ''),
+                        NULLIF(MAX(LTRIM(RTRIM(CAST(tour.BELLKZ AS VARCHAR(20))))), ''),
+                        ''
+                    ) AS ChargementPays,
+                    COALESCE(
+                        NULLIF(MAX(LTRIM(RTRIM(CAST(auf.BelPLZ AS VARCHAR(20))))), ''),
+                        NULLIF(MAX(LTRIM(RTRIM(CAST(tour.BelPLZ AS VARCHAR(20))))), ''),
+                        ''
+                    ) AS ChargementCP,
+                    COALESCE(
+                        NULLIF(MAX(LTRIM(RTRIM(CAST(auf.BelOrt AS VARCHAR(100))))), ''),
+                        NULLIF(MAX(LTRIM(RTRIM(CAST(tour.BelOrt AS VARCHAR(100))))), ''),
+                        ''
+                    ) AS ChargementVille,
+
+                    MAX(LTRIM(RTRIM(CONVERT(VARCHAR(10), CAST(auf.EntVonDat AS DATE), 103)))) AS DateLivraison,
+                    MAX(LTRIM(RTRIM(CAST(kun_livraison.Name1 AS VARCHAR(255))))) AS LivraisonName1,
+                    COALESCE(
+                        NULLIF(MAX(LTRIM(RTRIM(CAST(auf.EmgLKZ AS VARCHAR(20))))), ''),
+                        NULLIF(MAX(LTRIM(RTRIM(CAST(tour.EmgLKZ AS VARCHAR(20))))), ''),
+                        ''
+                    ) AS LivraisonPays,
+                    COALESCE(
+                        NULLIF(MAX(LTRIM(RTRIM(CAST(auf.EmgPLZ AS VARCHAR(20))))), ''),
+                        NULLIF(MAX(LTRIM(RTRIM(CAST(tour.EmgPLZ AS VARCHAR(20))))), ''),
+                        ''
+                    ) AS LivraisonCP,
+                    COALESCE(
+                        NULLIF(MAX(LTRIM(RTRIM(CAST(auf.EmgOrt AS VARCHAR(100))))), ''),
+                        NULLIF(MAX(LTRIM(RTRIM(CAST(tour.EmgOrt AS VARCHAR(100))))), ''),
+                        ''
+                    ) AS LivraisonVille,
+
                     CONCAT(
-                        MAX(LTRIM(RTRIM(CONVERT(VARCHAR(10), CAST(auf.belvondat AS DATE), 103)))),
+                        MAX(LTRIM(RTRIM(CONVERT(VARCHAR(10), CAST(auf.BelVonDat AS DATE), 103)))),
                         '-',
                         COALESCE(
                             NULLIF(MAX(LTRIM(RTRIM(CAST(auf.BELLKZ AS VARCHAR(20))))), ''),
@@ -315,19 +350,20 @@ class TourRepository(BaseRepository):
                     ON pos.aufintnr = leg.Main_aufintnr
                 LEFT JOIN XXATour tour
                     ON tour.TourNr = auf.TourNr
-                WHERE pos.VPE IS NOT NULL
-                AND LTRIM(RTRIM(CAST(auf.TourNr AS VARCHAR(20)))) IN ({placeholders})
+                LEFT JOIN XXAKun kun_chargement
+                    ON kun_chargement.KundenNr = auf.BelNr
+                LEFT JOIN XXAKun kun_livraison
+                    ON kun_livraison.KundenNr = auf.EmpNr
+                WHERE LTRIM(RTRIM(CAST(auf.TourNr AS VARCHAR(20)))) IN ({placeholders})
                 GROUP BY
                     LTRIM(RTRIM(CAST(auf.TourNr AS VARCHAR(20)))),
-                    LTRIM(RTRIM(CAST(auf.AufNr AS VARCHAR(50)))),
-                    pos.VPE
+                    LTRIM(RTRIM(CAST(auf.AufNr AS VARCHAR(50))))
                 ORDER BY
-                    Dossier,                    
-                    AufNr,
-                    pos.VPE;    
+                    Dossier,
+                    AufNr;
         """
         return self.fetch_all(query, tuple(tour_numbers))
-    
+
     def set_ocr_user_for_tournr(self, tour_nr: str, ocr_user: str = ""):
         """
         Met à jour XXATourExt.OCRUser pour un TourNr, même si la tournée n'est pas bloquée.

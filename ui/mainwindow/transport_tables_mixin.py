@@ -772,7 +772,10 @@ class MainWindowTransportTablesMixin:
 
             lines = []
             lines.append(f"Transporteur déterminé par le dossier : {source_tour_nr}")
-            lines.append(f"Transporteur : {transporter_name}")
+            if transporter_name:
+                lines.append(f"Transporteur : {transporter_name} ({kundennr})")
+            else:
+                lines.append(f"Transporteur : {kundennr}")
             lines.append(f"N° TVA : {ustid or '(non renseigné)'}")
 
             address_line = [
