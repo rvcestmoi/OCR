@@ -1,6 +1,7 @@
 import os
 import json
 import re
+import unicodedata
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 from collections import Counter
@@ -89,6 +90,56 @@ def _norm_for_search(s: str) -> str:
     return re.sub(r"[\s\u00A0\-\./]", "", (s or "").upper())
 
 
+def _normalize_model_date(value: str) -> str:
+    """Normalise une date en jj/mm/aaaa sans dépendre de invoice_parser.
+
+    ``invoice_parser`` importe ce module : on garde donc cette petite fonction ici
+    pour éviter une boucle d'import.
+    """
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    m = re.fullmatch(r"\s*(\d{1,4})[./-](\d{1,2})[./-](\d{1,4})\s*", raw)
+    if not m:
+        return raw
+    try:
+        p1, p2, p3 = [int(x) for x in m.groups()]
+    except Exception:
+        return raw
+
+    if p1 > 31:  # aaaa-mm-jj
+        year, month, day = p1, p2, p3
+    elif p3 > 31:  # jj-mm-aaaa
+        day, month, year = p1, p2, p3
+    else:  # année sur 2 chiffres
+        day, month, year = p1, p2, 2000 + p3 if p3 < 100 else p3
+
+    if not (1 <= day <= 31 and 1 <= month <= 12 and 1900 <= year <= 2100):
+        return raw
+    return f"{day:02d}/{month:02d}/{year:04d}"
+
+
+def _date_search_variants(value: str) -> List[str]:
+    d = _normalize_model_date(value)
+    m = re.fullmatch(r"(\d{2})/(\d{2})/(\d{4})", d or "")
+    if not m:
+        return [str(value or "").strip()] if value else []
+    day, month, year = m.groups()
+    yy = year[-2:]
+    return [
+        f"{day}/{month}/{year}", f"{day}-{month}-{year}", f"{day}.{month}.{year}",
+        f"{day}/{month}/{yy}", f"{day}-{month}-{yy}", f"{day}.{month}.{yy}",
+        f"{year}-{month}-{day}", f"{year}/{month}/{day}", f"{year}.{month}.{day}",
+    ]
+
+
+def _strip_accents(s: str) -> str:
+    return "".join(
+        ch for ch in unicodedata.normalize("NFKD", s or "")
+        if not unicodedata.combining(ch)
+    )
+
+
 def _find_line_with_value(text: str, value: str) -> Optional[str]:
     if not text or not value:
         return None
@@ -126,7 +177,7 @@ def _is_plausible_learned_label(label: str, field: str = "") -> bool:
         return False
 
     up = lab.upper()
-    compact = _norm_for_search(lab)
+    compact = _strip_accents(_norm_for_search(lab))
 
     # Évite d'apprendre une valeur comme label.
     if re.fullmatch(r"[A-Z]{0,4}\d[A-Z0-9/_\-.]{2,}", up):
@@ -135,12 +186,16 @@ def _is_plausible_learned_label(label: str, field: str = "") -> bool:
         return False
 
     if field == "invoice_number":
+        if _is_bad_invoice_number_label_text(lab):
+            return False
         return any(k in compact for k in (
             "FACTURE", "INVOICE", "INV", "FAKTUR", "RECHNUNG",
             "RECHNUNGSNR", "RECHNUNGSNUMMER", "NUMER", "NUMERO",
             "NUMBER", "NUMMER", "BELEG"
         ))
     if field == "invoice_date":
+        if _is_bad_invoice_date_label_text(lab):
+            return False
         return any(k in compact for k in (
             "DATE", "DATUM", "RECHNUNGSDATUM", "FACTURE", "INVOICE", "FAKTUR"
         ))
@@ -365,6 +420,45 @@ _ORDER_DATE_HINT_RE = re.compile(
     re.IGNORECASE,
 )
 
+_BAD_INVOICE_DATE_LABEL_HINT_RE = re.compile(
+    r"(?:DELIVERY\s+DATE|DATE\s+LIVRAISON|LIVRAISON|CHARGEMENT|LOAD(?:ING)?\s+DATE|UNLOAD(?:ING)?\s+DATE|PICKUP\s+DATE|PICK\s*UP\s+DATE|COLLECTION\s+DATE|DUE\s+DATE|PAYMENT\s+DUE|[ÉE]CH[ÉE]ANCE|ORDER\s+DATE|DATE\s+COMMANDE|AUFTRAGS\s*[-.]?\s*DATUM)",
+    re.IGNORECASE,
+)
+
+
+def _is_bad_invoice_date_label_text(label: str) -> bool:
+    raw = str(label or "").strip()
+    if not raw:
+        return False
+    if _BAD_INVOICE_DATE_LABEL_HINT_RE.search(raw):
+        return True
+
+    # Les patterns stockés peuvent contenir des séquences regex échappées
+    # (ex: Delivery\s+date). On teste aussi une version compacte.
+    compact = _strip_accents(re.sub(r"[^A-Z0-9]", "", raw.upper()))
+    if any(token in compact for token in (
+        "DUEDATE", "PAYMENTDUE", "ECHEANCE", "ECHAENCE",
+        "ORDERDATE", "DATECOMMANDE", "AUFTRAGSDATUM",
+        "DATELIVRAISON", "LIVRAISON", "CHARGEMENT",
+        "LOADINGDATE", "UNLOADINGDATE", "PICKUPDATE", "COLLECTIONDATE",
+    )):
+        return True
+    if "DELIVERY" in compact and "DATE" in compact:
+        return True
+    if "LOAD" in compact and "DATE" in compact:
+        return True
+    if "PICKUP" in compact and "DATE" in compact:
+        return True
+    return False
+
+
+def _is_bad_invoice_date_rule(rule: Dict[str, Any]) -> bool:
+    txt = " ".join([
+        str((rule or {}).get("label_regex") or ""),
+        str((rule or {}).get("regex") or ""),
+    ])
+    return _is_bad_invoice_date_label_text(txt)
+
 
 def _score_invoice_date_candidate(rule: Dict[str, Any], context: str) -> int:
     score = int(rule.get("hit_count", 0)) * 10
@@ -386,6 +480,8 @@ def _score_invoice_date_candidate(rule: Dict[str, Any], context: str) -> int:
         score -= 220
     if _ORDER_DATE_HINT_RE.search(haystack):
         score -= 160
+    if _BAD_INVOICE_DATE_LABEL_HINT_RE.search(haystack):
+        score -= 260
 
     if re.search(r"DATE\s+D['’]?[ÉE]MISSION", haystack, re.IGNORECASE):
         score += 140
@@ -395,6 +491,230 @@ def _score_invoice_date_candidate(rule: Dict[str, Any], context: str) -> int:
         score += 40
 
     return score
+
+
+def _model_ts(value: Any) -> float:
+    """Timestamp robuste pour trier les règles apprises par fraîcheur.
+
+    Les modèles existants stockent des dates ISO simples, sans timezone.
+    En cas de valeur absente/invalide, on retourne 0 pour garder la compatibilité.
+    """
+    try:
+        s = str(value or "").strip()
+        if not s:
+            return 0.0
+        s = s.replace("Z", "+00:00")
+        return datetime.fromisoformat(s).timestamp()
+    except Exception:
+        return 0.0
+
+
+def _rule_last_known_ts(rule: Dict[str, Any]) -> float:
+    return max(_model_ts(rule.get("last_seen")), _model_ts(rule.get("created_at")))
+
+
+def _invoice_rule_specificity(rule: Dict[str, Any]) -> int:
+    """Score de spécificité d'une règle n° facture.
+
+    Objectif : éviter qu'une règle très large apprise anciennement ou utilisée
+    souvent capte une petite valeur parasite (ex: "27") alors qu'une règle plus
+    récente et précise existe (ex: F\d{4}-\d{4}).
+    """
+    txt = " ".join([
+        str(rule.get("label_regex") or ""),
+        str(rule.get("value_regex") or ""),
+        str(rule.get("regex") or ""),
+    ]).upper()
+    score = 0
+    if "INVOICE" in txt or "FACTURE" in txt or "RECHNUNG" in txt or "FAKTUR" in txt:
+        score += 30
+    if re.search(r"F\\D*\\d|[A-Z]\\\\D|\\\\D\\{", txt):
+        score += 45
+    if re.search(r"\\\\D\{\d", txt) or re.search(r"\[A-Z", txt):
+        score += 20
+    if "COMPANY" in txt or "VAT" in txt or "CUSTOMER" in txt or "CLIENT" in txt:
+        score -= 120
+    if _is_bad_invoice_number_rule(rule):
+        score -= 500
+    if "[A-Z0-9]" in txt and "*" in txt:
+        score -= 15
+    return score
+
+
+
+def _invoice_rule_text(rule: Dict[str, Any]) -> str:
+    return " ".join([
+        str(rule.get("label_regex") or ""),
+        str(rule.get("value_regex") or ""),
+        str(rule.get("regex") or ""),
+    ])
+
+
+def _is_bad_invoice_number_label_text(label: str) -> bool:
+    """Rejette les faux libellés appris pour les numéros de facture.
+
+    Exemple réel : ``invoice@ed-trans com`` contient le mot ``invoice`` mais
+    c'est une adresse e-mail ; la règle apprenait ensuite ``FR83453080848``
+    comme numéro de facture.
+    """
+    raw = str(label or "").strip()
+    up = raw.upper()
+    compact = re.sub(r"[^A-Z0-9@]", "", up)
+    if not raw:
+        return False
+
+    email_like = (
+        "@" in raw
+        or "\\@" in raw
+        or "EMAIL" in up
+        or "E-MAIL" in up
+        or ("MAIL" in up and ("@" in raw or "INVOICE" in up or "FACTURE" in up))
+        or re.search(r"[A-Z0-9._%+\-]+\s*@", up) is not None
+    )
+    if email_like:
+        return True
+
+    bad_words = (
+        "SIRET", "SIREN", "APE", "CAPITAL", "INTRACOM",
+        "TVA", "VAT", "USTID", "UST-ID",
+        "COMPANYNUMBER", "CUSTOMERNUMBER", "CLIENTNUMBER", "CODECLIENT",
+        "IBAN", "BIC", "SWIFT",
+        # Très important : un modèle invoice_number ne doit jamais apprendre
+        # des libellés de dates. Exemple réel : label "Invoice date" qui
+        # renvoie ensuite 16/03/2026 comme numéro de facture.
+        "DATE", "DELIVERYDATE", "DUEDATE", "ECHEANCE", "ECHAENCE", "DATELIVRAISON",
+    )
+    if any(w in compact for w in bad_words):
+        return True
+
+    if "EDTRANS" in compact and ("INVOICE" in compact or "FACTURE" in compact):
+        return True
+
+    return False
+
+
+def _is_bad_invoice_number_rule(rule: Dict[str, Any]) -> bool:
+    return _is_bad_invoice_number_label_text(_invoice_rule_text(rule))
+
+
+def _is_bad_invoice_number_value(value: str) -> bool:
+    raw = str(value or "").strip()
+    # Une date ne doit jamais devenir un numéro de facture appris/appliqué.
+    # Exemple réel : une règle invoice_number apprenait "Invoice date" et
+    # ressortait ensuite 16/03/2026 au lieu du vrai numéro.
+    if re.fullmatch(r"\d{1,2}[./-]\d{1,2}[./-]\d{2,4}", raw):
+        return True
+
+    v = re.sub(r"[\s\u00A0\-_.]", "", raw.upper())
+    if not v:
+        return True
+
+    # TVA intracom FR : FR + 2 caractères de clé + 9 chiffres
+    # ou variantes OCR compactes FR + 10/12 chiffres.
+    if re.fullmatch(r"FR[A-Z0-9]{2}\d{9}", v):
+        return True
+    if re.fullmatch(r"FR\d{10,12}", v):
+        return True
+
+    # TVA intracom d'autres pays : deux lettres pays + longue suite alphanum.
+    if re.fullmatch(r"[A-Z]{2}[A-Z0-9]{8,14}", v) and re.search(r"\d{6,}", v):
+        return True
+
+    return False
+
+def _invoice_number_rule_sort_key(rule: Dict[str, Any]) -> tuple:
+    mode = (rule.get("mode") or "").strip().lower()
+    return (
+        _rule_last_known_ts(rule),
+        _model_ts(rule.get("created_at")),
+        1 if mode == "near_label" else 0,
+        _invoice_rule_specificity(rule),
+        int(rule.get("hit_count", 0) or 0),
+    )
+
+
+def _is_weak_invoice_number_value(value: str) -> bool:
+    v = (value or "").strip().upper()
+    compact = re.sub(r"[^A-Z0-9]", "", v)
+    if not compact:
+        return True
+    # Cas typique du bug : une règle large près de "Invoice number" récupère
+    # un petit nombre parasite comme 27 au lieu de F2026-9833.
+    if compact.isdigit() and len(compact) <= 3:
+        return True
+    if len(compact) <= 2:
+        return True
+    return False
+
+
+def _confirmed_value_sort_key(item: Dict[str, Any]) -> tuple:
+    return (
+        _model_ts((item or {}).get("last_seen")),
+        _model_ts((item or {}).get("created_at")),
+        int((item or {}).get("hit_count", 0) or 0),
+    )
+
+
+def _confirmed_value_variants(field: str, value: str) -> List[str]:
+    v = str(value or "").strip()
+    if not v:
+        return []
+    if field == "invoice_date":
+        return _date_search_variants(v)
+    if field in ("iban", "bic"):
+        compact = re.sub(r"[\s\u00A0-]", "", v.upper())
+        return [v, compact]
+    return [v]
+
+
+def _text_contains_confirmed_value(text: str, value: str, field: str = "") -> bool:
+    if not text or not value:
+        return False
+    haystack = _norm_for_search(text)
+    for candidate in _confirmed_value_variants(field, value):
+        if candidate and _norm_for_search(candidate) in haystack:
+            return True
+    return False
+
+
+def _clean_confirmed_value_for_field(field: str, value: str) -> str:
+    v = str(value or "").strip()
+    if not v:
+        return ""
+    if field == "invoice_number":
+        return "" if _is_bad_invoice_number_value(v) else v
+    if field == "invoice_date":
+        d = _normalize_model_date(v)
+        return d if re.fullmatch(r"\d{2}/\d{2}/\d{4}", d or "") else ""
+    if field == "iban":
+        n = re.sub(r"[\s\u00A0-]", "", v.upper())
+        return n if validate_iban(n) else ""
+    if field == "bic":
+        n = re.sub(r"[\s\u00A0-]", "", v.upper())
+        return n if validate_bic(n) else ""
+    if field in ("vat_rate", "vat_base", "vat_amount"):
+        return v if _is_plausible_model_value(field, v) else ""
+    return v
+
+
+def _match_confirmed_value(text: str, model: dict, field: str) -> str:
+    confirmed = (model or {}).get("confirmed_values") or {}
+    values = confirmed.get(field) or []
+    if not isinstance(values, list):
+        return ""
+
+    for item in sorted([x for x in values if isinstance(x, dict)], key=_confirmed_value_sort_key, reverse=True):
+        value = _clean_confirmed_value_for_field(field, str(item.get("value") or ""))
+        if not value:
+            continue
+        if _text_contains_confirmed_value(text, value, field):
+            return value
+    return ""
+
+
+def _match_confirmed_invoice_number(text: str, model: dict) -> str:
+    # Compatibilité avec les appels existants ; la logique est maintenant générique.
+    return _match_confirmed_value(text, model, "invoice_number")
 
 
 IBAN_LENGTHS: Dict[str, int] = {
@@ -583,8 +903,10 @@ def learn_supplier_patterns(
             "created_at": _now_iso(),
         })
 
-    # Invoice number : ligne + fallback label
-    if invoice_number:
+    # Invoice number : ligne + fallback label.
+    # Si l'OCR automatique a mis une date / TVA / IBAN-like dans le champ n° facture,
+    # on n'apprend surtout pas cette erreur dans le modèle fournisseur.
+    if invoice_number and not _is_bad_invoice_number_value(invoice_number):
         line = _find_line_with_value(ocr_text, invoice_number)
         rx = _make_line_regex(line, "invoice_number", invoice_number) if line else None
         if rx and _norm_for_search(line or "") != _norm_for_search(invoice_number):
@@ -776,7 +1098,21 @@ def merge_patterns(
                 out.append(rr)
                 idx[k] = rr
 
-        out.sort(key=lambda x: int(x.get("hit_count", 0)), reverse=True)
+        if field == "invoice_number":
+            # Supprime les faux patterns appris anciennement, ex :
+            # label ``invoice@ed-trans com`` qui attrape une TVA FR...
+            out = [r for r in out if not _is_bad_invoice_number_rule(r)]
+            # Pour les numéros de facture, la dernière règle apprise/confirmée
+            # doit primer sur la plus utilisée. Cela évite qu'un ancien pattern
+            # générique continue à gagner contre un pattern fournisseur plus précis.
+            out.sort(key=_invoice_number_rule_sort_key, reverse=True)
+        elif field == "invoice_date":
+            # Supprime les faux patterns appris anciennement, ex :
+            # Delivery date / Due date utilisés par erreur comme date de facture.
+            out = [r for r in out if not _is_bad_invoice_date_rule(r)]
+            out.sort(key=lambda x: (_rule_last_known_ts(x), int(x.get("hit_count", 0) or 0)), reverse=True)
+        else:
+            out.sort(key=lambda x: int(x.get("hit_count", 0)), reverse=True)
         merged[field] = out[:max_rules_per_field]
 
     return merged
@@ -787,10 +1123,20 @@ def extract_fields_with_model(text: str, model: dict) -> Dict[str, str]:
     patterns = (model or {}).get("patterns") or {}
     out: Dict[str, str] = {}
 
-    if not text or not patterns:
+    if not text:
         return out
 
     src = (text or "").replace("\u00A0", " ")
+
+    # Les valeurs corrigées manuellement par l'utilisateur sont prioritaires,
+    # mais uniquement si elles sont réellement présentes dans l'OCR courant.
+    # Exemple : si l'utilisateur corrige une date de facture puis sauvegarde,
+    # une prochaine OCR du même document doit reprendre cette date avant toute
+    # ancienne règle erronée qui retournerait une date de livraison/échéance.
+    for confirmed_field in ("invoice_number", "invoice_date", "iban", "bic", "vat_rate", "vat_base", "vat_amount"):
+        confirmed_value = _match_confirmed_value(src, model, confirmed_field)
+        if confirmed_value:
+            out[confirmed_field] = confirmed_value
 
     def apply_rule(field: str, rule: Dict[str, Any]) -> Optional[str]:
         mode = rule.get("mode")
@@ -828,24 +1174,50 @@ def extract_fields_with_model(text: str, model: dict) -> Dict[str, str]:
         rules = list(patterns.get(field, []) or [])
         rules.sort(key=lambda x: int(x.get("hit_count", 0)), reverse=True)
 
-        # Pour invoice_number, prioriser les near_label
+        # Une valeur confirmée par sauvegarde utilisateur est déjà prioritaire.
+        if field in out:
+            continue
+
+        # Pour invoice_number :
+        # - ne plus trier par hit_count, mais par dernière règle connue
+        #   (last_seen/created_at), afin que le dernier pattern fournisseur
+        #   confirmé soit essayé avant un ancien pattern générique ;
+        # - ignorer les valeurs très faibles comme "27" si un candidat plus
+        #   crédible est disponible ensuite.
         if field == "invoice_number":
-            near_label_rules = [r for r in rules if r.get("mode") == "near_label"]
-            other_rules = [r for r in rules if r.get("mode") != "near_label"]
-            found_val = None
-            for r in near_label_rules:
+            rules.sort(key=_invoice_number_rule_sort_key, reverse=True)
+            weak_candidate = None
+
+            for r in rules:
+                # Les anciens modèles peuvent contenir des faux labels appris
+                # dans invoice_number, par exemple "Company number". On les
+                # neutralise ici sans supprimer le JSON existant.
+                rule_text = " ".join([str(r.get("label_regex") or ""), str(r.get("regex") or "")]).upper()
+                if re.search(r"COMPANY\s*\\?\s*NUMBER|VAT\s*\\?\s*NUMBER|CUSTOMER\s*\\?\s*NUMBER", rule_text):
+                    continue
+                if _is_bad_invoice_number_rule(r):
+                    continue
+
                 val = apply_rule(field, r)
-                if val:
-                    found_val = val.strip()
-                    break
-            if not found_val:
-                for r in other_rules:
-                    val = apply_rule(field, r)
-                    if val:
-                        found_val = val.strip()
-                        break
-            if found_val:
-                out[field] = found_val
+                if not val:
+                    continue
+                val = val.strip()
+                if not val:
+                    continue
+
+                if _is_bad_invoice_number_value(val):
+                    continue
+
+                if _is_weak_invoice_number_value(val):
+                    if weak_candidate is None:
+                        weak_candidate = val
+                    continue
+
+                out[field] = val
+                break
+
+            if field not in out and weak_candidate:
+                out[field] = weak_candidate
             continue
 
         # Pour invoice_date, scorer tous les candidats pour éviter de prendre une échéance
@@ -853,6 +1225,8 @@ def extract_fields_with_model(text: str, model: dict) -> Dict[str, str]:
             best_date = None
             best_score = -10**9
             for r in rules:
+                if _is_bad_invoice_date_rule(r):
+                    continue
                 mode = (r.get("mode") or "").strip().lower()
                 if mode == "line_regex":
                     rx = re.compile(r.get("regex", ""), re.IGNORECASE | re.MULTILINE)
@@ -897,7 +1271,9 @@ def extract_fields_with_model(text: str, model: dict) -> Dict[str, str]:
                             best_score = score
                             best_date = val.strip()
             if best_date:
-                out[field] = best_date.strip()
+                cleaned_date = _normalize_model_date(best_date.strip())
+                if re.fullmatch(r"\d{2}/\d{2}/\d{4}", cleaned_date or ""):
+                    out[field] = cleaned_date
             continue
 
         # Comportement standard pour les autres champs

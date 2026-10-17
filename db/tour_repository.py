@@ -153,19 +153,25 @@ class TourRepository(BaseRepository):
 
     def get_theoretical_vat_percent_by_tournr(self, tour_nr: str) -> Optional[float]:
         """
-        Retourne le taux de TVA théorique (en %) pour une tournée/dossier (TourNr).
-        Source : XXAV_FR_UNION_XXAPreFakAuf_XXAFakAuf + XXAUC (champ Prozent).
+        Retourne le taux de TVA théorique (en %) pour une tournée/dossier.
+        Source : factures transporteur (DebKred = 'K') et premier UC du champ UCs.
+        En présence de plusieurs lignes pour une tournée, on retient le taux
+        maximal, comme dans la recherche groupée. Aucun UC trouvé => None.
         """
         tour_nr = (tour_nr or "").strip()
         if not tour_nr:
             return None
 
         query = """
-            SELECT TOP 1 COALESCE(uc.Prozent, 0) AS Prozent
-            FROM XXAV_FR_UNION_XXAPreFakAuf_XXAFakAuf auf
-            LEFT JOIN XXAUC uc ON auf.FFUC = uc.UC
-            WHERE auf.AufDK = 'K'
-            AND LTRIM(RTRIM(CAST(auf.TourNr AS VARCHAR(20)))) = ?
+            SELECT MAX(uc.Prozent) AS Prozent
+            FROM XXAV_FR_UNION_XXAPreFakT_XXAFakT_228794 AS auf
+            LEFT JOIN XXAUC AS uc
+                ON uc.UC = NULLIF(LTRIM(RTRIM(LEFT(
+                    auf.UCs,
+                    CHARINDEX(',', auf.UCs + ',') - 1
+                ))), '')
+            WHERE auf.DebKred = 'K'
+              AND LTRIM(RTRIM(CAST(auf.TourNr AS VARCHAR(20)))) = ?
         """
 
         row = self.fetch_one(query, (tour_nr,))
@@ -535,7 +541,7 @@ class TourRepository(BaseRepository):
 
 
     def get_theoretical_vat_percent_by_tournrs(self, tour_numbers: List[str]) -> Dict[str, Optional[float]]:
-        """Retourne {TourNr: taux TVA théorique} en une seule série de requêtes."""
+        """Retourne {TourNr: taux TVA théorique} depuis le premier UC de UCs."""
         tour_numbers = [str(t).strip() for t in (tour_numbers or []) if str(t).strip()]
         if not tour_numbers:
             return {}
@@ -548,11 +554,15 @@ class TourRepository(BaseRepository):
             query = f"""
                 SELECT
                     LTRIM(RTRIM(CAST(auf.TourNr AS VARCHAR(20)))) AS TourNr,
-                    MAX(COALESCE(uc.Prozent, 0)) AS Prozent
-                FROM XXAV_FR_UNION_XXAPreFakAuf_XXAFakAuf auf
-                LEFT JOIN XXAUC uc ON auf.FFUC = uc.UC
-                WHERE auf.AufDK = 'K'
-                AND LTRIM(RTRIM(CAST(auf.TourNr AS VARCHAR(20)))) IN ({placeholders})
+                    MAX(uc.Prozent) AS Prozent
+                FROM XXAV_FR_UNION_XXAPreFakT_XXAFakT_228794 AS auf
+                LEFT JOIN XXAUC AS uc
+                    ON uc.UC = NULLIF(LTRIM(RTRIM(LEFT(
+                        auf.UCs,
+                        CHARINDEX(',', auf.UCs + ',') - 1
+                    ))), '')
+                WHERE auf.DebKred = 'K'
+                  AND LTRIM(RTRIM(CAST(auf.TourNr AS VARCHAR(20)))) IN ({placeholders})
                 GROUP BY LTRIM(RTRIM(CAST(auf.TourNr AS VARCHAR(20))))
             """
             rows = self.fetch_all(query, tuple(chunk)) or []

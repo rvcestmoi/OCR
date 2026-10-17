@@ -2908,6 +2908,81 @@ class MainWindowCoreMixin:
             "model_version": 3,
         })
 
+        # Valeurs corrigées/sauvegardées par l'utilisateur : elles doivent primer
+        # lors d'une prochaine OCR du même document si elles sont présentes dans
+        # le texte OCR courant.
+        # Exemple : date de facture corrigée manuellement => elle passe avant une
+        # ancienne règle fournisseur qui capterait une date de livraison/échéance.
+        try:
+            confirmed = data.get("confirmed_values")
+            if not isinstance(confirmed, dict):
+                confirmed = {}
+
+            def _push_confirmed(field_name: str, raw_value: str):
+                value = str(raw_value or "").strip()
+                if not value:
+                    return
+
+                # Nettoyages/validations simples pour ne pas sauvegarder une erreur
+                # évidente comme valeur prioritaire.
+                if field_name == "invoice_number":
+                    is_date_like = bool(re.fullmatch(r"\d{1,2}[./-]\d{1,2}[./-]\d{2,4}", value))
+                    is_vat_like = bool(re.fullmatch(r"[A-Z]{2}[A-Z0-9]{8,14}", value.replace(" ", "").upper()))
+                    if is_date_like or is_vat_like:
+                        return
+                elif field_name == "invoice_date":
+                    value = normalize_date_format(value)
+                    if not re.fullmatch(r"\d{2}/\d{2}/\d{4}", value or ""):
+                        return
+                elif field_name == "iban":
+                    value = value.replace(" ", "").replace(" ", "").replace("-", "").upper()
+                    if not validate_iban(value):
+                        return
+                elif field_name == "bic":
+                    value = value.replace(" ", "").replace(" ", "").replace("-", "").upper()
+                    if not validate_bic(value):
+                        return
+
+                lst = confirmed.get(field_name)
+                if not isinstance(lst, list):
+                    lst = []
+
+                now_txt = datetime.now().isoformat(timespec="seconds")
+                found = False
+                for item in lst:
+                    if isinstance(item, dict) and str(item.get("value") or "").strip() == value:
+                        item["hit_count"] = int(item.get("hit_count", 0) or 0) + 1
+                        item["last_seen"] = now_txt
+                        item["source"] = "user_save"
+                        found = True
+                        break
+
+                if not found:
+                    lst.append({
+                        "value": value,
+                        "created_at": now_txt,
+                        "last_seen": now_txt,
+                        "hit_count": 1,
+                        "source": "user_save",
+                    })
+
+                lst = sorted(
+                    [x for x in lst if isinstance(x, dict) and str(x.get("value") or "").strip()],
+                    key=lambda x: (str(x.get("last_seen") or ""), int(x.get("hit_count", 0) or 0)),
+                    reverse=True,
+                )[:20]
+                confirmed[field_name] = lst
+
+            _push_confirmed("invoice_number", self.invoice_number_input.text())
+            _push_confirmed("invoice_date", self.date_input.text())
+            _push_confirmed("iban", self.iban_input.text())
+            _push_confirmed("bic", self.bic_input.text())
+
+            if confirmed:
+                data["confirmed_values"] = confirmed
+        except Exception:
+            pass
+
         # 6) sauver le fichier
         try:
             save_supplier_model(supplier_key, data)
