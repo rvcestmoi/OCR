@@ -566,6 +566,7 @@ class TourRepository(BaseRepository):
                 GROUP BY LTRIM(RTRIM(CAST(auf.TourNr AS VARCHAR(20))))
             """
             rows = self.fetch_all(query, tuple(chunk)) or []
+            print(rows)
             for r in rows:
                 t = str(r.get("TourNr") or r.get("tournr") or "").strip()
                 v = r.get("Prozent") if "Prozent" in r else r.get("prozent")

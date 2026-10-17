@@ -203,7 +203,13 @@ class MainWindowValidationMixin:
         # 1) Toujours re-sauvegarder AVANT les updates SQL
         validation_pdf_path = self._get_validation_document_path() or str(getattr(self, "current_pdf_path", "") or "").strip()
         self._last_validation_invoice_pdf_path = validation_pdf_path
-        self.save_current_data(status="validated", show_message=False, pdf_path=validation_pdf_path)
+        if not self.save_current_data(status="validated", show_message=False, pdf_path=validation_pdf_path):
+            QMessageBox.warning(
+                self,
+                "Validation",
+                "La sauvegarde de la facture a échoué. Aucun motif de blocage n'a été transmis à SQL.",
+            )
+            return
 
         # La mise à jour de XXAKun.KtoKreA/KtoKre est volontairement manuelle
         # via le bouton 💾 près du champ Cpte a. La validation ne modifie pas

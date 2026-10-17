@@ -305,44 +305,6 @@ class MainWindowDocumentsMixin:
         with open(json_path, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
 
-    def _get_block_sync_tournrs(self, data: dict | None = None) -> list[str]:
-        """Retourne les TourNr à mettre à jour lors d'un changement de blocage."""
-        tournrs: list[str] = []
-
-        # Priorité aux lignes actuellement affichées/saisies : l'utilisateur peut
-        # poser un blocage avant d'avoir sauvegardé la facture.
-        try:
-            if hasattr(self, "get_folder_rows"):
-                for row in self.get_folder_rows() or []:
-                    if isinstance(row, dict):
-                        tour_nr = str(row.get("tour_nr") or row.get("TourNr") or row.get("tournr") or "").strip()
-                    else:
-                        tour_nr = str(row or "").strip()
-                    if tour_nr:
-                        tournrs.append(tour_nr)
-        except Exception:
-            pass
-
-        # Fallback JSON déjà chargé.
-        if not tournrs and isinstance(data, dict):
-            try:
-                if hasattr(self, "_extract_tournrs_from_saved"):
-                    tournrs.extend(self._extract_tournrs_from_saved(data) or [])
-            except Exception:
-                pass
-
-        # Dernier fallback : JSON de la facture courante.
-        if not tournrs:
-            try:
-                current_pdf_path = str(getattr(self, "current_pdf_path", "") or "").strip()
-                if current_pdf_path and hasattr(self, "_read_saved_invoice_json") and hasattr(self, "_extract_tournrs_from_saved"):
-                    saved = self._read_saved_invoice_json(current_pdf_path) or {}
-                    tournrs.extend(self._extract_tournrs_from_saved(saved) or [])
-            except Exception:
-                pass
-
-        return sorted({str(t).strip() for t in tournrs if str(t).strip()})
-
     def _get_effective_block_state_for_database(self, block_options: dict | None = None, preferred_doc_name: str = "") -> tuple[bool, str]:
         """Calcule l'état de blocage global à écrire en BDD pour la facture.
 
@@ -383,8 +345,8 @@ class MainWindowDocumentsMixin:
     def _get_block_mail_metadata(self, preferred_doc_name: str = "") -> dict:
         """Récupère l'expéditeur et l'objet du mail source de la facture.
 
-        Ces informations sont poussées dans XXATourExt lors de la synchronisation
-        d'un motif de blocage. Si l'ancien flux n'a pas encore d'entry_id en
+        Ces informations sont poussées dans XXATourExt lors de la validation
+        d'une facture bloquée. Si l'ancien flux n'a pas encore d'entry_id en
         mémoire, on retombe sur le nom du PDF courant.
         """
         meta = {"expediteur": "", "sujet": ""}
@@ -417,7 +379,7 @@ class MainWindowDocumentsMixin:
         mail_expediteur: str = "",
         mail_objet: str = "",
     ) -> list[str]:
-        """Applique immédiatement l'état de blocage dans les tables SQL liées aux tours."""
+        """Applique l'état de blocage aux tournées uniquement lors de la validation."""
         errors: list[str] = []
         value = 601 if blocked else 600
         ocr_user = str(getattr(self, "current_username", "") or "").strip()
@@ -443,46 +405,6 @@ class MainWindowDocumentsMixin:
                 errors.append(f"{tour_nr} : {e}")
 
         return errors
-
-    def _sync_block_options_to_database(self, block_options: dict, *, data: dict | None = None, preferred_doc_name: str = "", show_message: bool = True) -> bool:
-        """Synchronise la BDD dès qu'un motif de blocage est ajouté ou retiré."""
-        tournrs = self._get_block_sync_tournrs(data)
-        blocked, comment = self._get_effective_block_state_for_database(block_options, preferred_doc_name)
-
-        if not tournrs:
-            if show_message:
-                QMessageBox.warning(
-                    self,
-                    "Blocage",
-                    "Motif enregistré dans le JSON, mais aucun dossier (TourNr) n'a été trouvé pour mettre à jour la BDD.",
-                )
-            return False
-
-        mail_meta = self._get_block_mail_metadata(preferred_doc_name) if blocked else {"expediteur": "", "sujet": ""}
-        errors = self._apply_block_state_to_database(
-            tournrs,
-            blocked=blocked,
-            comment=comment,
-            mail_expediteur=mail_meta.get("expediteur", ""),
-            mail_objet=mail_meta.get("sujet", ""),
-        )
-        if errors:
-            if show_message:
-                QMessageBox.warning(
-                    self,
-                    "Blocage",
-                    "Motif enregistré, mais la mise à jour BDD a échoué pour :\n" + "\n".join(errors),
-                )
-            return False
-
-        if show_message:
-            try:
-                state = "bloqué" if blocked else "débloqué"
-                self.statusBar().showMessage(f"Blocage BDD synchronisé : {len(tournrs)} dossier(s) {state}.", 3500)
-            except Exception:
-                pass
-
-        return True
 
     def open_block_options_dialog(self):
         # doc affiché (facture ou PJ)
@@ -511,14 +433,7 @@ class MainWindowDocumentsMixin:
         if dlg.exec() != QDialog.Accepted:
             return
 
-        previous_blocked = bool(current.get("blocked", False))
-        previous_comment = str(current.get("comment", "") or "").strip()
         result = dlg.get_result()
-        block_changed = (
-            previous_blocked != bool(result.get("blocked", False))
-            or previous_comment != str(result.get("comment", "") or "").strip()
-        )
-
         block_options[doc_name] = result
         data["block_options"] = block_options
         self._write_model_json(json_path, data)
@@ -526,15 +441,16 @@ class MainWindowDocumentsMixin:
         # en mémoire aussi (utile si tu veux t’en servir ailleurs)
         self.block_options = block_options
 
-        # Dès qu'un motif est ajouté, retiré ou modifié, on met à jour la BDD
-        # sans attendre la validation de la facture.
-        if block_changed:
-            self._sync_block_options_to_database(
-                block_options,
-                data=data,
-                preferred_doc_name=doc_name,
-                show_message=True,
+        # Le motif reste sauvegardé localement pour la facture en cours.
+        # Aucun UPDATE SQL n'est effectué ici : le blocage (ou son retrait)
+        # sera poussé sur toutes les tournées après confirmation de la validation.
+        try:
+            self.statusBar().showMessage(
+                "Motif de blocage enregistré. Application aux dossiers à la validation.",
+                4000,
             )
+        except Exception:
+            pass
 
     def on_pdf_table_context_menu(self, pos):
         """Clic-droit sur la liste du haut : rattacher un document à la facture sélectionnée."""

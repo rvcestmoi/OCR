@@ -2418,6 +2418,19 @@ class MainWindowCoreMixin:
                     except Exception:
                         reporting_tour_numbers = []
 
+                # Le reporting est alimenté à chaque sauvegarde, mais
+                # IsBloque ne doit être modifié dans SQL qu'à la validation.
+                # Le blocage effectif porte sur tous les documents du groupe.
+                reporting_blocked = None
+                if normalized_status == "validated":
+                    if hasattr(self, "_get_effective_block_state_for_database"):
+                        reporting_blocked, _ = self._get_effective_block_state_for_database(
+                            data.get("block_options") or getattr(self, "block_options", {}) or {},
+                            preferred_doc_name=os.path.basename(pdf_path),
+                        )
+                    else:
+                        reporting_blocked = bool(data.get("blocked", False))
+
                 # Le reporting est volontairement non bloquant : une erreur ici
                 # ne doit pas empêcher la sauvegarde JSON/SQL principale.
                 if utilisateur and rech_nr and reporting_tour_numbers:
@@ -2425,7 +2438,7 @@ class MainWindowCoreMixin:
                         utilisateur=utilisateur,
                         rech_nr=rech_nr,
                         tour_nrs=reporting_tour_numbers,
-                        is_bloque=bool(data.get("blocked", False)),
+                        is_bloque=reporting_blocked,
                         is_validated=(normalized_status == "validated"),
                     )
                     if reporting_errors:

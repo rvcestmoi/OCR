@@ -56,7 +56,7 @@ class ReportingRepository(BaseRepository):
         utilisateur: str,
         rech_nr: str,
         tour_nr: str,
-        is_bloque: bool,
+        is_bloque: bool | None,
         is_validated: bool = False,
     ) -> None:
         utilisateur = str(utilisateur or "").strip()
@@ -80,7 +80,7 @@ class ReportingRepository(BaseRepository):
 
             UPDATE dbo.XXA_OCR_REPORTING_MODIFS
             SET DateModification = SYSDATETIME(),
-                IsBloque = ?,
+                IsBloque = COALESCE(CAST(? AS BIT), IsBloque),
                 IsValidated = CASE WHEN ? = 1 THEN 1 ELSE IsValidated END,
                 IsLastModifierForTour = 1
             WHERE Utilisateur = ?
@@ -105,7 +105,7 @@ class ReportingRepository(BaseRepository):
                     ?,
                     ?,
                     ?,
-                    ?,
+                    COALESCE(CAST(? AS BIT), CAST(0 AS BIT)),
                     ?,
                     1
                 );
@@ -113,7 +113,9 @@ class ReportingRepository(BaseRepository):
 
             COMMIT TRANSACTION;
         """
-        is_bloque_db = 1 if is_bloque else 0
+        # Une sauvegarde non validée continue d'alimenter le reporting,
+        # mais ne doit pas changer son état de blocage SQL.
+        is_bloque_db = None if is_bloque is None else (1 if is_bloque else 0)
         is_validated_db = 1 if is_validated else 0
         self.execute(
             sql,
@@ -138,7 +140,7 @@ class ReportingRepository(BaseRepository):
         utilisateur: str,
         rech_nr: str,
         tour_nrs: list[str],
-        is_bloque: bool,
+        is_bloque: bool | None,
         is_validated: bool = False,
     ) -> list[str]:
         """Upsert une ligne par dossier et retourne les erreurs éventuelles."""
