@@ -253,51 +253,6 @@ def _extract_label_near_value(text: str, value: str, window: int = 50, field: st
     return None
 
 
-def _is_plausible_vat_label(field: str, label: str) -> bool:
-    lab = (label or "").strip()
-    up = lab.upper()
-    if not lab:
-        return False
-    bad = (
-        "REFERENCE", "RÉF", "REF", "N° TVA", "NO TVA", "TVA INTRA", "INTRACOMMUNAUTAIRE",
-        "ED-TRANS", "SIRET", "SIREN", "CMR", "DOSSIER", "FACTURE", "INVOICE"
-    )
-    if any(b in up for b in bad):
-        return False
-
-    if field == "vat_rate":
-        return any(k in up for k in ("TAUX", "TVA", "VAT", "%", "MWST", "IVA", "BTW", "PVM"))
-    if field == "vat_base":
-        return any(k in up for k in ("BASE", "HT", "NET", "NETTO", "TAXABLE"))
-    if field == "vat_amount":
-        return any(k in up for k in ("MONTANT", "TOTAL TVA", "VAT", "TVA", "TAX"))
-    return True
-
-
-def _is_plausible_model_value(field: str, value: str) -> bool:
-    v = (value or "").strip()
-    if not v:
-        return False
-    compact = re.sub(r"[\s €EUReur]", "", v)
-    if field == "vat_rate":
-        try:
-            n = float(v.replace("%", "").replace(",", "."))
-        except Exception:
-            return False
-        return 0 <= n <= 30
-    if field in ("vat_base", "vat_amount"):
-        if re.fullmatch(r"\d{8,}", compact):
-            return False
-        if not any(ch in v for ch in ",.") and len(compact) > 6:
-            return False
-        try:
-            float(v.replace(" ", "").replace(" ", "").replace("€", "").replace("EUR", "").replace("eur", "").replace(",", "."))
-        except Exception:
-            return False
-        return True
-    return True
-
-
 def _value_group_regex(field: str, value: str) -> str:
     v = (value or "").strip()
 
@@ -692,8 +647,6 @@ def _clean_confirmed_value_for_field(field: str, value: str) -> str:
     if field == "bic":
         n = re.sub(r"[\s\u00A0-]", "", v.upper())
         return n if validate_bic(n) else ""
-    if field in ("vat_rate", "vat_base", "vat_amount"):
-        return v if _is_plausible_model_value(field, v) else ""
     return v
 
 
@@ -869,7 +822,6 @@ def learn_supplier_patterns(
     bic: str,
     invoice_number: str,
     invoice_date: str,
-    vat_lines: list[dict] | None = None,
 ) -> Dict[str, List[Dict[str, Any]]]:
     """Construit des règles à partir du texte OCR + valeurs validées."""
     patterns: Dict[str, List[Dict[str, Any]]] = {
@@ -877,9 +829,6 @@ def learn_supplier_patterns(
         "bic": [],
         "invoice_number": [],
         "invoice_date": [],
-        "vat_rate": [],
-        "vat_base": [],
-        "vat_amount": [],
     }
 
     # IBAN/BIC : match exact tolérant (fiable)
@@ -979,84 +928,6 @@ def learn_supplier_patterns(
             "created_at": _now_iso(),
         })
 
-    # VAT patterns : apprendre des patterns d'extraction comme pour invoice_number
-    if vat_lines:
-        for vat_row in vat_lines:
-            rate = vat_row.get("rate", "").strip()
-            base = vat_row.get("base", "").strip()
-            vat = vat_row.get("vat", "").strip()
-
-            # Pour rate
-            if rate:
-                specific_label = _extract_label_near_value(ocr_text, rate, field="vat_rate")
-                if specific_label and _is_plausible_vat_label("vat_rate", specific_label):
-                    patterns["vat_rate"].append({
-                        "mode": "near_label",
-                        "label_regex": rf"\b{re.escape(specific_label)}\b",
-                        "value_regex": r"(\d{1,2}(?:[.,]\d{1,2})?)",
-                        "window": 200,
-                        "group": 1,
-                        "hit_count": 0,
-                        "created_at": _now_iso(),
-                    })
-
-            # Pour base
-            if base:
-                specific_label = _extract_label_near_value(ocr_text, base, field="vat_base")
-                if specific_label and _is_plausible_vat_label("vat_base", specific_label):
-                    patterns["vat_base"].append({
-                        "mode": "near_label",
-                        "label_regex": rf"\b{re.escape(specific_label)}\b",
-                        "value_regex": r"(\d+(?:[ \u00A0]\d{3})*(?:[.,]\d{2})?)",
-                        "window": 200,
-                        "group": 1,
-                        "hit_count": 0,
-                        "created_at": _now_iso(),
-                    })
-
-            # Pour vat
-            if vat:
-                specific_label = _extract_label_near_value(ocr_text, vat, field="vat_amount")
-                if specific_label and _is_plausible_vat_label("vat_amount", specific_label):
-                    patterns["vat_amount"].append({
-                        "mode": "near_label",
-                        "label_regex": rf"\b{re.escape(specific_label)}\b",
-                        "value_regex": r"(\d+(?:[ \u00A0]\d{3})*(?:[.,]\d{2})?)",
-                        "window": 200,
-                        "group": 1,
-                        "hit_count": 0,
-                        "created_at": _now_iso(),
-                    })
-
-    # Fallbacks génériques TVA : plus sûrs que des labels appris au hasard
-    patterns["vat_rate"].append({
-        "mode": "near_label",
-        "label_regex": r"(TAUX(?:\s+DE)?\s*TVA|VAT\s+RATE|TVA\s*%)",
-        "value_regex": r"(\d{1,2}(?:[.,]\d{1,2})?\s*%?)",
-        "window": 80,
-        "group": 1,
-        "hit_count": 0,
-        "created_at": _now_iso(),
-    })
-    patterns["vat_base"].append({
-        "mode": "near_label",
-        "label_regex": r"(BASE\s*HT|NET\s*HT|TAXABLE\s+BASE|TOTAL\s*HT)",
-        "value_regex": r"(\d+(?:[  ]\d{3})*(?:[.,]\d{2,3})?)",
-        "window": 100,
-        "group": 1,
-        "hit_count": 0,
-        "created_at": _now_iso(),
-    })
-    patterns["vat_amount"].append({
-        "mode": "near_label",
-        "label_regex": r"(MONTANT\s*(?:DE\s*)?TVA|TOTAL\s*TVA|VAT\s+AMOUNT|AMOUNT\s+VAT)",
-        "value_regex": r"(\d+(?:[  ]\d{3})*(?:[.,]\d{2,3})?)",
-        "window": 100,
-        "group": 1,
-        "hit_count": 0,
-        "created_at": _now_iso(),
-    })
-
     return {k: v for k, v in patterns.items() if v}
 
 
@@ -1070,6 +941,10 @@ def merge_patterns(
     merged: Dict[str, List[Dict[str, Any]]] = {}
 
     for field in set(existing.keys()) | set(new.keys()):
+        # Les modèles historiques peuvent encore contenir ces règles :
+        # ne jamais les recopier lors d’un nouvel apprentissage.
+        if field in ("vat_rate", "vat_base", "vat_amount"):
+            continue
         cur = list(existing.get(field, []) or [])
         add = list(new.get(field, []) or [])
 
@@ -1133,7 +1008,7 @@ def extract_fields_with_model(text: str, model: dict) -> Dict[str, str]:
     # Exemple : si l'utilisateur corrige une date de facture puis sauvegarde,
     # une prochaine OCR du même document doit reprendre cette date avant toute
     # ancienne règle erronée qui retournerait une date de livraison/échéance.
-    for confirmed_field in ("invoice_number", "invoice_date", "iban", "bic", "vat_rate", "vat_base", "vat_amount"):
+    for confirmed_field in ("invoice_number", "invoice_date", "iban", "bic"):
         confirmed_value = _match_confirmed_value(src, model, confirmed_field)
         if confirmed_value:
             out[confirmed_field] = confirmed_value
@@ -1170,7 +1045,7 @@ def extract_fields_with_model(text: str, model: dict) -> Dict[str, str]:
         return None
 
 
-    for field in ("iban", "bic", "invoice_date", "invoice_number", "vat_rate", "vat_base", "vat_amount"):
+    for field in ("iban", "bic", "invoice_date", "invoice_number"):
         rules = list(patterns.get(field, []) or [])
         rules.sort(key=lambda x: int(x.get("hit_count", 0)), reverse=True)
 
@@ -1290,8 +1165,6 @@ def extract_fields_with_model(text: str, model: dict) -> Dict[str, str]:
             if field == "iban" and not validate_iban(val):
                 continue
             if field == "bic" and not validate_bic(val):
-                continue
-            if field in ("vat_rate", "vat_base", "vat_amount") and not _is_plausible_model_value(field, val):
                 continue
 
             out[field] = val

@@ -42,9 +42,6 @@ DEFAULT_SETTINGS = {
         "background_ocr_batch_size": 200,
         "background_ocr_hide_window": True,
     },
-    "vat": {
-        "allowed_rates": [0, 20]
-    },
 }
 
 

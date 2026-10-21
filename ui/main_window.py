@@ -556,23 +556,6 @@ class MainWindow(
         self.lbl_folder_totals = QLabel("")
         self.lbl_folder_totals.setStyleSheet("padding:4px;")
 
-        # =========================
-        # TVA (table sous les dossiers)
-        # =========================
-        self.vat_table = QTableWidget(0, 3)
-        self.vat_table.setHorizontalHeaderLabels(["Taux TVA (%)", "Base HT", "Montant TVA"])
-        self.vat_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
-        self.vat_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
-        self.vat_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
-        self.vat_table.setAlternatingRowColors(True)
-        self.vat_table.setSelectionBehavior(QTableWidget.SelectRows)
-        self.vat_table.setEditTriggers(QTableWidget.NoEditTriggers)
-        self.vat_table.setMinimumHeight(50)
-        self.vat_table.setMaximumHeight(100)
-
-        self.lbl_vat_total = QLabel("")
-        self.lbl_vat_total.setStyleSheet("padding:4px;")
-
         # Commentaire libre facture (sauvegardé dans le JSON, optionnel pour compatibilité).
         self.invoice_comment_input = QPlainTextEdit()
         self.invoice_comment_input.setPlaceholderText("Commentaire libre sur la facture…")
@@ -580,7 +563,7 @@ class MainWindow(
         self.invoice_comment_input.setMaximumHeight(90)
 
         # =========================
-        # Conteneur vertical (dossiers + totaux + TVA)
+        # Conteneur vertical (dossiers + totaux)
         # =========================
         folders_box = QWidget()
         self.folders_layout = QVBoxLayout(folders_box)
@@ -589,9 +572,6 @@ class MainWindow(
         self.folders_layout.addWidget(self.folder_table)
         self.folders_layout.addWidget(self.lbl_folder_totals)
 
-        self.folders_layout.addWidget(QLabel("TVA :"))
-        self.folders_layout.addWidget(self.vat_table)
-        self.folders_layout.addWidget(self.lbl_vat_total)
         self.folders_layout.addWidget(QLabel("Commentaire :"))
         self.folders_layout.addWidget(self.invoice_comment_input)
 
@@ -599,7 +579,6 @@ class MainWindow(
 
         # Lignes vides permanentes
         self._ensure_empty_folder_row()
-        self._ensure_empty_vat_row()
 
         # =========================
         # Gestion champ actif (PDF -> champ)

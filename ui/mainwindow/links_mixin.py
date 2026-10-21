@@ -249,8 +249,7 @@ class MainWindowLinksMixin:
             "status": "draft",
             "tags": ["cmr"],
             "ocr_text": "",
-            "folders": [],
-            "vat_lines": []
+            "folders": []
         }
         os.makedirs(os.path.dirname(json_path), exist_ok=True)
         with open(json_path, "w", encoding="utf-8") as f:

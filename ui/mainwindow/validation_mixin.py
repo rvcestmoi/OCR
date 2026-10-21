@@ -542,9 +542,6 @@ class MainWindowValidationMixin:
         bic = str(data.get("bic") or "").strip()
         transporter = str(data.get("transporter_text") or "").strip()
         folders = self._extract_tournrs_from_saved(data)
-        vat_lines = data.get("vat_lines") or []
-        if not isinstance(vat_lines, list):
-            vat_lines = []
         ocr_text = str(data.get("ocr_text") or "")
 
         if invoice_number:
@@ -559,8 +556,6 @@ class MainWindowValidationMixin:
             score += 40
         if folders:
             score += 220 + min(120, len(folders) * 12)
-        if vat_lines:
-            score += 80 + min(60, len(vat_lines) * 10)
         if ocr_text:
             score += min(220, max(20, len(ocr_text) // 40))
 
@@ -2241,25 +2236,13 @@ class MainWindowValidationMixin:
         raise ValueError(f"Format de date non reconnu pour RechDat : {s}")
 
     def _resolve_lisinvoice_taux(self, tour_nrs: list[str]) -> Decimal:
+        """Taux LISINVOICE_EDTRANS : source BDD (TVA théorique des tournées).
+
+        Le tableau TVA OCR a été supprimé : aucune valeur extraite de la
+        facture ne peut désormais prendre le dessus sur la valeur WinSped.
+        LISINVOICE_EDTRANS n’ayant qu’une colonne Taux, on conserve le
+        premier taux BDD disponible, dans l’ordre des dossiers.
         """
-        1) on préfère le premier taux saisi/extrait dans la zone TVA
-        2) sinon fallback sur le premier taux TVA théorique BDD des tournées
-
-        LISINVOICE_EDTRANS ne contient qu'une seule colonne Taux : en cas de
-        plusieurs taux détectés, on conserve volontairement le premier taux
-        exploitable au lieu de bloquer l'alimentation.
-        """
-        for row in (self.get_vat_rows() or []):
-            rate = self._to_sql_decimal_2(row.get("rate"))
-            base = self._to_sql_decimal_2(row.get("base"))
-            vat = self._to_sql_decimal_2(row.get("vat"))
-
-            if rate is None and base is None and vat is None:
-                continue
-
-            if rate is not None:
-                return rate
-
         for tour_nr in tour_nrs:
             try:
                 val = self.tour_repo.get_theoretical_vat_percent_by_tournr(tour_nr)

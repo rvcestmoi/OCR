@@ -513,11 +513,8 @@ class MainWindowCoreMixin:
         if hasattr(self, "invoice_comment_input") and self.invoice_comment_input is not None:
             self.invoice_comment_input.setPlainText("")
 
-        # dossiers + TVA
+        # Dossiers
         self.clear_folder_fields()
-        self.vat_table.setRowCount(0)
-        self._ensure_empty_vat_row()
-        self.update_vat_total()
 
         # OCR texte + recherche
         self.ocr_text_view.setPlainText("")
@@ -638,23 +635,6 @@ class MainWindowCoreMixin:
             except Exception:
                 pass
 
-        # TVA
-        vat_lines = saved_data.get("vat_lines") or []
-        if vat_lines:
-            old_updates = self.vat_table.updatesEnabled()
-            try:
-                self.vat_table.setUpdatesEnabled(False)
-                # Supprimer la ligne vide ajoutée par _ensure_empty_vat_row
-                self.vat_table.setRowCount(0)
-                for vat_line in vat_lines:
-                    if isinstance(vat_line, dict):
-                        rate = vat_line.get("rate", "")
-                        base = vat_line.get("base", "")
-                        vat = vat_line.get("vat", "")
-                        self._add_vat_row(rate, base, vat)
-            finally:
-                self.vat_table.setUpdatesEnabled(old_updates)
-
         # OCR text
         if saved_data.get("ocr_text"):
             self.ocr_text_view.setPlainText(saved_data["ocr_text"])
@@ -666,8 +646,6 @@ class MainWindowCoreMixin:
 
         # Mettre à jour les totaux
         self.update_folder_totals()
-        self.update_vat_total()
-        self._ensure_empty_vat_row()
 
         # Vérifier les informations bancaires si IBAN/BIC remplis, mais le
         # transporteur vient uniquement du premier dossier.
@@ -830,47 +808,6 @@ class MainWindowCoreMixin:
 
         return None, ctx
 
-    def _merge_vat_lines_from_supplier_model(self, model: dict) -> None:
-        if not model or not model.get("patterns"):
-            return
-
-        ocr_text = self.ocr_text_view.toPlainText() or ""
-        if not ocr_text.strip():
-            return
-
-        try:
-            from ocr.invoice_parser import parse_vat_lines
-            rows = parse_vat_lines(ocr_text, model=model) or []
-        except Exception:
-            return
-
-        existing_vat = {
-            (
-                str(row.get("rate") or "").strip(),
-                str(row.get("base") or "").strip(),
-                str(row.get("vat") or "").strip(),
-            )
-            for row in (self.get_vat_rows() if hasattr(self, "get_vat_rows") else [])
-        }
-
-        changed = False
-        for row in rows:
-            candidate = (
-                str(row.get("rate") or "").strip(),
-                str(row.get("base") or "").strip(),
-                str(row.get("vat") or "").strip(),
-            )
-            if not any(candidate) or candidate in existing_vat:
-                continue
-            if not self._fill_first_empty_vat_row(*candidate):
-                self._add_vat_row(*candidate)
-            existing_vat.add(candidate)
-            changed = True
-
-        if changed:
-            self._ensure_empty_vat_row()
-            self.update_vat_total()
-
     def _apply_supplier_model_for_current_context(self) -> dict | None:
         model, ctx = self._load_supplier_model_for_current_context(allow_legacy=True)
         if not model:
@@ -878,7 +815,6 @@ class MainWindowCoreMixin:
 
         try:
             self.apply_supplier_model(model)
-            self._merge_vat_lines_from_supplier_model(model)
         except Exception:
             pass
 
@@ -1423,14 +1359,6 @@ class MainWindowCoreMixin:
             pass
 
         try:
-            if hasattr(self, "vat_table") and self.vat_table is not None:
-                for r in range(self.vat_table.rowCount()):
-                    for w in self._get_vat_row_widgets(r):
-                        self._set_line_edit_locked_style(w, locked)
-        except Exception:
-            pass
-
-        try:
             if hasattr(self, "btn_analyze_pdf"):
                 self.btn_analyze_pdf.setToolTip("Facture déjà validée : OCR non autorisé." if locked else "")
             if hasattr(self, "btn_deep_ocr"):
@@ -1622,28 +1550,6 @@ class MainWindowCoreMixin:
             existing_folders.add(folder_number)
         self._ensure_empty_folder_row()
 
-        existing_vat = {
-            (
-                str(row.get("rate") or "").strip(),
-                str(row.get("base") or "").strip(),
-                str(row.get("vat") or "").strip(),
-            )
-            for row in (self.get_vat_rows() if hasattr(self, "get_vat_rows") else [])
-        }
-        for vat_row in list(getattr(data, "vat_lines", None) or []):
-            candidate = (
-                str(vat_row.get("rate") or "").strip(),
-                str(vat_row.get("base") or "").strip(),
-                str(vat_row.get("vat") or "").strip(),
-            )
-            if candidate in existing_vat or not any(candidate):
-                continue
-            if not self._fill_first_empty_vat_row(*candidate):
-                self._add_vat_row(*candidate)
-            existing_vat.add(candidate)
-        self._ensure_empty_vat_row()
-        self.update_vat_total()
-
     def _fill_first_empty_folder_row(self, dossier: str) -> bool:
         for row in range(self.folder_table.rowCount()):
             dossier_le, amount_le, _ = self._get_row_widgets(row)
@@ -1651,19 +1557,6 @@ class MainWindowCoreMixin:
             amount_txt = (amount_le.text() if amount_le else "").strip()
             if dossier_le and not dossier_txt and not amount_txt:
                 dossier_le.setText(dossier)
-                return True
-        return False
-
-    def _fill_first_empty_vat_row(self, rate: str, base: str, vat: str) -> bool:
-        for row in range(self.vat_table.rowCount()):
-            rate_le, base_le, vat_le = self._get_vat_row_widgets(row)
-            rate_txt = (rate_le.text() if rate_le else "").strip()
-            base_txt = (base_le.text() if base_le else "").strip()
-            vat_txt = (vat_le.text() if vat_le else "").strip()
-            if rate_le and base_le and vat_le and not rate_txt and not base_txt and not vat_txt:
-                rate_le.setText(rate)
-                base_le.setText(base)
-                vat_le.setText(vat)
                 return True
         return False
 
@@ -1723,16 +1616,6 @@ class MainWindowCoreMixin:
         # ligne vide permanente
         self._ensure_empty_folder_row()
         self.update_folder_totals()
-        # --- TVA ---
-        self.vat_table.setRowCount(0)
-
-        vat_lines = getattr(data, "vat_lines", None) or []
-        for r in vat_lines:
-            self._add_vat_row(r.get("rate", ""), r.get("base", ""), r.get("vat", ""))
-
-        self._ensure_empty_vat_row()
-        self.update_vat_total()
-
         # Totaux / couleurs (si tu as ces fonctions)
         if hasattr(self, "update_folder_totals"):
             self.update_folder_totals()
@@ -2262,7 +2145,8 @@ class MainWindowCoreMixin:
 
 
         data["folders"] = self.get_folder_rows() if hasattr(self, "get_folder_rows") else []
-        data["vat_lines"] = self.get_vat_rows() if hasattr(self, "get_vat_rows") else []
+        # Ne plus écrire la TVA extraite par OCR dans les nouveaux JSON.
+        data.pop("vat_lines", None)
         data["tags"] = sorted(set(tags))
         data["blocked"] = blocked
         data["block_comment"] = block_comment
@@ -2640,7 +2524,7 @@ class MainWindowCoreMixin:
             ocr_text = data.get("ocr_text", "")
             self.ocr_text_view.setPlainText(ocr_text if isinstance(ocr_text, str) else "")
 
-            # ✅ dossiers + TVA (ta fonction rebuild gère déjà tout proprement)
+            # Dossiers (affichage recalculé depuis les données sauvegardées)
             self.rebuild_folder_fields_from_json(data)
 
             # Transporteur recalculé depuis le premier dossier seulement.
@@ -2654,16 +2538,6 @@ class MainWindowCoreMixin:
 
 
     def rebuild_folder_fields_from_json(self, data: dict):
-        # reset table
-        self.vat_table.setRowCount(0)
-        vat_lines = data.get("vat_lines", [])
-        if isinstance(vat_lines, list):
-            for r in vat_lines:
-                self._add_vat_row(r.get("rate", ""), r.get("base", ""), r.get("vat", ""))
-
-        self._ensure_empty_vat_row()
-        self.update_vat_total()
-
         self.folder_table.setRowCount(0)
 
         folders = data.get("folders")
@@ -2867,20 +2741,6 @@ class MainWindowCoreMixin:
                 self.statusBar().showMessage("Modèle transporteur non mis à jour (KundenNr du premier dossier introuvable).", 4000)
             return False
 
-        # 2) extraire les données TVA pour apprentissage
-        # On privilégie les lignes TVA déjà visibles / corrigées dans l'écran.
-        vat_lines = []
-        if hasattr(self, "get_vat_rows"):
-            for row in (self.get_vat_rows() or []):
-                rate = str((row or {}).get("rate") or "").strip()
-                base = str((row or {}).get("base") or "").strip()
-                vat = str((row or {}).get("vat") or "").strip()
-                if rate or base or vat:
-                    vat_lines.append({"rate": rate, "base": base, "vat": vat})
-        if not vat_lines:
-            from ocr.invoice_parser import parse_vat_lines
-            vat_lines = parse_vat_lines(ocr_text)
-
         # 3) charger l’existant.
         # Rétrocompatibilité : si le nouveau modèle KundenNr n'existe pas encore,
         # on repart de l'ancien modèle IBAN_BIC lorsqu'il existe, puis on sauvegarde
@@ -2901,8 +2761,8 @@ class MainWindowCoreMixin:
             bic=bic,
             invoice_number=self.invoice_number_input.text().strip(),
             invoice_date=self.date_input.text().strip(),
-            vat_lines=vat_lines,
         )
+        # Purge les anciens patterns de TVA OCR lors du prochain enregistrement.
         merged = merge_patterns(existing.get("patterns") or {}, new_patterns)
 
         # 5) construire data
@@ -2930,6 +2790,9 @@ class MainWindowCoreMixin:
             confirmed = data.get("confirmed_values")
             if not isinstance(confirmed, dict):
                 confirmed = {}
+            # Valeurs TVA OCR obsolètes : ne plus les réinjecter.
+            for old_field in ("vat_rate", "vat_base", "vat_amount"):
+                confirmed.pop(old_field, None)
 
             def _push_confirmed(field_name: str, raw_value: str):
                 value = str(raw_value or "").strip()
